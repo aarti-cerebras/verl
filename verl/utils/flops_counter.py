@@ -265,6 +265,41 @@ def _estimate_qwen3_vit_flop(images_seqlens, config):
     return vit_flops
 
 
+def _estimate_minicpm3_flops(config, tokens_sum, batch_seqlens, delta_time):
+    # MiniCPM3-4B: dense (non-MoE) backbone with MLA attention. Dense FFN + MLA attn linear + core attn.
+    # (MiniCPM's scale_emb/scale_depth/dim_model_base are activation scalings and do not change FLOPS.)
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
+    num_hidden_layers = config.num_hidden_layers
+    num_query_heads = config.num_attention_heads
+    intermediate_size = config.intermediate_size
+
+    # MLA attention linear params (same structure as DeepSeek-V3's MLA block)
+    q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+    attn_linear_N = 0
+    if config.q_lora_rank is None:
+        attn_linear_N += hidden_size * num_query_heads * q_head_dim
+    else:
+        attn_linear_N += hidden_size * config.q_lora_rank
+        attn_linear_N += num_query_heads * q_head_dim * config.q_lora_rank
+    attn_linear_N += hidden_size * (config.kv_lora_rank + config.qk_rope_head_dim)
+    attn_linear_N += num_query_heads * (q_head_dim - config.qk_rope_head_dim + config.v_head_dim) * config.kv_lora_rank
+    attn_linear_N += num_query_heads * config.v_head_dim * hidden_size
+
+    # dense SwiGLU FFN (gate, up, down)
+    mlp_N = hidden_size * intermediate_size * 3
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    dense_N_flops = 6 * dense_N * tokens_sum
+
+    # core attention (causal MLA): Q@K^T + attn@V over all layers/tokens
+    seqlen_square_sum = sum(seqlen * seqlen * num_hidden_layers for seqlen in batch_seqlens)
+    attn_qkv_flops = 3 * seqlen_square_sum * (q_head_dim + config.v_head_dim) * num_query_heads
+
+    flops_all_token = dense_N_flops + attn_qkv_flops
+    return flops_all_token * (1.0 / delta_time) / 1e12
+
+
 def _estimate_deepseek_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
@@ -550,6 +585,7 @@ ESTIMATE_FUNC = {
     "qwen3_vl": _estimate_qwen3_vl_flops,
     "qwen3_vl_moe": _estimate_qwen3_vl_moe_flops,
     "deepseek_v3": _estimate_deepseek_v3_flops,
+    "minicpm3": _estimate_minicpm3_flops,
     "minicpmv": _estimate_qwen2_flops,
     "minicpmo": _estimate_qwen2_flops,
     "mistral": _estimate_qwen2_flops,

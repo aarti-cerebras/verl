@@ -492,6 +492,24 @@ def apply_monkey_patch(
             print("Not support fused kernels for KimiVL")
 
         return
+    elif model.config.model_type == "minicpm3" and getattr(model.config, "dsa_enabled", False):
+        # DeepSeek Sparse Attention (DSA) lightning indexer grafted onto MiniCPM3's MLA attention.
+        # Gated on `config.dsa_enabled` so non-DSA MiniCPM3 runs fall through to the generic patch.
+        from verl.models.transformers.minicpm_dsa import (
+            apply_get_usable_length_shim,
+            attach_indexers,
+            build_dsa_config,
+            install_kl_accumulation,
+            minicpm3_dsa_attn_forward,
+        )
+
+        apply_get_usable_length_shim()  # transformers 4.5x compat (see minicpm3-transformers5-incompat)
+        dsa_cfg = build_dsa_config(model.config, **getattr(model.config, "dsa_overrides", {}))
+        attach_indexers(model, dsa_cfg)
+        module.MiniCPMFlashAttention2.forward = minicpm3_dsa_attn_forward
+        install_kl_accumulation(model)
+        print("Monkey patch MiniCPMFlashAttention2.forward for DSA indexer")
+        return
     elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
         # Step 1: patch model to support image-text mixed data
         from transformers.models.qwen3_5.modeling_qwen3_5 import (

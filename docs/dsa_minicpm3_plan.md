@@ -286,23 +286,29 @@ field returned by the HF forward is **dropped**. The loss fn receives that engin
 explicit pass-through. There is an exact precedent: the `fused_linear_aux` getattr hook at
 `transformer_impl.py:1101-1109` copies aux fields off `raw_output` into `model_output`. We mirror it.
 
-**(C1) Surface the KL from the model.** Each patched attention layer accumulates its scalar KL into a
-forward-local buffer on the model (reset via a forward-pre-hook); the patched **model forward** sums them
-and attaches `raw_output.indexer_kl` (a scalar tensor) onto the HF output object. Big tiled tensors stay
-local to each layer — only a scalar leaves.
+**(C1) Surface the KL from the model — IMPLEMENTED in Part B.** `install_kl_accumulation` (in
+`minicpm_dsa.py`) registers a forward-**pre**-hook (resets per-layer state) and a forward-**post**-hook
+(sums each `layer.self_attn._dsa_kl` into **`model._dsa_indexer_kl`**, a scalar tensor attribute on the
+module). Big tiled tensors stay local to each layer — only the scalar (and a small diagnostics dict, see
+C7) leaves. NOTE: it lives on the **module** (`model._dsa_indexer_kl`), not on the `ModelOutput` object —
+transformers' `ModelOutput.__setattr__` rejects arbitrary fields, so reading off the module is the robust
+path (this supersedes the earlier "attach to `raw_output`" idea).
 
 **(C2) Custom engine subclass to pass it through.** Add an FSDP engine variant
 (`verl/workers/engine/fsdp/`), registered via `EngineRegistry.register(model_type="dsa_language_model",
-backend=["fsdp","fsdp2"])`, that overrides `prepare_model_outputs` to do
-`model_output["indexer_kl"] = getattr(raw_output, "indexer_kl", None)` (mirroring lines 1101-1109).
-Select it via `TrainingWorkerConfig(model_type="dsa_language_model", ...)` in `sft_trainer.py:165`.
-(Alternative considered & rejected: routing through the `logits_processor_func` topk path at lines
-1221-1228 — that path is shaped for per-token tensors == `log_probs.shape`, not a scalar aux loss.)
+backend=["fsdp","fsdp2"])`, that overrides `prepare_model_outputs` to read the module attributes set by the
+C1 hooks: `model_output["indexer_kl"] = self.module._dsa_indexer_kl` and
+`model_output["indexer_metrics"] = self.module._dsa_metrics` (precedent: the `fused_linear_aux` getattr
+hook at `transformer_impl.py:1101-1109`). Select it via `TrainingWorkerConfig(model_type=
+"dsa_language_model", ...)` in `sft_trainer.py:165`. (Alternative considered & rejected: routing through the
+`logits_processor_func` topk path at lines 1221-1228 — that path is shaped for per-token tensors ==
+`log_probs.shape`, not a scalar aux loss.)
 
 **(C3) New losses** in `verl/workers/utils/losses.py` (same `(config, model_output, data, dp_group)`
 signature as `sft_loss`; KL/agg helpers from `verl/trainer/distillation/losses.py`):
 - `indexer_kl_loss` — Phase 1: returns `model_output["indexer_kl"]` (already aggregated, normalized by
-  #valid query positions × #layers), metrics = per-layer KL + indexer/teacher mass. **No LM CE.**
+  #valid query positions × #layers) as the loss, and `{"indexer/kl": ..., **model_output["indexer_metrics"]}`
+  as the metrics dict (→ wandb `train/indexer/*`, see C7). **No LM CE.**
 - `dsa_distill_loss` — Phase 2: `agg(forward_kl_topk(student_logits, teacher_topk)) + λ · indexer_kl`
   (`λ` from config). **No raw CE by default** (self-distillation toward dense parity — the teacher's soft
   distribution dominates the hard label; CE conflicts with calibration matching). Optional low-weight
@@ -325,6 +331,33 @@ is RL-specific (online vLLM via the agent loop). So Phase 2: enable `distillatio
 `data["teacher_logprobs"]`/`data["teacher_ids"]` from one of two backends (Part E), set
 `use_task_rewards=False`/`use_policy_gradient=False` for pure supervised forward-KL, and have the DSA
 engine add `indexer_kl` on top. No change to `compute_forward_kl_topk` itself.
+
+**(C7) Monitoring / wandb (warm-up observability).** wandb is already wired: `sft_trainer.py:391-406` logs
+the **loss fn's returned metrics dict** to `Tracking` (`utils/tracking.py`; backends `wandb|console|...`)
+as `train/<key>`, rank-0 only. So monitoring = (a) compute indexer diagnostics in the forward, (b) carry
+them through the C1/C2 module-attr path, (c) return them from `indexer_kl_loss`. Enable via
+`trainer.logger=["console","wandb"]` + `project_name`/`experiment_name` (and `WANDB_*` env).
+
+- **Diagnostics computed in the forward** (extend Part B's `_dense_warmup_kl`; we already have `p_blk`
+  (target) and `I_blk` (indexer scores)). Per layer, under `no_grad`, gated by a `diag_interval` (only
+  every Nth step — the top-k adds compute), record into `attn._dsa_diag`:
+  - **`topk_recall`** = Σ over the indexer's top-k keys of `p` (dense attention mass the selector
+    captures) — *the early-stop gate*; `topk_overlap` = |topk(I) ∩ topk(p)|/k;
+  - `score_mean`/`score_std` of `I`; `nan_frac` (FP8 / masking guard).
+- **Aggregate in the C1 post-hook** → `model._dsa_metrics` (dict): `indexer/topk_recall` (mean over
+  layers), `indexer/kl_layer_mean`, and `indexer/kl_layer_min`/`_max` wrapped in
+  `verl.utils.metric.Metric(AggregationType.MIN/MAX, …)` so they reduce correctly across micro-batches /
+  ranks (same pattern the distillation losses use), plus `indexer/score_*`, `indexer/nan_frac`.
+- **Engine (C2)** copies `model._dsa_metrics` → `model_output["indexer_metrics"]`; **`indexer_kl_loss`
+  (C3)** merges it into its returned metrics → all appear in wandb as `train/indexer/*`. (Optional: log a
+  `wandb.Histogram` of the 62 per-layer KLs every N steps instead of per-layer scalars.)
+- **Ad-hoc debug prints:** rank-0-guarded (`dist.get_rank()==0`) and gated by an env flag
+  (`VERL_DSA_DEBUG=1`) + selected `layer_idx`, printing `kl`/`recall`/score stats / NaN flags. The forward
+  doesn't know the global step, so gate by env/a forward counter, or have the trainer stash
+  `model._dsa_step` each step.
+- **Monitored keys:** `indexer/kl`, `indexer/kl_layer_{min,max,mean}`, **`indexer/topk_recall`**,
+  `indexer/topk_overlap`, `indexer/score_{mean,std}`, `indexer/nan_frac` (+ trainer's `optim/lr`,
+  indexer `grad_norm`). Early-stop when `indexer/kl` plateaus and `indexer/topk_recall` saturates.
 
 **Freezing + optimizer — reuse the LoRA pattern (verified).** Phase 1 is structurally identical to LoRA
 (frozen base + small trainable modules), which verl already supports end-to-end (`is_lora`/`lora_rank`
