@@ -132,13 +132,17 @@ def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
     dot, so the fallback is equivalent for scores).
     """
     scale = x.shape[-1] ** -0.5
-    try:
-        from fast_hadamard_transform import hadamard_transform
+    # The fused kernel is CUDA-only; fall back to the pure-torch FWHT on CPU or when the lib is absent
+    # (any orthonormal Hadamard ordering preserves the dot, so the fallback is equivalent for scores).
+    if x.is_cuda:
+        try:
+            from fast_hadamard_transform import hadamard_transform
 
-        in_dtype = x.dtype
-        return hadamard_transform(x.to(torch.bfloat16), scale=scale).to(in_dtype)
-    except ImportError:
-        return _fwht(x) * scale
+            in_dtype = x.dtype
+            return hadamard_transform(x.to(torch.bfloat16), scale=scale).to(in_dtype)
+        except ImportError:
+            pass
+    return _fwht(x) * scale
 
 
 def _act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
