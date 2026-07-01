@@ -74,6 +74,7 @@ class DSAConfig:
     fp8: bool = True  # run the indexer score matmul in FP8 (E4M3), as in the reference
     block_size: int = 128  # FP8 act_quant block size (reference default)
     rotate_activation: bool = True  # Hadamard pre-quant rotation (V3.2), only in the FP8 path
+    diag_interval: int = 10  # compute monitoring diagnostics (topk recall/overlap/score) every N forwards
 
     def __post_init__(self):
         if self.rope_head_dim > self.head_dim:

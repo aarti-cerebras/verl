@@ -499,6 +499,7 @@ def apply_monkey_patch(
             apply_get_usable_length_shim,
             attach_indexers,
             build_dsa_config,
+            freeze_base_train_indexer,
             install_kl_accumulation,
             minicpm3_dsa_attn_forward,
         )
@@ -508,6 +509,10 @@ def apply_monkey_patch(
         attach_indexers(model, dsa_cfg)
         module.MiniCPMFlashAttention2.forward = minicpm3_dsa_attn_forward
         install_kl_accumulation(model)
+        # Phase 1 (dense warm-up): freeze the base, train only the indexer. Phase 2 (sparse) trains both.
+        if dsa_cfg.mode == "dense_warmup":
+            freeze_base_train_indexer(model)
+            print("DSA dense_warmup: froze base, only *.indexer.* params trainable")
         print("Monkey patch MiniCPMFlashAttention2.forward for DSA indexer")
         return
     elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:

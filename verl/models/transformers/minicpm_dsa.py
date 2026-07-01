@@ -72,19 +72,65 @@ def attach_indexers(model, dsa_cfg: DSAConfig) -> None:
         attn.indexer = idx.to(device=ref.device, dtype=ref.dtype)
 
 
+def freeze_base_train_indexer(model) -> list:
+    """Phase-1 freeze: set ``requires_grad=False`` on all params except the DSA indexer (``*.indexer.*``).
+
+    Returns the list of trainable (indexer) params — hand these to the optimizer (LR ~1e-3). With the base
+    frozen, autograd retains no base activation graph and AdamW no-ops the frozen params, so only the indexer
+    trains. Call this BEFORE FSDP wrapping; the FSDP wrap must use ``use_orig_params=True`` (FSDP1) or FSDP2
+    for mixed ``requires_grad`` in a flat parameter to be legal.
+    """
+    trainable = []
+    for name, p in model.named_parameters():
+        is_indexer = ".indexer." in name
+        p.requires_grad_(is_indexer)
+        if is_indexer:
+            trainable.append(p)
+    return trainable
+
+
 def install_kl_accumulation(model) -> None:
-    """Reset per-layer KL each forward (pre-hook) and sum it into `model._dsa_indexer_kl` (post-hook)."""
+    """Wire the per-layer indexer KL + monitoring into model attributes each forward.
+
+    Pre-hook: reset per-layer state, bump a forward counter, and set the shared `dsa._do_diag` flag every
+    `diag_interval` forwards (diagnostics add top-k compute, so they're gated). Post-hook: sum the per-layer
+    KL into `model._dsa_indexer_kl` (the loss) and build `model._dsa_metrics` — plain floats for wandb (the
+    SFT trainer logs the metrics dict raw; it does NOT unwrap `Metric` objects). KL layer min/max/mean are
+    cheap and always logged; recall/overlap/score-health only on diag forwards.
+    """
     layers = model.model.layers
 
     def _pre_hook(module, args, kwargs):
         for layer in layers:
             layer.self_attn._dsa_kl = None
+            layer.self_attn._dsa_diag = None
+        cnt = getattr(model, "_dsa_fwd_count", 0) + 1
+        model._dsa_fwd_count = cnt
+        dsa = layers[0].self_attn.dsa  # shared across layers
+        interval = max(1, getattr(dsa, "diag_interval", 1))
+        dsa._do_diag = (cnt - 1) % interval == 0  # diag on the 1st forward, then every `interval`
         return None
 
     def _post_hook(module, args, output):
-        kls = [layer.self_attn._dsa_kl for layer in layers if getattr(layer.self_attn, "_dsa_kl", None) is not None]
-        # sum of per-layer (mean-over-positions) KL; Part C/D applies final normalization
-        model._dsa_indexer_kl = torch.stack(kls).sum() if kls else None
+        attns = [layer.self_attn for layer in layers]
+        kls = [a._dsa_kl for a in attns if getattr(a, "_dsa_kl", None) is not None]
+        if not kls:
+            model._dsa_indexer_kl = None
+            model._dsa_metrics = {}
+            return output
+        kl_stack = torch.stack(kls)
+        model._dsa_indexer_kl = kl_stack.sum()  # the loss (keeps grad)
+        metrics = {
+            "indexer/kl_layer_mean": kl_stack.mean().item(),
+            "indexer/kl_layer_min": kl_stack.min().item(),
+            "indexer/kl_layer_max": kl_stack.max().item(),
+        }
+        diags = [a._dsa_diag for a in attns if getattr(a, "_dsa_diag", None) is not None]
+        if diags:
+            rename = {"recall": "topk_recall", "overlap": "topk_overlap"}
+            for key in ("recall", "overlap", "score_mean", "score_std", "nan_frac"):
+                metrics[f"indexer/{rename.get(key, key)}"] = torch.stack([d[key] for d in diags]).mean().item()
+        model._dsa_metrics = metrics
         return output
 
     model.register_forward_pre_hook(_pre_hook, with_kwargs=True)
@@ -124,6 +170,8 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     device, compute_dtype = query_states.device, query_states.dtype
     scale = attn.softmax_scale
     block = getattr(attn.dsa, "kl_block_size", 0) or T
+    do_diag = bool(getattr(attn.dsa, "_do_diag", False))  # set by the KL pre-hook every diag_interval
+    diag_k = min(getattr(attn.dsa, "top_k", T), T)
 
     if position_ids is None:
         position_ids = torch.arange(T, device=device).unsqueeze(0)
@@ -133,9 +181,19 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
 
     total_kl = query_states.new_zeros((), dtype=torch.float32)
     total_cnt = 0
+    # monitoring diagnostics (only when do_diag): recall/overlap of top-k, indexer score health
+    d_recall = query_states.new_zeros((), dtype=torch.float32)
+    d_overlap = query_states.new_zeros((), dtype=torch.float32)
+    d_rc = 0
+    d_ssum = query_states.new_zeros((), dtype=torch.float32)
+    d_ssq = query_states.new_zeros((), dtype=torch.float32)
+    d_scnt = 0
+    d_nan = query_states.new_zeros((), dtype=torch.float32)
+
     for q0 in range(0, T, block):
         q1 = min(q0 + block, T)
         bias = _causal_doc_bias_block(position_ids, q0, q1, T, device)  # [bsz, B, T]
+        allow = bias == 0.0
 
         # --- target p_blk (detached); accumulate over heads to bound memory ---
         with torch.no_grad():
@@ -150,11 +208,38 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
         I_blk = attn.indexer.scores(q_idx[:, q0:q1], k_idx, weights[:, q0:q1], attn_bias=bias)  # [bsz, B, T]
         log_q = torch.log_softmax(I_blk.float(), dim=-1)
 
-        allow = bias == 0.0
         term = p_blk * (torch.log(p_blk.clamp_min(_KL_EPS)) - log_q)
         kl_blk = torch.where(allow, term, torch.zeros_like(term)).sum(dim=-1)  # [bsz, B]
         total_kl = total_kl + kl_blk.sum()
         total_cnt += kl_blk.numel()
+
+        if do_diag:
+            with torch.no_grad():
+                idf = I_blk.detach().float()
+                k = min(diag_k, T)
+                topk_i = idf.topk(k, dim=-1).indices  # indexer-selected keys [bsz, B, k]
+                d_recall += p_blk.gather(-1, topk_i).sum()  # dense mass the selector captures
+                topk_p = p_blk.topk(k, dim=-1).indices
+                d_overlap += (topk_i.unsqueeze(-1) == topk_p.unsqueeze(-2)).any(-1).float().sum() / k
+                d_rc += kl_blk.numel()
+                fin = idf[allow]  # finite (unmasked) scores only
+                d_ssum += fin.sum()
+                d_ssq += (fin * fin).sum()
+                d_scnt += fin.numel()
+                d_nan += torch.isnan(idf).float().sum()
+
+    if do_diag and d_rc > 0:
+        mean = d_ssum / max(d_scnt, 1)
+        var = (d_ssq / max(d_scnt, 1) - mean * mean).clamp_min(0)
+        attn._dsa_diag = {
+            "recall": (d_recall / d_rc).detach(),
+            "overlap": (d_overlap / d_rc).detach(),
+            "score_mean": mean.detach(),
+            "score_std": var.sqrt().detach(),
+            "nan_frac": (d_nan / max(d_scnt, 1)).detach(),
+        }
+    else:
+        attn._dsa_diag = None
 
     return (total_kl / max(total_cnt, 1)).to(compute_dtype)
 

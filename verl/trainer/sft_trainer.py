@@ -158,9 +158,16 @@ class SFTTrainer:
 
     def _build_engine(self):
         from verl.workers.engine_workers import TrainingWorkerConfig
-        from verl.workers.utils.losses import sft_loss
+        from verl.workers.utils.losses import indexer_kl_loss, sft_loss
 
-        self.loss_fn = partial(sft_loss, config=None)
+        loss_mode = self.config.get("loss_mode", "sft")
+        if loss_mode == "indexer_kl":
+            # DSA Phase-1 dense warm-up: loss = the indexer KL, read off the model by a closure (the DSA
+            # forward hooks set model._dsa_indexer_kl). self.engine is resolved lazily at call time (set
+            # below), so it exists by the first loss invocation during training.
+            self.loss_fn = lambda **kw: indexer_kl_loss(**kw, model=self.engine.module)
+        else:
+            self.loss_fn = partial(sft_loss, config=None)
 
         config = TrainingWorkerConfig(
             model_type="language_model",

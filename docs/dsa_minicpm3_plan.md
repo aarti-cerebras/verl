@@ -267,6 +267,25 @@ default on), since the reference's efficiency win comes from FP8 + few heads + R
   TransformerEngine `Linear`/`fp8_autocast`, which verl already uses on the mcore DeepSeek path) on both
   dev and production. The bf16 reference path is for parity validation only.
 
+> **⚠ Serving-time optimization (FP8 real GEMM) — TODO, not a precision change.** The **implemented**
+> indexer FP8 path (`dsa_indexer.py::_act_quant`/`scores`) is a **fake-quant reference**: it rounds
+> `q_idx`/`k_idx` to E4M3 (so it is *numerically* FP8 — same quantization error as DeepSeek) but then
+> **dequantizes and runs the matmul in float** (`q_fp8.float() @ k_fp8.float()`), so it gets FP8 *accuracy*
+> but **not** FP8 *throughput* (no fp8 tensor cores). This is deliberate for now: it is portable (CPU +
+> tests), and trivially **differentiable for training** — the `.to(float8_e4m3fn)` cast passes gradients as
+> a straight-through estimator (STE), so `wq_b`/`wk` train correctly.
+> **We are NOT making a bf16 exception** — the indexer stays FP8 (matching DeepSeek-V3.2). The remaining
+> work is purely a **kernel upgrade for serving/throughput**: replace the fake-quant matmul with a *real*
+> FP8 GEMM that runs on fp8 tensor cores — either `torch._scaled_mm` (Hopper) or vendor DeepSeek's fused
+> Triton `fp8_index`/`act_quant` (`inference/kernel.py`). For a real-kernel **training** path the fp8 GEMM
+> has no autograd, so wrap it in a custom `autograd.Function` with an STE backward; keep the fake-quant as
+> the CPU/reference/differentiable fallback. The FP8↔bf16 **parity test is the guardrail** for this swap
+> (it already asserts the two agree within tolerance). The Hadamard `rotate_activation` is *already* the
+> real fused kernel on CUDA (`fast_hadamard_transform`, built from git); `act_quant` + the score GEMM are
+> the remaining pieces. Priority: highest at **inference/serving** (the every-query-vs-every-key scan);
+> for Phase-1 training the indexer GEMM is not the bottleneck (frozen base forward + dense-target recompute
+> dominate), so the fake-quant reference is acceptable there.
+
 **Integration (monkey-patch), mirroring kimi_vl:**
 - Add a `minicpm` / `minicpm3` branch in `verl/models/transformers/monkey_patch.py::apply_monkey_patch`
   (next to the `kimi_vl` branch at line 480). It will: import the trust-remote-code module, attach a

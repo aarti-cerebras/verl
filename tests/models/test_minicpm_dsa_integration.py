@@ -18,6 +18,8 @@ Requires a CUDA device (MiniCPMFlashAttention2 + flash_attn) and the transformer
     PYTHONPATH=/tmp/tf457lib pytest tests/models/test_minicpm_dsa_integration.py -v
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -150,6 +152,30 @@ def test_sparse_mode_stub_raises():
     with pytest.raises(NotImplementedError):
         with torch.no_grad():
             model(input_ids=_ids(), position_ids=torch.arange(16, device="cuda").unsqueeze(0))
+
+
+@requires_cuda
+def test_monitoring_diagnostics_populated():
+    """After a forward, model._dsa_metrics carries plain-float KL + top-k recall/overlap/score diagnostics."""
+    model = _build_tiny_minicpm3(dsa_enabled=True)  # diag fires on the 1st forward regardless of interval
+    _patch(model)
+    ids = _ids()
+    pos = torch.arange(ids.shape[1], device="cuda").unsqueeze(0)
+    with torch.no_grad():
+        model(input_ids=ids, position_ids=pos)
+    m = model._dsa_metrics
+    expected = [
+        "indexer/kl_layer_mean", "indexer/kl_layer_min", "indexer/kl_layer_max",
+        "indexer/topk_recall", "indexer/topk_overlap", "indexer/score_mean", "indexer/score_std",
+        "indexer/nan_frac",
+    ]
+    for key in expected:
+        assert key in m, f"missing metric {key}"
+        assert isinstance(m[key], float) and math.isfinite(m[key]), f"{key}={m[key]!r} not a finite float"
+    assert 0.0 <= m["indexer/topk_recall"] <= 1.0 + 1e-4
+    assert 0.0 <= m["indexer/topk_overlap"] <= 1.0 + 1e-4
+    assert m["indexer/nan_frac"] == 0.0
+    assert m["indexer/kl_layer_min"] <= m["indexer/kl_layer_mean"] + 1e-6 <= m["indexer/kl_layer_max"] + 1e-6
 
 
 def test_dense_warmup_kl_tiling_matches_full():

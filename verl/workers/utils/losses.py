@@ -25,6 +25,31 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model=None):
+    """DSA Phase-1 (dense warm-up) loss: the per-layer indexer KL, summed over layers.
+
+    The DSA forward hooks (see ``verl/models/transformers/minicpm_dsa.py::install_kl_accumulation``) stash
+    the aggregated KL on the model as ``model._dsa_indexer_kl`` (and diagnostics on ``model._dsa_metrics``).
+    This loss reads them off the model directly — it is bound to the model via a closure in the SFT trainer
+    (``self.loss_fn = lambda **kw: indexer_kl_loss(**kw, model=self.engine.module)``), so no custom engine /
+    ``model_output`` pass-through is required. There is **no LM cross-entropy** in Phase 1.
+
+    Args:
+        model: the (FSDP-wrapped) module; attribute access forwards through FSDP. Required.
+    """
+    assert model is not None, "indexer_kl_loss must be bound to the model (pass model=...)"
+    kl = getattr(model, "_dsa_indexer_kl", None)
+    assert kl is not None, (
+        "model._dsa_indexer_kl is not set — is DSA enabled (config.dsa_enabled), the forward run, and "
+        "mode == 'dense_warmup'?"
+    )
+    metrics = {"indexer/kl": kl.detach()}
+    dsa_metrics = getattr(model, "_dsa_metrics", None)
+    if dsa_metrics:
+        metrics.update(dsa_metrics)
+    return kl, metrics
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
