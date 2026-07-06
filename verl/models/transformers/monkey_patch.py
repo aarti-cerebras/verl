@@ -499,13 +499,14 @@ def apply_monkey_patch(
             apply_get_usable_length_shim,
             attach_indexers,
             build_dsa_config,
+            dsa_overrides_from_config,
             freeze_base_train_indexer,
             install_kl_accumulation,
             minicpm3_dsa_attn_forward,
         )
 
         apply_get_usable_length_shim()  # transformers 4.5x compat (see minicpm3-transformers5-incompat)
-        dsa_cfg = build_dsa_config(model.config, **getattr(model.config, "dsa_overrides", {}))
+        dsa_cfg = build_dsa_config(model.config, **dsa_overrides_from_config(model.config))
         attach_indexers(model, dsa_cfg)
         module.MiniCPMFlashAttention2.forward = minicpm3_dsa_attn_forward
         install_kl_accumulation(model)

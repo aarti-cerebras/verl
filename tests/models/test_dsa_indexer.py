@@ -231,3 +231,66 @@ def test_fp8_matches_bf16_within_tolerance():
     top_got = got.topk(k, dim=-1).indices.sort(dim=-1).values
     overlap = (top_ref == top_got).float().mean()
     assert overlap > 0.9, f"FP8 top-k selection overlap too low: {overlap.item():.3f}"
+
+
+def test_fp8_scores_are_differentiable():
+    """Regression: the FP8 score path must be trainable. A bare ``.to(float8)`` cast is non-differentiable,
+    so without a straight-through estimator gradients never reach ``wq_b``/``wk``/``k_norm`` (only the
+    ``weights_proj`` residual survives) -- the indexer silently fails to learn. Assert every parameter gets
+    a nonzero gradient through the fp8 path, with the Hadamard rotation both off and on."""
+    x, qr, cos, sin = _inputs()
+    for rotate in (False, True):
+        idx = LightningIndexer(_cfg(fp8=True, rotate_activation=rotate))
+        idx.zero_grad(set_to_none=True)
+        idx(x, qr, cos, sin).pow(2).mean().backward()
+        for name, p in idx.named_parameters():
+            assert p.grad is not None, f"[rotate={rotate}] {name} got no grad (fp8 path severed)"
+            assert p.grad.abs().sum().item() > 0, f"[rotate={rotate}] {name} grad is all-zero"
+
+
+def test_indexer_state_dict_roundtrip_is_functionally_identical():
+    """#10 (L1): a *trained* indexer must round-trip through state_dict and reproduce IDENTICAL scores.
+    Guards the property Phase 2 relies on — the injected indexer params serialize/deserialize and a reloaded
+    indexer is functionally identical. Runs the fp8 (production) path, which is deterministic end-to-end."""
+    cfg = _cfg(fp8=True)
+    idx = LightningIndexer(cfg)
+    with torch.no_grad():  # simulate training: move every param off its init
+        for p in idx.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    x, qr, cos, sin = _inputs()
+    scores_ref = idx(x, qr, cos, sin)
+
+    sd = idx.state_dict()
+    assert {"wq_b.weight", "wk.weight", "weights_proj.weight", "k_norm.weight", "k_norm.bias"} <= set(sd)
+
+    fresh = LightningIndexer(cfg)  # different random init
+    assert not torch.allclose(fresh(x, qr, cos, sin), scores_ref)  # sanity: differs before load
+    fresh.load_state_dict(sd)  # strict=True by default
+    for (n, a), (_, b) in zip(idx.named_parameters(), fresh.named_parameters()):
+        assert torch.equal(a, b), f"{n} not bit-identical after reload"
+    torch.testing.assert_close(fresh(x, qr, cos, sin), scores_ref, rtol=0, atol=0)  # exact
+
+
+def test_strict_load_rejects_missing_indexer_keys():
+    """#10 (L1, Phase-2 ordering gotcha): a checkpoint that CONTAINS indexer params must not load silently
+    into a model whose indexers aren't attached. Strict load raises on the unexpected `indexer.*` keys, so a
+    forgotten attach_indexers can't yield a silently re-initialized (untrained) indexer."""
+    import torch.nn as nn
+
+    cfg = _cfg()
+
+    class WithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = nn.Linear(HIDDEN, HIDDEN)
+            self.indexer = LightningIndexer(cfg)
+
+    class NoIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = nn.Linear(HIDDEN, HIDDEN)
+
+    sd = WithIndexer().state_dict()
+    with pytest.raises(RuntimeError, match="[Uu]nexpected key"):
+        NoIndexer().load_state_dict(sd)  # strict=True: indexer.* are unexpected -> caught, not silently dropped
+    WithIndexer().load_state_dict(sd)  # with indexers attached: loads cleanly (no raise)

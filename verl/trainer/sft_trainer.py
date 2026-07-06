@@ -165,7 +165,7 @@ class SFTTrainer:
             # DSA Phase-1 dense warm-up: loss = the indexer KL, read off the model by a closure (the DSA
             # forward hooks set model._dsa_indexer_kl). self.engine is resolved lazily at call time (set
             # below), so it exists by the first loss invocation during training.
-            self.loss_fn = lambda **kw: indexer_kl_loss(**kw, model=self.engine.module)
+            self.loss_fn = lambda **kw: indexer_kl_loss(**kw, config=None, model=self.engine.module)
         else:
             self.loss_fn = partial(sft_loss, config=None)
 
@@ -396,6 +396,24 @@ class SFTTrainer:
 
                 if self.engine.is_mp_src_rank_with_outputs():
                     metrics = tu.get(output, "metrics")
+
+                    # Custom loss-fn metrics (e.g. the DSA `indexer/*` diagnostics) arrive as per-micro-batch
+                    # lists (from append_to_dict) and/or tensors; the logger only renders scalars, so reduce
+                    # each to a scalar mean. loss/grad_norm/lr/mfu/perf are already scalars and pass through.
+                    def _reduce_metric(v):
+                        if isinstance(v, torch.Tensor):
+                            return v.detach().float().mean().item()
+                        if isinstance(v, (list, tuple)):
+                            vals = [_reduce_metric(x) for x in v if x is not None]
+                            return sum(vals) / len(vals) if vals else None
+                        return v
+
+                    for k in list(metrics.keys()):
+                        reduced = _reduce_metric(metrics[k])
+                        if reduced is None:
+                            metrics.pop(k)
+                        else:
+                            metrics[k] = reduced
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                     for k in ["loss", "grad_norm", "lr", "mfu"]:

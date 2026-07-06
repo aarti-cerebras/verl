@@ -71,12 +71,17 @@ class DSAConfig:
     top_k: int = 2048  # attention top-k (used by select_topk / the DSA attention layer)
     mode: str = "dense_warmup"  # "dense_warmup" (Phase 1) | "sparse" (Phase 2)
     kl_block_size: int = 1024  # query tiling block for the target/KL recompute (used later)
+    kl_reduction: str = "mean"  # per-layer KL -> loss reduction over layers: "mean" (default; interpretable
+    # per-layer scale, loss ~= per-layer KL) | "sum" (reference; each layer weighted equally, loss ~=
+    # n_layers * per-layer KL). Same optimum; "sum" scales the gradient by ~n_layers vs "mean" at a given LR.
     fp8: bool = True  # run the indexer score matmul in FP8 (E4M3), as in the reference
     block_size: int = 128  # FP8 act_quant block size (reference default)
     rotate_activation: bool = True  # Hadamard pre-quant rotation (V3.2), only in the FP8 path
     diag_interval: int = 10  # compute monitoring diagnostics (topk recall/overlap/score) every N forwards
 
     def __post_init__(self):
+        if self.kl_reduction not in ("sum", "mean"):
+            raise ValueError(f"kl_reduction must be 'sum' or 'mean', got {self.kl_reduction!r}")
         if self.rope_head_dim > self.head_dim:
             raise ValueError(f"rope_head_dim ({self.rope_head_dim}) must be <= head_dim ({self.head_dim})")
         if self.rope_head_dim % 2 != 0:
@@ -146,17 +151,23 @@ def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return _fwht(x) * scale
 
 
-def _act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Blockwise FP8 (E4M3) quantization over the last dim, matching DeepSeek's ``act_quant``.
+def _fake_quant_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Blockwise FP8 (E4M3) fake-quantization with a straight-through estimator (QAT).
 
-    ``head_dim <= block_size`` (enforced by DSAConfig), so there is a single block per head/token: one
-    fp32 scale per row. Returns ``(x_fp8, scale)`` where ``x ~= x_fp8.float() * scale`` and
-    ``scale = amax / FP8_MAX``.
+    Forward returns the dequantized E4M3 round-trip ``round_fp8(x / scale) * scale`` (``scale = amax /
+    FP8_MAX`` over the last dim), so the indexer sees exactly the fp8 numerics it will use at inference.
+    Backward is the identity via the straight-through estimator (``x + (x_q - x).detach()``): a bare
+    ``.to(float8)`` cast is non-differentiable (its rounding derivative is 0 a.e. and float8 has no autograd
+    support), so without the STE *no* gradient reaches ``wq_b``/``wk``. ``head_dim <= block_size`` (enforced
+    by DSAConfig) => a single block per head/token, i.e. one fp32 scale per row.
+
+    See Jacob et al. 2018 (arXiv:1712.05877) and PyTorch ``FakeQuantize`` for the fake-quant + STE pattern.
     """
-    amax = x.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    scale = amax / FP8_MAX
-    x_fp8 = (x / scale).to(FP8_DTYPE)
-    return x_fp8, scale.squeeze(-1)
+    with torch.no_grad():  # x_q is a value-only reference point; no graph is kept for it
+        amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+        scale = amax / FP8_MAX
+        x_q = (x / scale).to(FP8_DTYPE).float() * scale
+    return x + (x_q - x).detach()  # STE: forward == x_q, backward == identity into x
 
 
 class LightningIndexer(nn.Module):
@@ -224,10 +235,11 @@ class LightningIndexer(nn.Module):
     ) -> torch.Tensor:
         """Raw indexer scores ``I[b, s_q, s_k] = sum_h (w_h * softmax_scale) * ReLU(<q_h, k>)``.
 
-        Single key broadcast across all query heads (MQA). When ``cfg.fp8`` is set this mirrors DeepSeek's
-        ``fp8_index``: q/k are blockwise-quantized to E4M3, the per-head ReLU dot products are summed with
-        ``weights`` that carry ``q_scale * softmax_scale`` (and the key dequant ``k_scale``). The bf16 path
-        is the algebraically-identical full-precision reference. No softmax / L1-norm here.
+        Single key broadcast across all query heads (MQA). When ``cfg.fp8`` is set, q/k are fake-quantized
+        to E4M3 (blockwise, straight-through) and the ReLU dot product is taken in the *dequantized* domain
+        — the same fp8 numerics DeepSeek's ``fp8_index`` computes (the per-row positive scales ``q_scale``/
+        ``k_scale`` factor out of the ReLU), but differentiable so ``wq_b``/``wk`` train. The bf16 path is
+        the algebraically-identical full-precision reference. No softmax / L1-norm here.
         """
         if self.cfg.fp8:
             # V3.2 applies a Hadamard rotation to q/k before quantization (orthonormal -> preserves the
@@ -235,11 +247,10 @@ class LightningIndexer(nn.Module):
             if self.cfg.rotate_activation:
                 q_idx = _rotate_activation(q_idx)
                 k_idx = _rotate_activation(k_idx)
-            q_fp8, q_scale = _act_quant(q_idx)  # q_scale: [b, s_q, n_heads]
-            k_fp8, k_scale = _act_quant(k_idx)  # k_scale: [b, s_k]
-            dots = torch.einsum("bqhd,bkd->bqhk", q_fp8.float(), k_fp8.float())
-            dots = torch.relu(dots) * k_scale[:, None, None, :]  # apply key dequant scale
-            eff_w = (weights * self.softmax_scale * q_scale).to(dots.dtype)  # fold q_scale + softmax_scale
+            q_dq = _fake_quant_fp8(q_idx)  # dequantized E4M3 (with STE): [b, s_q, n_heads, head_dim]
+            k_dq = _fake_quant_fp8(k_idx)  # dequantized E4M3 (with STE): [b, s_k, head_dim]
+            dots = torch.relu(torch.einsum("bqhd,bkd->bqhk", q_dq, k_dq))
+            eff_w = (weights * self.softmax_scale).to(dots.dtype)
             scores = torch.einsum("bqhk,bqh->bqk", dots, eff_w)
         else:
             dots = torch.relu(torch.einsum("bqhd,bkd->bqhk", q_idx, k_idx))

@@ -205,6 +205,100 @@ def test_dense_warmup_kl_tiling_matches_full():
     torch.testing.assert_close(kl_tiled, kl_full, rtol=1e-5, atol=1e-5)
 
 
+@requires_cuda
+@pytest.mark.parametrize("T", [16, 512])
+def test_recompute_matches_minicpm_eager_attention(T):
+    """Ground-truth check: our recomputed target `p` must equal MiniCPM's OWN attention distribution.
+
+    Flash hides the weights, so we use MiniCPM's *eager* attention (output_attentions=True) as the
+    reference and compare its head-averaged attn_weights to our recomputed `p` (from the flash-path q/k),
+    on the same weights + input. Catches any mismatch in softmax_scale, RoPE, nope/pe split, or causal mask.
+
+    T=512 is the positional-confidence case (9b): eager at 32K is infeasible (~172 GB attn matrix), but
+    MiniCPM3's RoPE is regime-independent (long_factor == short_factor, original_max == max == 32768) and
+    `p` is built from the base's own post-RoPE q/k, so a mid-length single-doc match is representative of
+    32K. Larger T would just cost eager memory without adding coverage.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from verl.models.transformers.minicpm_dsa import apply_get_usable_length_shim
+
+    apply_get_usable_length_shim()
+    ids = _ids(bsz=1, T=T)
+    pos = torch.arange(T, device="cuda").unsqueeze(0)  # single doc, no padding -> strictly causal
+
+    # --- reference: MiniCPM eager attention weights (the real distribution) ---
+    cfg_e = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
+    cfg_e.num_hidden_layers = 2
+    cfg_e.vocab_size = 1000
+    cfg_e._attn_implementation = "eager"
+    eager = AutoModelForCausalLM.from_config(cfg_e, trust_remote_code=True).to("cuda").to(torch.bfloat16).eval()
+    with torch.no_grad():
+        out = eager(input_ids=ids, position_ids=pos, output_attentions=True)
+    ref_p = [a.float().mean(dim=1) for a in out.attentions]  # per layer: [bsz, T, T] head-averaged
+
+    # --- ours: DSA flash path, SAME weights, capture the recomputed p ---
+    cfg_f = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
+    cfg_f.num_hidden_layers = 2
+    cfg_f.vocab_size = 1000
+    cfg_f._attn_implementation = "flash_attention_2"
+    flash = AutoModelForCausalLM.from_config(
+        cfg_f, trust_remote_code=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16
+    ).to("cuda").to(torch.bfloat16)
+    flash.load_state_dict(eager.state_dict())  # identical base weights (no indexer yet)
+    flash.config.dsa_enabled = True
+    flash.config.dsa_overrides = {"n_heads": 4, "head_dim": 64, "mode": "dense_warmup", "fp8": False, "kl_block_size": 4096}
+    _patch(flash)
+    for layer in flash.model.layers:
+        layer.self_attn.dsa._capture_p = True
+    with torch.no_grad():
+        flash(input_ids=ids, position_ids=pos)
+    ours_p = [layer.self_attn._dsa_p.float() for layer in flash.model.layers]
+
+    for li, (o, r) in enumerate(zip(ours_p, ref_p)):
+        assert o.shape == r.shape, f"layer {li}: {o.shape} vs {r.shape}"
+        torch.testing.assert_close(o, r, rtol=2e-2, atol=2e-2)
+
+
+def test_dense_warmup_kl_ignores_padding():
+    """With an attention_mask, pad tokens contribute nothing: KL(masked length-8) == KL(real length-5)."""
+    import types
+
+    from verl.models.transformers.dsa_indexer import DSAConfig, LightningIndexer
+    from verl.models.transformers.minicpm_dsa import _dense_warmup_kl
+
+    torch.manual_seed(0)
+    bsz, H, Dh = 1, 2, 6
+    R, L = 5, 8  # 5 real tokens, padded to length 8
+    cfg = DSAConfig(enabled=True, n_heads=4, head_dim=8, rope_head_dim=4, q_lora_rank=16, hidden_size=32, fp8=False)
+    attn = types.SimpleNamespace(softmax_scale=Dh**-0.5, indexer=LightningIndexer(cfg), dsa=cfg)
+
+    hidden = torch.randn(bsz, L, 32)
+    qr = torch.randn(bsz, L, 16)
+    q = torch.randn(bsz, H, L, Dh)
+    k = torch.randn(bsz, H, L, Dh)
+    cos = torch.randn(L, 4)
+    sin = torch.randn(L, 4)
+    # right-padded: position_ids reset to 0 in the pad region (as torch.nested.to_padded_tensor does)
+    pos8 = torch.tensor([[0, 1, 2, 3, 4, 0, 0, 0]])
+    mask8 = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]])
+
+    kl_masked = _dense_warmup_kl(attn, hidden, qr, q, k, cos, sin, pos8, attention_mask=mask8)
+    assert torch.isfinite(kl_masked)  # pad-query NaNs must not leak
+
+    # real-only equivalent: first R positions, no padding
+    pos5 = torch.tensor([[0, 1, 2, 3, 4]])
+    kl_real = _dense_warmup_kl(attn, hidden[:, :R], qr[:, :R], q[:, :, :R], k[:, :, :R], cos, sin, pos5)
+    torch.testing.assert_close(kl_masked, kl_real, rtol=1e-5, atol=1e-5)
+
+    # diagnostics must also stay finite under padding (pad-query rows give NaN recall pre-guard)
+    cfg._do_diag = True
+    _dense_warmup_kl(attn, hidden, qr, q, k, cos, sin, pos8, attention_mask=mask8)
+    diag = attn._dsa_diag
+    assert diag is not None and all(torch.isfinite(v) for v in diag.values()), f"non-finite diag: {diag}"
+    assert 0.0 <= diag["recall"].item() <= 1.0 + 1e-4 and diag["nan_frac"].item() == 0.0
+
+
 def test_causal_doc_mask_helper():
     """Pure-CPU unit test of the per-document causal mask (no model needed)."""
     from verl.models.transformers.minicpm_dsa import _build_causal_doc_bias
@@ -219,4 +313,59 @@ def test_causal_doc_mask_helper():
     assert allow[2].tolist() == [True, True, True, False, False, False, False, False]
     # no cross-document attention anywhere
     assert not allow[:4, 4:].any() and not allow[4:, :4].any()
+
+
+def test_dense_warmup_target_is_blockdiagonal_multidoc():
+    """9a: with multi-document `position_ids` (per-doc resets), the recomputed target `p` must be exactly
+    the block-diagonal per-document causal head-averaged softmax — cross-doc/future entries zero, within-doc
+    a renormalized causal softmax over the SAME q/k. This validates the doc-mask math that real multi-doc
+    packing (#5) will depend on. NOTE: the base flash attention must ALSO be made per-doc (varlen/cu_seqlens)
+    when real packing lands, or `p` (per-doc masked) != the true base attention (which would attend
+    cross-doc). This test is the acceptance oracle for that #5 wiring. CPU-only (no model needed).
+    """
+    import types
+
+    from verl.models.transformers.dsa_indexer import DSAConfig, LightningIndexer
+    from verl.models.transformers.minicpm_dsa import _dense_warmup_kl
+
+    torch.manual_seed(0)
+    bsz, H, Dh = 1, 3, 8
+    doc_lens = [7, 5]  # two packed docs, position_ids reset at the 2nd
+    T = sum(doc_lens)
+    pos = torch.tensor([[*range(doc_lens[0]), *range(doc_lens[1])]])  # [0..6, 0..4]
+    scale = Dh**-0.5
+    # kl_block_size >= T => a single query block, so `_capture_p` stashes the full [bsz, T, T] target
+    cfg = DSAConfig(
+        enabled=True, n_heads=4, head_dim=8, rope_head_dim=4, q_lora_rank=16, hidden_size=32, fp8=False, kl_block_size=T
+    )
+    attn = types.SimpleNamespace(softmax_scale=scale, indexer=LightningIndexer(cfg), dsa=cfg)
+
+    hidden = torch.randn(bsz, T, 32)
+    qr = torch.randn(bsz, T, 16)
+    q = torch.randn(bsz, H, T, Dh)
+    k = torch.randn(bsz, H, T, Dh)
+    cos, sin = torch.randn(T, 4), torch.randn(T, 4)
+
+    cfg._capture_p = True
+    _dense_warmup_kl(attn, hidden, qr, q, k, cos, sin, pos)
+    p = attn._dsa_p[0]  # [T, T] head-averaged target
+
+    # --- independent block-diagonal causal reference over the SAME q/k ---
+    doc_id = torch.tensor([d for d, n in enumerate(doc_lens) for _ in range(n)])  # [0]*7 + [1]*5
+    qi = torch.arange(T)
+    allow = (qi[:, None] >= qi[None, :]) & (doc_id[:, None] == doc_id[None, :])  # causal AND same-document
+    logits = torch.einsum("hid,hjd->hij", q[0], k[0]) * scale  # [H, T, T]
+    logits = logits.masked_fill(~allow[None], float("-inf"))
+    per_head = torch.softmax(logits, dim=-1)  # [H, T, T], masked entries exactly 0
+    ref = per_head.mean(0)  # head-averaged [T, T]
+
+    torch.testing.assert_close(p, ref, rtol=1e-4, atol=1e-4)
+    # structural guarantees the doc-mask must give
+    assert torch.count_nonzero(p[~allow]) == 0, "cross-document / future keys must be exactly 0"
+    torch.testing.assert_close(p.sum(-1), torch.ones(T), atol=1e-4, rtol=0)  # each query row normalized
+
+    # 9c: head aggregation — mean-over-heads == L1-normalize(sum-over-heads) (the DeepSeek-V3.2 target form)
+    summed = per_head.sum(0)
+    l1 = summed / summed.sum(-1, keepdim=True)
+    torch.testing.assert_close(ref, l1, rtol=1e-5, atol=1e-5)
 

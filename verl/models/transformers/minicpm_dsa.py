@@ -48,6 +48,35 @@ def apply_get_usable_length_shim() -> None:
         DynamicCache.get_usable_length = lambda self, new_seq_length, layer_idx=0: self.get_seq_length(layer_idx)
 
 
+def dsa_overrides_from_config(model_config) -> dict:
+    """Collect DSA overrides from the (HF) model config, supporting two injection styles:
+
+    * a `dsa_overrides` dict attribute (used by tests / programmatic setup), or
+    * flat scalar attributes `dsa_<field>` (e.g. `dsa_n_heads`) — required for verl's `override_config`,
+      whose `update_model_config` recurses into nested dict values (so a nested `dsa_overrides` dict can't
+      be injected, but scalars `setattr` fine).
+    """
+    ov = getattr(model_config, "dsa_overrides", None)
+    if isinstance(ov, dict):
+        return dict(ov)
+    out = {}
+    for field in (
+        "n_heads",
+        "head_dim",
+        "rope_head_dim",
+        "top_k",
+        "mode",
+        "kl_block_size",
+        "kl_reduction",
+        "fp8",
+        "diag_interval",
+    ):
+        val = getattr(model_config, f"dsa_{field}", None)
+        if val is not None:
+            out[field] = val
+    return out
+
+
 def build_dsa_config(model_config, **overrides) -> DSAConfig:
     """Build a `DSAConfig` from a live MiniCPM3 config. `q_lora_rank`/`rope_head_dim`/`hidden_size` are
     forced from the model; `n_heads`/`head_dim`/`top_k`/`mode`/`fp8` come from `overrides` (training cfg)."""
@@ -119,7 +148,10 @@ def install_kl_accumulation(model) -> None:
             model._dsa_metrics = {}
             return output
         kl_stack = torch.stack(kls)
-        model._dsa_indexer_kl = kl_stack.sum()  # the loss (keeps grad)
+        # loss reduction over layers (configurable, keeps grad): "mean" (default) | "sum" (reference). "mean"
+        # gives an interpretable per-layer loss scale; same optimum, gradient just rescaled by 1/n_layers.
+        reduction = getattr(layers[0].self_attn.dsa, "kl_reduction", "mean")
+        model._dsa_indexer_kl = kl_stack.mean() if reduction == "mean" else kl_stack.sum()
         metrics = {
             "indexer/kl_layer_mean": kl_stack.mean().item(),
             "indexer/kl_layer_min": kl_stack.min().item(),
@@ -137,15 +169,19 @@ def install_kl_accumulation(model) -> None:
     model.register_forward_hook(_post_hook)
 
 
-def _causal_doc_bias_block(position_ids, q0: int, q1: int, T: int, device) -> torch.Tensor:
+def _causal_doc_bias_block(position_ids, q0: int, q1: int, T: int, device, key_mask=None) -> torch.Tensor:
     """Additive mask `[bsz, q1-q0, T]` (0 where key j is attendable by query i in [q0,q1), else -inf):
-    causal (j<=i) AND same-document (doc boundary = `position_ids == 0`)."""
+    causal (j<=i) AND same-document (doc boundary = `position_ids == 0`) AND, if `key_mask` is given,
+    the key is a real (non-pad) token. This mirrors exactly what the base attention attends over, so the
+    recomputed target `p` matches the base attention distribution over the same positions."""
     doc_id = (position_ids == 0).cumsum(dim=-1)  # [bsz, T] — increments at each doc start
     q_pos = torch.arange(q0, q1, device=device)  # [B]
     k_pos = torch.arange(T, device=device)  # [T]
     causal = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)  # [B, T]
     same_doc = doc_id[:, q0:q1].unsqueeze(2) == doc_id.unsqueeze(1)  # [bsz, B, T]
     allow = causal.unsqueeze(0) & same_doc  # [bsz, B, T]
+    if key_mask is not None:
+        allow = allow & key_mask[:, None, :]  # exclude pad keys ([bsz, 1, T])
     return torch.zeros(allow.shape, device=device, dtype=torch.float32).masked_fill(~allow, float("-inf"))
 
 
@@ -156,12 +192,15 @@ def _build_causal_doc_bias(position_ids: Optional[torch.Tensor], T: int, device,
     return _causal_doc_bias_block(position_ids, 0, T, T, device).to(dtype)
 
 
-def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin, position_ids):
+def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask=None):
     """Per-layer indexer KL for Phase 1, tiled over query blocks to bound memory at 32K.
 
     Args:
         query_states, key_states: ``[bsz, num_heads, T, q_head_dim]`` (post-RoPE, pre-flash-transpose).
         cos, sin: rotary tables ``[seq_len, rope_head_dim]`` from MiniCPM's `rotary_emb`.
+        attention_mask: optional ``[bsz, T]`` real-token mask (1=real, 0=pad). When present, the valid set
+            mirrors the base attention exactly — pad keys are excluded and pad queries are dropped from the
+            loss/normalization — so padding never leaks into the target/loss.
     Returns scalar `KL(p || softmax(I))` averaged over valid query positions. The target `p` (head-averaged
     softmax attention, detached) is accumulated head-by-head so peak is ~`[bsz, block, T]`, not
     `[bsz, H, T, T]`. `block = dsa.kl_block_size`.
@@ -174,26 +213,30 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     diag_k = min(getattr(attn.dsa, "top_k", T), T)
 
     if position_ids is None:
-        position_ids = torch.arange(T, device=device).unsqueeze(0)
+        position_ids = torch.arange(T, device=device).unsqueeze(0).expand(bsz, T)
+    # real-token mask (exclude right-padding); only 2D [bsz, T] padding masks are used
+    key_mask = attention_mask.bool() if (attention_mask is not None and attention_mask.dim() == 2) else None
+
     cos_g, sin_g = cos[position_ids], sin[position_ids]  # [bsz, T, rope_head_dim]
     # indexer projections once; score per query-block (key set is the full sequence)
     q_idx, k_idx, weights = attn.indexer.project(hidden_states, qr, cos_g, sin_g)
 
     total_kl = query_states.new_zeros((), dtype=torch.float32)
-    total_cnt = 0
+    total_cnt = query_states.new_zeros((), dtype=torch.float32)
     # monitoring diagnostics (only when do_diag): recall/overlap of top-k, indexer score health
     d_recall = query_states.new_zeros((), dtype=torch.float32)
     d_overlap = query_states.new_zeros((), dtype=torch.float32)
-    d_rc = 0
+    d_rc = query_states.new_zeros((), dtype=torch.float32)
     d_ssum = query_states.new_zeros((), dtype=torch.float32)
     d_ssq = query_states.new_zeros((), dtype=torch.float32)
-    d_scnt = 0
+    d_scnt = query_states.new_zeros((), dtype=torch.float32)
     d_nan = query_states.new_zeros((), dtype=torch.float32)
 
     for q0 in range(0, T, block):
         q1 = min(q0 + block, T)
-        bias = _causal_doc_bias_block(position_ids, q0, q1, T, device)  # [bsz, B, T]
+        bias = _causal_doc_bias_block(position_ids, q0, q1, T, device, key_mask=key_mask)  # [bsz, B, T]
         allow = bias == 0.0
+        qv = key_mask[:, q0:q1].to(torch.float32) if key_mask is not None else None  # [bsz, B] real-query mask
 
         # --- target p_blk (detached); accumulate over heads to bound memory ---
         with torch.no_grad():
@@ -202,46 +245,65 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
             for h in range(H):
                 s = torch.matmul(qb[:, h], key_states[:, h].transpose(1, 2)) * scale  # [bsz, B, T]
                 p_blk += torch.softmax(s.float() + bias, dim=-1)
-            p_blk /= H
+            p_blk /= H  # NOTE: rows with no valid keys (pad queries) are NaN here — never used (see below)
+
+        if getattr(attn.dsa, "_capture_p", False):
+            # test/debug only: stash the recomputed target distribution for validation vs eager attention.
+            # Assumes a single block (kl_block_size >= T) so this is the full [bsz, T, T].
+            attn._dsa_p = p_blk.detach()
 
         # --- indexer I_blk (grad into indexer only) ---
         I_blk = attn.indexer.scores(q_idx[:, q0:q1], k_idx, weights[:, q0:q1], attn_bias=bias)  # [bsz, B, T]
         log_q = torch.log_softmax(I_blk.float(), dim=-1)
 
         term = p_blk * (torch.log(p_blk.clamp_min(_KL_EPS)) - log_q)
+        # `where` yields 0 for every masked key, so an all-masked (pad-query) row sums to a finite 0 — the
+        # NaN in p_blk at such rows is confined to masked entries and discarded, so kl_blk is always finite.
         kl_blk = torch.where(allow, term, torch.zeros_like(term)).sum(dim=-1)  # [bsz, B]
-        total_kl = total_kl + kl_blk.sum()
-        total_cnt += kl_blk.numel()
+        if qv is not None:
+            total_kl = total_kl + (kl_blk * qv).sum()  # count only real (non-pad) query rows
+            total_cnt = total_cnt + qv.sum()
+        else:
+            total_kl = total_kl + kl_blk.sum()
+            total_cnt = total_cnt + kl_blk.numel()
 
         if do_diag:
             with torch.no_grad():
                 idf = I_blk.detach().float()
                 k = min(diag_k, T)
                 topk_i = idf.topk(k, dim=-1).indices  # indexer-selected keys [bsz, B, k]
-                d_recall += p_blk.gather(-1, topk_i).sum()  # dense mass the selector captures
+                recall = p_blk.gather(-1, topk_i).sum(-1)  # [bsz, B] (NaN at pad-query rows)
                 topk_p = p_blk.topk(k, dim=-1).indices
-                d_overlap += (topk_i.unsqueeze(-1) == topk_p.unsqueeze(-2)).any(-1).float().sum() / k
-                d_rc += kl_blk.numel()
-                fin = idf[allow]  # finite (unmasked) scores only
-                d_ssum += fin.sum()
-                d_ssq += (fin * fin).sum()
-                d_scnt += fin.numel()
-                d_nan += torch.isnan(idf).float().sum()
+                overlap = (topk_i.unsqueeze(-1) == topk_p.unsqueeze(-2)).any(-1).float().sum(-1) / k
+                if qv is not None:
+                    qb_bool = qv.bool()
+                    recall = torch.where(qb_bool, recall, torch.zeros_like(recall))  # drop NaN pad rows
+                    overlap = torch.where(qb_bool, overlap, torch.zeros_like(overlap))
+                    d_rc = d_rc + qv.sum()
+                else:
+                    d_rc = d_rc + recall.numel()
+                d_recall = d_recall + recall.sum()
+                d_overlap = d_overlap + overlap.sum()
+                fin = idf[allow]  # finite valid scores only (excludes pad keys / masked / pad rows)
+                d_ssum = d_ssum + fin.sum()
+                d_ssq = d_ssq + (fin * fin).sum()
+                d_scnt = d_scnt + fin.numel()
+                d_nan = d_nan + torch.isnan(fin).float().sum()
 
-    if do_diag and d_rc > 0:
-        mean = d_ssum / max(d_scnt, 1)
-        var = (d_ssq / max(d_scnt, 1) - mean * mean).clamp_min(0)
+    if do_diag:
+        mean = d_ssum / d_scnt.clamp_min(1)
+        var = (d_ssq / d_scnt.clamp_min(1) - mean * mean).clamp_min(0)
         attn._dsa_diag = {
-            "recall": (d_recall / d_rc).detach(),
-            "overlap": (d_overlap / d_rc).detach(),
+            "recall": (d_recall / d_rc.clamp_min(1)).detach(),
+            "overlap": (d_overlap / d_rc.clamp_min(1)).detach(),
             "score_mean": mean.detach(),
             "score_std": var.sqrt().detach(),
-            "nan_frac": (d_nan / max(d_scnt, 1)).detach(),
+            "nan_frac": (d_nan / d_scnt.clamp_min(1)).detach(),
         }
     else:
         attn._dsa_diag = None
 
-    return (total_kl / max(total_cnt, 1)).to(compute_dtype)
+    return (total_kl / total_cnt.clamp_min(1)).to(compute_dtype)
 
 
 def minicpm3_dsa_attn_forward(
@@ -297,7 +359,9 @@ def minicpm3_dsa_attn_forward(
     dsa = getattr(self, "dsa", None)
     if dsa is not None and dsa.enabled:
         if dsa.mode == "dense_warmup":
-            self._dsa_kl = _dense_warmup_kl(self, hidden_states, qr, query_states, key_states, cos, sin, position_ids)
+            self._dsa_kl = _dense_warmup_kl(
+                self, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask
+            )
         elif dsa.mode == "sparse":
             raise NotImplementedError("DSA 'sparse' mode (Phase 2 top-k attention) is not implemented yet.")
         else:
