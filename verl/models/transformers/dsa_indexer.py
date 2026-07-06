@@ -78,6 +78,8 @@ class DSAConfig:
     block_size: int = 128  # FP8 act_quant block size (reference default)
     rotate_activation: bool = True  # Hadamard pre-quant rotation (V3.2), only in the FP8 path
     diag_interval: int = 10  # compute monitoring diagnostics (topk recall/overlap/score) every N forwards
+    log_per_layer: bool = False  # also emit per-layer indexer/kl_by_layer/L## (+ entropy_frac_by_layer/L##
+    # on diag forwards) — a debug breakdown (~2*n_layers extra scalar keys); the mean/min/max always log
 
     def __post_init__(self):
         if self.kl_reduction not in ("sum", "mean"):
@@ -199,6 +201,25 @@ class LightningIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(cfg.head_dim)
         # per-head weights from hidden states, kept in fp32 (reference: Linear(dim, n_heads, dtype=float32))
         self.weights_proj = nn.Linear(cfg.hidden_size, cfg.n_heads, bias=False).float()
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Explicit, reproducible init for the indexer (do NOT rely on framework defaults — only rank-0's
+        init survives the FSDP2 broadcast, so it must be deterministic and seedable).
+
+        Per-fan-in width-scaled normal, ``std = 0.5 / sqrt(fan_in)`` (the DeepSeek-family ``0.5/sqrt(d)``
+        convention applied per projection): each linear's output starts at ~half-unit variance, so the raw
+        scores ``I`` are small and ``softmax(I)`` starts near-uniform — the right high-entropy start for the
+        KL distillation (unbiased, gentle gradients, maximal softmax responsiveness). ``k_norm`` at identity
+        (the key is renormalized anyway). ``weights_proj`` is kept SMALL-BUT-NONZERO: zeroing it severs the
+        gradient to ``wq_b``/``wk`` (they only receive grad through ``w`` — see docs/dsa_grad_norm_debugging.md
+        issue #2). Watch ``indexer/entropy_frac`` (~1.0 = near-uniform) to confirm the start is healthy.
+        """
+        nn.init.normal_(self.wq_b.weight, std=0.5 * self.cfg.q_lora_rank**-0.5)
+        nn.init.normal_(self.wk.weight, std=0.5 * self.cfg.hidden_size**-0.5)
+        nn.init.normal_(self.weights_proj.weight, std=0.5 * self.cfg.hidden_size**-0.5)
+        nn.init.ones_(self.k_norm.weight)
+        nn.init.zeros_(self.k_norm.bias)
 
     def project(
         self, x: torch.Tensor, qr: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor

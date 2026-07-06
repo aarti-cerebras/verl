@@ -167,7 +167,7 @@ def test_monitoring_diagnostics_populated():
     expected = [
         "indexer/kl_layer_mean", "indexer/kl_layer_min", "indexer/kl_layer_max",
         "indexer/topk_recall", "indexer/topk_overlap", "indexer/score_mean", "indexer/score_std",
-        "indexer/nan_frac",
+        "indexer/nan_frac", "indexer/entropy", "indexer/entropy_frac",
     ]
     for key in expected:
         assert key in m, f"missing metric {key}"
@@ -175,7 +175,41 @@ def test_monitoring_diagnostics_populated():
     assert 0.0 <= m["indexer/topk_recall"] <= 1.0 + 1e-4
     assert 0.0 <= m["indexer/topk_overlap"] <= 1.0 + 1e-4
     assert m["indexer/nan_frac"] == 0.0
+    assert 0.0 <= m["indexer/entropy_frac"] <= 1.0 + 1e-4  # normalized softmax(I) entropy
     assert m["indexer/kl_layer_min"] <= m["indexer/kl_layer_mean"] + 1e-6 <= m["indexer/kl_layer_max"] + 1e-6
+
+
+@requires_cuda
+def test_per_layer_metrics_logged_when_enabled():
+    """log_per_layer emits SEPARATE per-layer scalars: indexer/kl_by_layer/L## every step and
+    indexer/entropy_frac_by_layer/L## on diag forwards. Off by default (would be ~2*n_layers keys)."""
+    import statistics
+
+    model = _build_tiny_minicpm3(dsa_enabled=True)
+    model.config.dsa_overrides = {**DSA_OVERRIDES, "log_per_layer": True}
+    _patch(model)
+    ids = _ids(bsz=1, T=16)
+    pos = torch.arange(16, device="cuda").unsqueeze(0)
+    with torch.no_grad():
+        model(input_ids=ids, position_ids=pos)  # forward #1 -> diag always runs
+    m = model._dsa_metrics
+
+    per_layer_kl = []
+    for i in range(2):  # tiny model has 2 layers -> L00, L01
+        kk, ek = f"indexer/kl_by_layer/L0{i}", f"indexer/entropy_frac_by_layer/L0{i}"
+        assert kk in m and isinstance(m[kk], float) and math.isfinite(m[kk]), f"missing/bad {kk}: {list(m)}"
+        assert ek in m and 0.0 <= m[ek] <= 1.0 + 1e-4, f"missing/bad {ek}"
+        per_layer_kl.append(m[kk])
+    # the aggregate mean must equal the mean of the per-layer values (bf16 tol — per-layer KL is bf16)
+    assert m["indexer/kl_layer_mean"] == pytest.approx(statistics.mean(per_layer_kl), abs=5e-3)
+    assert min(per_layer_kl) == pytest.approx(m["indexer/kl_layer_min"], abs=5e-3)
+
+
+def test_per_layer_metrics_off_by_default():
+    """Sanity (CPU): with log_per_layer unset, no per-layer keys are emitted (dashboards stay clean)."""
+    from verl.models.transformers.dsa_indexer import DSAConfig
+
+    assert DSAConfig().log_per_layer is False
 
 
 def test_dense_warmup_kl_tiling_matches_full():

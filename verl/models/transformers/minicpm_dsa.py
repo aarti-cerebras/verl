@@ -70,6 +70,7 @@ def dsa_overrides_from_config(model_config) -> dict:
         "kl_reduction",
         "fp8",
         "diag_interval",
+        "log_per_layer",
     ):
         val = getattr(model_config, f"dsa_{field}", None)
         if val is not None:
@@ -142,12 +143,13 @@ def install_kl_accumulation(model) -> None:
 
     def _post_hook(module, args, output):
         attns = [layer.self_attn for layer in layers]
-        kls = [a._dsa_kl for a in attns if getattr(a, "_dsa_kl", None) is not None]
-        if not kls:
+        # keep the true layer index alongside each value so per-layer keys are labelled correctly
+        kl_items = [(i, a._dsa_kl) for i, a in enumerate(attns) if getattr(a, "_dsa_kl", None) is not None]
+        if not kl_items:
             model._dsa_indexer_kl = None
             model._dsa_metrics = {}
             return output
-        kl_stack = torch.stack(kls)
+        kl_stack = torch.stack([kl for _, kl in kl_items])
         # loss reduction over layers (configurable, keeps grad): "mean" (default) | "sum" (reference). "mean"
         # gives an interpretable per-layer loss scale; same optimum, gradient just rescaled by 1/n_layers.
         reduction = getattr(layers[0].self_attn.dsa, "kl_reduction", "mean")
@@ -157,11 +159,19 @@ def install_kl_accumulation(model) -> None:
             "indexer/kl_layer_min": kl_stack.min().item(),
             "indexer/kl_layer_max": kl_stack.max().item(),
         }
-        diags = [a._dsa_diag for a in attns if getattr(a, "_dsa_diag", None) is not None]
-        if diags:
+        diag_items = [(i, a._dsa_diag) for i, a in enumerate(attns) if getattr(a, "_dsa_diag", None) is not None]
+        if diag_items:
+            diags = [d for _, d in diag_items]
             rename = {"recall": "topk_recall", "overlap": "topk_overlap"}
-            for key in ("recall", "overlap", "score_mean", "score_std", "nan_frac"):
+            for key in ("recall", "overlap", "score_mean", "score_std", "nan_frac", "entropy", "entropy_frac"):
                 metrics[f"indexer/{rename.get(key, key)}"] = torch.stack([d[key] for d in diags]).mean().item()
+        # optional per-layer breakdown (debug): emit SEPARATE scalar keys so the logger doesn't collapse them
+        # to a mean. kl_by_layer every step; entropy_frac_by_layer only on diag forwards.
+        if getattr(layers[0].self_attn.dsa, "log_per_layer", False):
+            for i, kl in kl_items:
+                metrics[f"indexer/kl_by_layer/L{i:02d}"] = kl.item()
+            for i, d in diag_items:
+                metrics[f"indexer/entropy_frac_by_layer/L{i:02d}"] = d["entropy_frac"].item()
         model._dsa_metrics = metrics
         return output
 
@@ -231,6 +241,8 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     d_ssq = query_states.new_zeros((), dtype=torch.float32)
     d_scnt = query_states.new_zeros((), dtype=torch.float32)
     d_nan = query_states.new_zeros((), dtype=torch.float32)
+    d_ent = query_states.new_zeros((), dtype=torch.float32)  # softmax(I) entropy (nats), summed over valid queries
+    d_entfrac = query_states.new_zeros((), dtype=torch.float32)  # entropy / log(#valid keys) in [0,1]
 
     for q0 in range(0, T, block):
         q1 = min(q0 + block, T)
@@ -289,6 +301,19 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
                 d_ssq = d_ssq + (fin * fin).sum()
                 d_scnt = d_scnt + fin.numel()
                 d_nan = d_nan + torch.isnan(fin).float().sum()
+                # softmax(I) entropy: how peaked the student distribution is. entropy_frac ~1.0 => near-uniform
+                # (healthy KL-distillation start); a low/falling value flags a saturated or over-committed init.
+                q_dist = torch.softmax(idf, dim=-1)  # masked keys -> 0 (idf carries -inf on disallowed)
+                ent = torch.special.entr(q_dist).sum(-1)  # [bsz, B] per-query entropy (nats); entr(0)=0
+                valid = allow.sum(-1)  # [bsz, B] attendable keys per query (causal + same-doc)
+                ent_frac = torch.where(
+                    valid > 1, ent / valid.float().clamp_min(2).log(), torch.ones_like(ent)
+                )  # single-valid-key rows are trivially uniform -> 1.0
+                if qv is not None:
+                    ent = torch.where(qb_bool, ent, torch.zeros_like(ent))
+                    ent_frac = torch.where(qb_bool, ent_frac, torch.zeros_like(ent_frac))
+                d_ent = d_ent + ent.sum()
+                d_entfrac = d_entfrac + ent_frac.sum()
 
     if do_diag:
         mean = d_ssum / d_scnt.clamp_min(1)
@@ -299,6 +324,8 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
             "score_mean": mean.detach(),
             "score_std": var.sqrt().detach(),
             "nan_frac": (d_nan / d_scnt.clamp_min(1)).detach(),
+            "entropy": (d_ent / d_rc.clamp_min(1)).detach(),
+            "entropy_frac": (d_entfrac / d_rc.clamp_min(1)).detach(),
         }
     else:
         attn._dsa_diag = None

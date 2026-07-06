@@ -294,3 +294,47 @@ def test_strict_load_rejects_missing_indexer_keys():
     with pytest.raises(RuntimeError, match="[Uu]nexpected key"):
         NoIndexer().load_state_dict(sd)  # strict=True: indexer.* are unexpected -> caught, not silently dropped
     WithIndexer().load_state_dict(sd)  # with indexers attached: loads cleanly (no raise)
+
+
+def test_reset_parameters_per_fan_in_std_and_norms():
+    """#7: reset_parameters uses per-fan-in width-scaled normal (std=0.5/sqrt(fan_in)); k_norm at identity;
+    weights_proj NONZERO (zeroing it severs the gradient to wq_b/wk -- Issue #2)."""
+    import math
+
+    cfg = _cfg()
+    idx = LightningIndexer(cfg)
+    assert abs(idx.wq_b.weight.std().item() - 0.5 / math.sqrt(cfg.q_lora_rank)) < 5e-3
+    assert abs(idx.wk.weight.std().item() - 0.5 / math.sqrt(cfg.hidden_size)) < 5e-3
+    assert abs(idx.weights_proj.weight.std().item() - 0.5 / math.sqrt(cfg.hidden_size)) < 5e-3
+    assert torch.equal(idx.k_norm.weight, torch.ones_like(idx.k_norm.weight))
+    assert torch.equal(idx.k_norm.bias, torch.zeros_like(idx.k_norm.bias))
+    assert idx.weights_proj.weight.abs().sum().item() > 0, "weights_proj must be nonzero at init"
+
+
+def test_reset_parameters_is_deterministic():
+    """#7: init must be reproducible under a fixed seed (only rank-0's init survives the FSDP2 broadcast)."""
+    torch.manual_seed(42)
+    a = LightningIndexer(_cfg())
+    torch.manual_seed(42)
+    b = LightningIndexer(_cfg())
+    for (n, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters()):
+        assert torch.equal(pa, pb), f"{n} not deterministic under the same seed"
+
+
+def test_init_softmax_entropy_is_near_uniform():
+    """#7: the per-fan-in init must start softmax(I) near-uniform (high entropy) -- the healthy KL-distillation
+    start (unbiased, gentle gradients, maximal softmax responsiveness). Prints entropy_frac across input
+    scales for debugging (score scale grows with ||x||; MiniCPM's muP residual scaling keeps ||x|| ~unit)."""
+    import math
+
+    torch.manual_seed(0)
+    idx = LightningIndexer(_cfg(fp8=True))  # production (fp8) path
+    fracs = {}
+    for x_std in (1.0, 3.0, 8.0):
+        x, qr, cos, sin = _inputs()
+        scores = idx(x * x_std, qr, cos, sin).float()  # [B, S, S], no mask -> all S keys valid
+        q = torch.softmax(scores, dim=-1)
+        frac = (torch.special.entr(q).sum(-1) / math.log(S)).mean().item()  # 1.0 == uniform over S keys
+        fracs[x_std] = frac
+        print(f"[init entropy] x_std={x_std:>4}: entropy_frac={frac:.4f} (1.0 = uniform over {S} keys)")
+    assert fracs[1.0] >= 0.95, f"softmax(I) not near-uniform at unit input scale: {fracs[1.0]:.4f}"
