@@ -11,9 +11,9 @@ three sections:
 
 | section | keys | contents |
 |---|---|---|
-| **`indexer/`** | `kl`, `kl_layer_{mean,min,max}`, `topk_recall`, `topk_overlap`, `score_{mean,std}`, `nan_frac` | the loss + indexer training-health scalars |
+| **`indexer/`** | `kl`, `kl_layer_{mean,min,max}`, `topk_recall`, `topk_overlap`, `score_{mean,std}`, `nan_frac`, `entropy`, `entropy_frac` (+ `entropy_frac_by_layer/L##`) | the loss + **student** (indexer) training-health scalars, incl. `softmax(I)` entropy |
 | **`kl_by_layer/`** | `L00`, `L01`, … | per-layer KL breakdown (only when `log_per_layer=True`) |
-| **`entropy/`** | `indexer`, `indexer_frac`, `attn`, `attn_frac` (+ `*_frac_by_layer/L##`) | student (indexer `softmax(I)`) **and** teacher (base attention `p`) entropy, side by side |
+| **`attn/`** | `entropy`, `entropy_frac` (+ `entropy_frac_by_layer/L##`) | **teacher** (base attention `p`) entropy — a fixed reference (no gradient), in its own section so student and teacher panes never mix |
 
 Related: [`dsa_grad_norm_debugging.md`](dsa_grad_norm_debugging.md).
 
@@ -140,10 +140,11 @@ Detects score collapse/explosion (dead ReLU → μ→0; blow-up → σ huge).
 
 Fraction of valid `I` entries that are NaN, `d_nan / N`. Pure guard; should be exactly 0.
 
-## The entropy section (`entropy/*`, only every `diag_interval` forwards)
+## Entropy: student vs teacher (`indexer/entropy*` and `attn/entropy*`, only every `diag_interval` forwards)
 
-Two distributions' entropies, grouped in their own `entropy/` wandb section so the **student** (indexer) and
-**teacher** (base attention) read side by side. Both use `torch.special.entr` (`= −P·ln P`, with `entr(0)=0`
+Two distributions' entropies, split into **separate** wandb sections — the **student** (indexer) entropy
+under `indexer/` (alongside its kl/topk/score health) and the **teacher** (base attention) entropy under
+`attn/` — so the two never share a pane group. Both use `torch.special.entr` (`= −P·ln P`, with `entr(0)=0`
 so masked keys contribute nothing), summed over keys → per-query entropy in **nats**; averaged over valid
 queries, then over layers. The `*_frac` variant normalizes by `ln(#allowed keys)` so it's comparable across
 query positions and sequence lengths (`1.0 = uniform`; single-valid-key rows → `1.0`).
@@ -153,7 +154,7 @@ entropy_i      = Σ_j  −P[i,j] · ln P[i,j]           (over allowed keys j)
 entropy_frac_i = entropy_i / ln(#valid keys_i)      ∈ [0,1]
 ```
 
-### `entropy/indexer` / `entropy/indexer_frac`
+### `indexer/entropy` / `indexer/entropy_frac`
 
 Entropy of the **student** distribution `q = softmax(I)` (`P = q` above) — how peaked vs. spread the indexer's
 selection is. **Read it as init/training health:** ~1.0 = near-uniform (healthy KL-distillation start — unbiased,
@@ -165,7 +166,7 @@ for `indexer_frac` well below 1.0 at step 0, which would indicate the init tempe
 `std(I) ≈ 0.177·x_std`, and `entropy_frac ≈ 1 − C·x_std²` connect — is in
 [`dsa_indexer_init_entropy_math.md`](dsa_indexer_init_entropy_math.md).
 
-### `entropy/attn` / `entropy/attn_frac`
+### `attn/entropy` / `attn/entropy_frac`
 
 Entropy of the **teacher** distribution `p` (the base model's head-averaged softmax attention, `P = p` above) —
 how peaked the *true* attention the indexer is distilling actually is. This is a property of the frozen base
@@ -175,9 +176,10 @@ the top-`k` selection is inherently easy and you should expect high `topk_recall
 attention) is a harder target and caps how much recall the sparse selection can retain. It contextualizes
 `topk_recall`/`topk_overlap` and the KL floor — the indexer can only get as peaked as the teacher it matches.
 
-### `entropy/indexer_frac_by_layer/L##` / `entropy/attn_frac_by_layer/L##`
+### `indexer/entropy_frac_by_layer/L##` / `attn/entropy_frac_by_layer/L##`
 
-Per-layer breakdowns of the two `*_frac` metrics (only when `log_per_layer=True`), in the `entropy/` section.
+Per-layer breakdowns of the two `*_frac` metrics (only when `log_per_layer=True`), in the `indexer/` and
+`attn/` sections respectively.
 
 ---
 

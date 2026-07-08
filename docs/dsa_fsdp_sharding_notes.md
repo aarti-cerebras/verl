@@ -190,9 +190,11 @@ FSDP1 kept a view onto the freed unsharded storage → hard crash `setStorage: �
 silently leaves `.grad` empty → `grad_norm = 0`. (`_finalize_backward:340` may also `warning_once` that
 "N modules … did not run forward before backward" — the same skipped-boundary-logic symptom.)
 
-**Current fix:** `engine.reshard_after_forward=False` — the unsharded buffer is never freed, so no
-re-gather is needed and plain autograd finds live params. Free at world_size=1; costs memory at
-world_size>1 (the whole frozen base stays resident on every rank).
+**First workaround (superseded):** `engine.reshard_after_forward=False` — the unsharded buffer is never
+freed, so no re-gather is needed and plain autograd finds live params. Free at world_size=1; costs memory at
+world_size>1 (the whole frozen base stays resident on every rank). **This only fixed `grad_norm=0`, not the
+flat loss** — see §3b for why the optimizer master still got no grad. The real fix is **Option B2** (§4),
+now the default; this override has been removed from the launch scripts.
 
 ---
 
@@ -266,32 +268,54 @@ is that the *optimizer's* params get a grad and move — i.e. `post_backward`/`f
 
 ## 4. Sharding options for the trainable indexer
 
-### Option A — global `reshard_after_forward=False` (current)
+**Status: Option B2 is implemented and is the current default.** Option A below is retained for context (it
+was the prior workaround). See "Implementation & validation" at the end of this section.
+
+### Option A — global `reshard_after_forward=False` (prior workaround)
 
 Simplest, correct. Keeps every unit (including the ~8 GB frozen base) unsharded per rank. Right for
-single-GPU; wasteful of memory at multi-rank.
+single-GPU; wasteful of memory at multi-rank. This was the stop-gap before B2; the launch scripts no longer
+use it (they set the base `reshard_after_forward=True` and let B2 pin only the indexer resident).
 
-### Option B — indexer as its own `fully_shard` unit
+### Option B — indexer as its own `fully_shard` unit ✅ (implemented)
 
-The indexer's output *does* require grad (its params are trainable), so a separately-wrapped indexer
-**would** have its EXIT gate armed and fired by the KL backward — re-gather works. Two sub-variants:
+The indexer's output *does* require grad (its params are trainable), so a separately-wrapped indexer has its
+EXIT gate armed and fired by the KL backward — the reduce-scatter onto the sharded (optimizer) master runs.
+Two sub-variants:
 
 - **B1**: indexer unit `reshard=True` — works via the fired gate.
-- **B2 (recommended for multi-rank)**: indexer unit `reshard=False`, base layers `reshard=True`. The huge
+- **B2 (implemented; recommended)**: indexer unit `reshard=False`, base layers `reshard=True`. The huge
   frozen base still reshards (where the memory is); the tiny indexer (~1 M params/layer, ~62 M total) stays
-  resident, so you don't even rely on gate-firing. `fully_shard` takes `reshard_after_forward` per call.
+  resident, so it doesn't even rely on gate-firing. `fully_shard` takes `reshard_after_forward` per call.
 
-**Hard prerequisite for Option B:** FSDP2 forward hooks fire only on `nn.Module.__call__`. The integration
-calls the indexer via **plain methods** — `attn.indexer.project(...)` (`minicpm_dsa.py:209`) and
-`attn.indexer.scores(...)` (`:243`) — which bypass `__call__`, so the pre-forward all-gather never fires
-and (at `NPROC>1`) forward would run on sharded params. The param-bearing compute must be routed through
-`indexer.__call__`. Convenient split: `scores()` is **param-free** (only `softmax_scale`/cfg); **all params
-are in `project()`**, which is called **once per layer forward** — so wrapping/routing just the projection
-gives one all-gather/reshard cycle per layer, not per query block.
+**Hard prerequisite for Option B (done):** FSDP2 forward hooks fire only on `nn.Module.__call__`. The
+integration previously called the indexer via **plain methods** (`attn.indexer.project(...)`), which bypass
+`__call__`, so the pre-forward all-gather never fired and (at `NPROC>1`) forward would run on sharded
+params. Fixed: the projection is now routed through `indexer.__call__` via
+`attn.indexer(..., return_projection=True)` (`minicpm_dsa.py`, `dsa_indexer.py::LightningIndexer.forward`).
+Convenient split: `scores()` is **param-free** (only `softmax_scale`/cfg); **all params are in
+`project()`**, called **once per layer forward** — so routing just the projection gives one
+all-gather/reshard cycle per layer, not per query block.
 
 **Cost of Option B:** 62 tiny FSDP units → 62 extra small-tensor collectives per step (poor bandwidth
 utilization). Coarse units are generally preferred; only worth it when memory-bound at multi-rank. At
-world_size=1 it buys nothing over Option A.
+world_size=1 it buys nothing over Option A but is harmless.
+
+### Implementation & validation
+
+- **Wrap:** `verl/utils/fsdp_utils.py::apply_fsdp2` — a Phase-1-gated pre-pass (`model.config.dsa_enabled` and
+  `dsa_mode == "dense_warmup"`) wraps each `LightningIndexer` as its own unit with a `reshard_after_forward=False`
+  override **before** the decoder layers are wrapped (so the layer units exclude the nested indexer params).
+  Logs `[DSA B2] wrapped N lightning-indexer module(s) …`.
+- **Routing (Change 1):** `dsa_indexer.py` (`return_projection` kwarg on `forward`) + `minicpm_dsa.py` (call site).
+- **Config (Change 3):** launch scripts set base `engine.reshard_after_forward=True`; the old `=False` workaround
+  is removed (with a NOTE guarding against re-adding it).
+- **Regression test:** `tests/workers/test_dsa_indexer_fsdp_grad.py` — asserts every indexer optimizer-master
+  gets a grad from the side-channel KL under B2 (base `reshard=True`), and a sensitivity check that without B2
+  they get **none** (reproduces the bug). CUDA-gated.
+- **End-to-end (real MiniCPM3-4B overfit, 10 InfLLM docs):** with `DSA_DEBUG_MASTER=1` the indexer masters move
+  (e.g. `wq_b` master norm 17.5 → 36.2, `max|Δ init|` 8e-3 → 0.17, live Adam state); KL layer-mean falls
+  3.6 → 0.52 and top-k recall rises 0.83 → 0.98. Launcher: `examples/dsa/run_minicpm3_dsa_phase1_overfit.sh`.
 
 ---
 

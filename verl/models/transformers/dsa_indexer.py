@@ -78,7 +78,7 @@ class DSAConfig:
     block_size: int = 128  # FP8 act_quant block size (reference default)
     rotate_activation: bool = True  # Hadamard pre-quant rotation (V3.2), only in the FP8 path
     diag_interval: int = 10  # compute monitoring diagnostics (topk recall/overlap/score) every N forwards
-    log_per_layer: bool = False  # also emit per-layer kl_by_layer/L## (+ entropy/{indexer,attn}_frac_by_layer/L##
+    log_per_layer: bool = False  # also emit per-layer kl_by_layer/L## (+ indexer/entropy_frac_by_layer/L## and attn/entropy_frac_by_layer/L##
     # on diag forwards) — a debug breakdown (~3*n_layers extra scalar keys); the mean/min/max always log
 
     def __post_init__(self):
@@ -213,7 +213,7 @@ class LightningIndexer(nn.Module):
         KL distillation (unbiased, gentle gradients, maximal softmax responsiveness). ``k_norm`` at identity
         (the key is renormalized anyway). ``weights_proj`` is kept SMALL-BUT-NONZERO: zeroing it severs the
         gradient to ``wq_b``/``wk`` (they only receive grad through ``w`` — see docs/dsa_grad_norm_debugging.md
-        issue #2). Watch ``entropy/indexer_frac`` (~1.0 = near-uniform) to confirm the start is healthy.
+        issue #2). Watch ``indexer/entropy_frac`` (~1.0 = near-uniform) to confirm the start is healthy.
         """
         nn.init.normal_(self.wq_b.weight, std=0.5 * self.cfg.q_lora_rank**-0.5)
         nn.init.normal_(self.wk.weight, std=0.5 * self.cfg.hidden_size**-0.5)

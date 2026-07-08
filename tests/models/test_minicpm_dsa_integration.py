@@ -168,8 +168,9 @@ def test_monitoring_diagnostics_populated():
         "indexer/kl_layer_mean", "indexer/kl_layer_min", "indexer/kl_layer_max",
         "indexer/topk_recall", "indexer/topk_overlap", "indexer/score_mean", "indexer/score_std",
         "indexer/nan_frac",
-        # entropy metrics live in their own `entropy/` section: indexer softmax(I) + base-model attention
-        "entropy/indexer", "entropy/indexer_frac", "entropy/attn", "entropy/attn_frac",
+        # entropy metrics split by student/teacher into SEPARATE sections: indexer softmax(I) under
+        # `indexer/`, base-model attention under `attn/` (so the two never share a wandb pane group)
+        "indexer/entropy", "indexer/entropy_frac", "attn/entropy", "attn/entropy_frac",
     ]
     for key in expected:
         assert key in m, f"missing metric {key}"
@@ -177,15 +178,15 @@ def test_monitoring_diagnostics_populated():
     assert 0.0 <= m["indexer/topk_recall"] <= 1.0 + 1e-4
     assert 0.0 <= m["indexer/topk_overlap"] <= 1.0 + 1e-4
     assert m["indexer/nan_frac"] == 0.0
-    assert 0.0 <= m["entropy/indexer_frac"] <= 1.0 + 1e-4  # normalized softmax(I) entropy
-    assert 0.0 <= m["entropy/attn_frac"] <= 1.0 + 1e-4  # normalized base-model attention entropy
+    assert 0.0 <= m["indexer/entropy_frac"] <= 1.0 + 1e-4  # normalized softmax(I) entropy
+    assert 0.0 <= m["attn/entropy_frac"] <= 1.0 + 1e-4  # normalized base-model attention entropy
     assert m["indexer/kl_layer_min"] <= m["indexer/kl_layer_mean"] + 1e-6 <= m["indexer/kl_layer_max"] + 1e-6
 
 
 @requires_cuda
 def test_per_layer_metrics_logged_when_enabled():
     """log_per_layer emits SEPARATE per-layer scalars, each in its own wandb section: kl_by_layer/L## every
-    step; entropy/indexer_frac_by_layer/L## and entropy/attn_frac_by_layer/L## on diag forwards. Off by
+    step; indexer/entropy_frac_by_layer/L## and attn/entropy_frac_by_layer/L## on diag forwards. Off by
     default (would be ~3*n_layers keys)."""
     import statistics
 
@@ -202,7 +203,7 @@ def test_per_layer_metrics_logged_when_enabled():
     for i in range(2):  # tiny model has 2 layers -> L00, L01
         kk = f"kl_by_layer/L0{i}"
         assert kk in m and isinstance(m[kk], float) and math.isfinite(m[kk]), f"missing/bad {kk}: {list(m)}"
-        for ek in (f"entropy/indexer_frac_by_layer/L0{i}", f"entropy/attn_frac_by_layer/L0{i}"):
+        for ek in (f"indexer/entropy_frac_by_layer/L0{i}", f"attn/entropy_frac_by_layer/L0{i}"):
             assert ek in m and 0.0 <= m[ek] <= 1.0 + 1e-4, f"missing/bad {ek}"
         per_layer_kl.append(m[kk])
     # the aggregate mean must equal the mean of the per-layer values (bf16 tol — per-layer KL is bf16)

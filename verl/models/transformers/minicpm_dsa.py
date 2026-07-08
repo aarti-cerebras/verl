@@ -171,20 +171,22 @@ def install_kl_accumulation(model) -> None:
             metrics["indexer/topk_overlap"] = _layer_mean("overlap")
             for key in ("score_mean", "score_std", "nan_frac"):
                 metrics[f"indexer/{key}"] = _layer_mean(key)
-            # `entropy/` section: the indexer's softmax(I) entropy AND the base model's attention entropy,
-            # grouped together so the student (indexer) and teacher (attention) distributions read side by side.
-            metrics["entropy/indexer"] = _layer_mean("entropy")
-            metrics["entropy/indexer_frac"] = _layer_mean("entropy_frac")
-            metrics["entropy/attn"] = _layer_mean("attn_entropy")
-            metrics["entropy/attn_frac"] = _layer_mean("attn_entropy_frac")
+            # Split the two entropies into SEPARATE wandb sections (the wandb section is the key's first path
+            # segment): the student (indexer softmax(I)) entropy joins the `indexer/` section alongside the
+            # kl/topk/score health above, and the teacher (base attention `p`) entropy goes to its own `attn/`
+            # section. So indexer panes and attn panes never share a group.
+            metrics["indexer/entropy"] = _layer_mean("entropy")
+            metrics["indexer/entropy_frac"] = _layer_mean("entropy_frac")
+            metrics["attn/entropy"] = _layer_mean("attn_entropy")
+            metrics["attn/entropy_frac"] = _layer_mean("attn_entropy_frac")
         # optional per-layer breakdown (debug): emit SEPARATE scalar keys so the logger doesn't collapse them
         # to a mean, each in its own wandb section. kl_by_layer every step; entropy by-layer only on diag forwards.
         if getattr(layers[0].self_attn.dsa, "log_per_layer", False):
             for i, kl in kl_items:
                 metrics[f"kl_by_layer/L{i:02d}"] = kl.item()
             for i, d in diag_items:
-                metrics[f"entropy/indexer_frac_by_layer/L{i:02d}"] = d["entropy_frac"].item()
-                metrics[f"entropy/attn_frac_by_layer/L{i:02d}"] = d["attn_entropy_frac"].item()
+                metrics[f"indexer/entropy_frac_by_layer/L{i:02d}"] = d["entropy_frac"].item()
+                metrics[f"attn/entropy_frac_by_layer/L{i:02d}"] = d["attn_entropy_frac"].item()
         model._dsa_metrics = metrics
         return output
 
