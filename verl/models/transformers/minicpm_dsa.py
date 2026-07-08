@@ -241,8 +241,11 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     key_mask = attention_mask.bool() if (attention_mask is not None and attention_mask.dim() == 2) else None
 
     cos_g, sin_g = cos[position_ids], sin[position_ids]  # [bsz, T, rope_head_dim]
-    # indexer projections once; score per query-block (key set is the full sequence)
-    q_idx, k_idx, weights = attn.indexer.project(hidden_states, qr, cos_g, sin_g)
+    # indexer projections once; score per query-block (key set is the full sequence). Route through
+    # __call__ (return_projection=True), NOT attn.indexer.project(...): a direct method call bypasses
+    # nn.Module.__call__, so FSDP2's forward hooks on a separately-wrapped indexer unit never fire (no
+    # all-gather, no pre-backward gate -> no grad reduce-scatter to the master). See dsa_fsdp_sharding_notes B2.
+    q_idx, k_idx, weights = attn.indexer(hidden_states, qr, cos_g, sin_g, return_projection=True)
 
     total_kl = query_states.new_zeros((), dtype=torch.float32)
     total_cnt = query_states.new_zeros((), dtype=torch.float32)

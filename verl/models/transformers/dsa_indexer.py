@@ -289,8 +289,20 @@ class LightningIndexer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_projection: bool = False,
+    ):
+        """Default: raw scores ``I`` (project -> scores). When ``return_projection`` is set, return the
+        ``(q_idx, k_idx, weights)`` projection tuple instead.
+
+        The projection carries ALL indexer parameters (``wq_b``/``wk``/``k_norm``/``weights_proj``); ``scores``
+        is param-free. Reaching the projection through ``__call__`` (not a direct ``.project()`` method call) is
+        what lets FSDP2's forward hooks fire when the indexer is wrapped as its own ``fully_shard`` unit — the
+        pre-forward all-gather and the pre-backward EXIT gate whose backward triggers the gradient
+        reduce-scatter onto the sharded (optimizer) master. See docs/dsa_fsdp_sharding_notes.md (Option B2).
+        """
         q_idx, k_idx, weights = self.project(x, qr, cos, sin)
+        if return_projection:
+            return q_idx, k_idx, weights
         return self.scores(q_idx, k_idx, weights, attn_bias)
 
     def select_topk(
