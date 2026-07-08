@@ -577,6 +577,11 @@ class FSDPEngine(BaseEngine):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
+        if os.environ.get("DSA_DEBUG_MASTER") == "1" and optimizer is not None:
+            # At build, the optimizer's master params ARE module.named_parameters() (same objects), so this
+            # id->name map lets the step probe verify it is tracking *.indexer.* masters and label them by name.
+            self._dbg_name_by_id = {id(p): n for n, p in module.named_parameters()}
+
     def train_mode(self, **kwargs):
         """
         Return a context manager that switches to training mode with FSDP-specific handling.
@@ -691,6 +696,41 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
+        # --- DEBUG (env-gated): does the optimizer's fp32 MASTER weight move, and is Adam tracking it? ---
+        # Reads the optimizer's own params (the fp32 sharded masters), NOT module.named_parameters() (which
+        # returns the bf16 unsharded compute copy post-forward). Captures grad BEFORE step() (still live here),
+        # then master delta + Adam state AFTER step(), before zero_grad. See docs/dsa flat-loss investigation.
+        _dbg_master = os.environ.get("DSA_DEBUG_MASTER") == "1"
+        if _dbg_master:
+            def _matm(t):
+                if t is None:
+                    return None
+                if hasattr(t, "to_local"):
+                    t = t.to_local()
+                return t.detach().float()
+
+            if not hasattr(self, "_dbgm"):
+                names = getattr(self, "_dbg_name_by_id", {})
+                self._dbgm = []  # first ~3 trainable INDEXER masters (name-verified), tracked by stable id()
+                for grp in self.optimizer.param_groups:
+                    for p in grp["params"]:
+                        name = names.get(id(p), "<unknown>")
+                        if p.requires_grad and "indexer" in name and len(self._dbgm) < 3:
+                            snap = _matm(p)
+                            self._dbgm.append({"p": p, "name": name, "init": snap.clone(),
+                                               "prev": snap.clone(), "shape": tuple(p.shape)})
+                n_train = sum(p.requires_grad for grp in self.optimizer.param_groups for p in grp["params"])
+                n_indexer = sum(
+                    p.requires_grad and "indexer" in names.get(id(p), "")
+                    for grp in self.optimizer.param_groups for p in grp["params"]
+                )
+                print(f"[dsa-master] optimizer trainable params: {n_train}, of which indexer: {n_indexer}", flush=True)
+                for e in self._dbgm:
+                    print(f"[dsa-master] tracking {e['name']} shape={e['shape']} dtype={e['p'].dtype} "
+                          f"is_dtensor={hasattr(e['p'], 'to_local')}", flush=True)
+            self._dbgm_grad = [(_matm(e["p"].grad).norm().item() if e["p"].grad is not None else None)
+                               for e in self._dbgm]
+
         if scaler is not None:
             # scaler handles inf/nan skipping internally via _check_inf_per_device.
             scaler.step(self.optimizer)
@@ -702,6 +742,28 @@ class FSDPEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
+
+        if _dbg_master:
+            for i, e in enumerate(self._dbgm):
+                p = e["p"]
+                cur = _matm(p)
+                d_init = (cur - e["init"]).abs().max().item()
+                d_prev = (cur - e["prev"]).abs().max().item()
+                e["prev"] = cur.clone()
+                st = self.optimizer.state.get(p, {})
+                if st:
+                    step = st.get("step", None)
+                    step = step.item() if hasattr(step, "item") else step
+                    ea, eas = _matm(st.get("exp_avg", None)), _matm(st.get("exp_avg_sq", None))
+                    ststr = (f"step={step} exp_avg_norm={ea.norm().item():.3e} "
+                             f"exp_avg_sq_norm={eas.norm().item():.3e}") if ea is not None else f"step={step} (no moments)"
+                else:
+                    ststr = "NO STATE"
+                g = self._dbgm_grad[i]
+                gstr = "None" if g is None else f"{g:.3e}"
+                print(f"[dsa-master] {e['name']}: grad_norm={gstr} "
+                      f"max|Δ init|={d_init:.3e} max|Δ prev|={d_prev:.3e} "
+                      f"norm={cur.norm().item():.6f} adam[{ststr}]", flush=True)
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales

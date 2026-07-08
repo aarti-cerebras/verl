@@ -26,13 +26,22 @@ from verl.workers.utils.padding import no_padding_2_padding
 
 
 def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model=None):
-    """DSA Phase-1 (dense warm-up) loss: the per-layer indexer KL, summed over layers.
+    """DSA Phase-1 (dense warm-up) loss: the indexer KL, meaned over layers, seq, and the global batch.
 
     The DSA forward hooks (see ``verl/models/transformers/minicpm_dsa.py::install_kl_accumulation``) stash
     the aggregated KL on the model as ``model._dsa_indexer_kl`` (and diagnostics on ``model._dsa_metrics``).
-    This loss reads them off the model directly — it is bound to the model via a closure in the SFT trainer
-    (``self.loss_fn = lambda **kw: indexer_kl_loss(**kw, model=self.engine.module)``), so no custom engine /
-    ``model_output`` pass-through is required. There is **no LM cross-entropy** in Phase 1.
+    That value is already the mean over layers (``kl_stack.mean()``) and over this micro-batch's query rows
+    (``total_kl / total_cnt``). This loss reads it off the model directly — it is bound to the model via a
+    closure in the SFT trainer (``self.loss_fn = lambda **kw: indexer_kl_loss(**kw, model=self.engine.module)``),
+    so no custom engine / ``model_output`` pass-through is required. There is **no LM cross-entropy** in Phase 1.
+
+    **Global-batch normalization.** The engine backward()s each micro-batch loss and *accumulates* (sums) the
+    gradients over the ``train_batch_size / micro_batch_size_per_gpu`` micro-batches before one optimizer step,
+    and FSDP/DDP then averages gradients across dp ranks. To make the optimized objective a true MEAN over the
+    whole global batch (so the effective LR is independent of the micro-batch split and dp size), we weight this
+    micro-batch by its token share of the all-reduced global ``batch_num_tokens`` and multiply by ``dp_size`` to
+    cancel the dp-mean — exactly the convention ``sft_loss`` uses. Without this, ``train/loss`` = n_micro * kl.
+    (Falls back to the raw ``kl`` when batch metadata is absent, e.g. standalone unit tests.)
 
     Args:
         model: the (FSDP-wrapped) module; attribute access forwards through FSDP. Required.
@@ -43,11 +52,19 @@ def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model
         "model._dsa_indexer_kl is not set — is DSA enabled (config.dsa_enabled), the forward run, and "
         "mode == 'dense_warmup'?"
     )
-    metrics = {"indexer/kl": kl.detach()}
+
+    loss = kl
+    batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None) if data is not None else None
+    if batch_num_tokens:
+        dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
+        mb_tokens = data["loss_mask"].sum()  # this micro-batch's query rows; shares sum to batch_num_tokens
+        loss = kl * mb_tokens / batch_num_tokens * dp_size
+
+    metrics = {"indexer/kl": kl.detach()}  # log the interpretable per-batch mean, not the normalized loss
     dsa_metrics = getattr(model, "_dsa_metrics", None)
     if dsa_metrics:
         metrics.update(dsa_metrics)
-    return kl, metrics
+    return loss, metrics
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):

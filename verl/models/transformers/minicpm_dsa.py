@@ -162,16 +162,29 @@ def install_kl_accumulation(model) -> None:
         diag_items = [(i, a._dsa_diag) for i, a in enumerate(attns) if getattr(a, "_dsa_diag", None) is not None]
         if diag_items:
             diags = [d for _, d in diag_items]
-            rename = {"recall": "topk_recall", "overlap": "topk_overlap"}
-            for key in ("recall", "overlap", "score_mean", "score_std", "nan_frac", "entropy", "entropy_frac"):
-                metrics[f"indexer/{rename.get(key, key)}"] = torch.stack([d[key] for d in diags]).mean().item()
+
+            def _layer_mean(key):
+                return torch.stack([d[key] for d in diags]).mean().item()
+
+            # `indexer/` section: indexer training-health scalars (top-k fidelity + score stats)
+            metrics["indexer/topk_recall"] = _layer_mean("recall")
+            metrics["indexer/topk_overlap"] = _layer_mean("overlap")
+            for key in ("score_mean", "score_std", "nan_frac"):
+                metrics[f"indexer/{key}"] = _layer_mean(key)
+            # `entropy/` section: the indexer's softmax(I) entropy AND the base model's attention entropy,
+            # grouped together so the student (indexer) and teacher (attention) distributions read side by side.
+            metrics["entropy/indexer"] = _layer_mean("entropy")
+            metrics["entropy/indexer_frac"] = _layer_mean("entropy_frac")
+            metrics["entropy/attn"] = _layer_mean("attn_entropy")
+            metrics["entropy/attn_frac"] = _layer_mean("attn_entropy_frac")
         # optional per-layer breakdown (debug): emit SEPARATE scalar keys so the logger doesn't collapse them
-        # to a mean. kl_by_layer every step; entropy_frac_by_layer only on diag forwards.
+        # to a mean, each in its own wandb section. kl_by_layer every step; entropy by-layer only on diag forwards.
         if getattr(layers[0].self_attn.dsa, "log_per_layer", False):
             for i, kl in kl_items:
-                metrics[f"indexer/kl_by_layer/L{i:02d}"] = kl.item()
+                metrics[f"kl_by_layer/L{i:02d}"] = kl.item()
             for i, d in diag_items:
-                metrics[f"indexer/entropy_frac_by_layer/L{i:02d}"] = d["entropy_frac"].item()
+                metrics[f"entropy/indexer_frac_by_layer/L{i:02d}"] = d["entropy_frac"].item()
+                metrics[f"entropy/attn_frac_by_layer/L{i:02d}"] = d["attn_entropy_frac"].item()
         model._dsa_metrics = metrics
         return output
 
@@ -243,6 +256,8 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     d_nan = query_states.new_zeros((), dtype=torch.float32)
     d_ent = query_states.new_zeros((), dtype=torch.float32)  # softmax(I) entropy (nats), summed over valid queries
     d_entfrac = query_states.new_zeros((), dtype=torch.float32)  # entropy / log(#valid keys) in [0,1]
+    d_attn_ent = query_states.new_zeros((), dtype=torch.float32)  # base-model attention entropy (nats), summed
+    d_attn_entfrac = query_states.new_zeros((), dtype=torch.float32)  # attn entropy / log(#valid keys) in [0,1]
 
     for q0 in range(0, T, block):
         q1 = min(q0 + block, T)
@@ -314,6 +329,19 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
                     ent_frac = torch.where(qb_bool, ent_frac, torch.zeros_like(ent_frac))
                 d_ent = d_ent + ent.sum()
                 d_entfrac = d_entfrac + ent_frac.sum()
+                # base-model attention entropy (the teacher `p`): how peaked the true attention is per query.
+                # Rising KL-target entropy => flatter attention the indexer must match; a very low value means
+                # attention is near-argmax (easy to top-k). Masked keys contribute 0 (entr(0)=0); pad-query rows
+                # are NaN in p_blk but dropped below by the same qb_bool mask, so the sum stays finite.
+                attn_ent = torch.special.entr(p_blk).sum(-1)  # [bsz, B] per-query attention entropy (nats)
+                attn_ent_frac = torch.where(
+                    valid > 1, attn_ent / valid.float().clamp_min(2).log(), torch.ones_like(attn_ent)
+                )
+                if qv is not None:
+                    attn_ent = torch.where(qb_bool, attn_ent, torch.zeros_like(attn_ent))
+                    attn_ent_frac = torch.where(qb_bool, attn_ent_frac, torch.zeros_like(attn_ent_frac))
+                d_attn_ent = d_attn_ent + attn_ent.sum()
+                d_attn_entfrac = d_attn_entfrac + attn_ent_frac.sum()
 
     if do_diag:
         mean = d_ssum / d_scnt.clamp_min(1)
@@ -326,6 +354,8 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
             "nan_frac": (d_nan / d_scnt.clamp_min(1)).detach(),
             "entropy": (d_ent / d_rc.clamp_min(1)).detach(),
             "entropy_frac": (d_entfrac / d_rc.clamp_min(1)).detach(),
+            "attn_entropy": (d_attn_ent / d_rc.clamp_min(1)).detach(),
+            "attn_entropy_frac": (d_attn_entfrac / d_rc.clamp_min(1)).detach(),
         }
     else:
         attn._dsa_diag = None

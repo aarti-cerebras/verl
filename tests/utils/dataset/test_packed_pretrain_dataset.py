@@ -14,6 +14,7 @@
 """CPU unit test for PackedPretrainDataset (contract + fixed-length chunking)."""
 
 import pandas as pd
+import pytest
 import torch
 
 from verl.utils.dataset.packed_pretrain_dataset import PackedPretrainDataset
@@ -55,3 +56,44 @@ def test_max_samples_caps_windows(tmp_path):
     df.to_parquet(p)
     ds = PackedPretrainDataset(parquet_files=str(p), tokenizer=_StubTokenizer(), config={"max_length": 8}, max_samples=2)
     assert len(ds) == 2
+
+
+# ---- pre-tokenized, one-document-per-row mode (input_ids column; the 6a real-data path) ----
+
+
+def test_pretokenized_one_doc_per_row(tmp_path):
+    # 3 long docs (>= seq_len=8) + 1 short doc (< seq_len, must be skipped). Rows have varying lengths.
+    df = pd.DataFrame({"input_ids": [list(range(1, 13)), list(range(1, 9)), list(range(1, 21)), [1, 2, 3]]})
+    p = tmp_path / "ids.parquet"
+    df.to_parquet(p)
+
+    ds = PackedPretrainDataset(parquet_files=str(p), tokenizer=None, config={"max_length": 8})
+    assert len(ds) == 3  # the 3-token short doc is skipped
+
+    item = ds[0]
+    assert set(item) == {"input_ids", "attention_mask", "position_ids", "loss_mask"}
+    for k in item:
+        assert item[k].shape == (8,) and item[k].dtype == torch.long
+    # each row is ONE doc truncated to seq_len (not concatenated across docs)
+    assert torch.equal(ds[0]["input_ids"], torch.arange(1, 9))  # first 8 of the 12-token doc
+    assert torch.equal(ds[2]["input_ids"], torch.arange(1, 9))  # first 8 of the 20-token doc
+    assert torch.equal(item["position_ids"], torch.arange(8))  # single doc, contiguous
+    assert torch.equal(item["attention_mask"], torch.ones(8, dtype=torch.long))
+    assert torch.equal(item["loss_mask"], torch.ones(8, dtype=torch.long))
+
+
+def test_pretokenized_takes_precedence_and_caps(tmp_path):
+    # input_ids column wins even if a text column is also present; max_samples caps rows.
+    df = pd.DataFrame({"input_ids": [list(range(20))] * 5, "text": ["ignored"] * 5})
+    p = tmp_path / "both.parquet"
+    df.to_parquet(p)
+    ds = PackedPretrainDataset(parquet_files=str(p), tokenizer=None, config={"max_length": 8}, max_samples=3)
+    assert len(ds) == 3
+
+
+def test_pretokenized_all_short_raises(tmp_path):
+    df = pd.DataFrame({"input_ids": [[1, 2, 3], [4, 5]]})  # none reach seq_len=8
+    p = tmp_path / "short.parquet"
+    df.to_parquet(p)
+    with pytest.raises(AssertionError, match="no rows with >="):
+        PackedPretrainDataset(parquet_files=str(p), tokenizer=None, config={"max_length": 8})

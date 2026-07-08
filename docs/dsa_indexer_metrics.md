@@ -1,10 +1,19 @@
-# DSA `indexer/*` Metrics Reference
+# DSA Indexer Metrics Reference
 
-Exact definition of every `indexer/*` metric logged during DSA Phase-1 (dense warm-up) training —
+Exact definition of every metric logged during DSA Phase-1 (dense warm-up) training —
 input/output shapes, what each sum/mean is taken over, and the equations. All metrics originate in
 `verl/models/transformers/minicpm_dsa.py::_dense_warmup_kl` / `install_kl_accumulation` and are surfaced
 through `verl/workers/utils/losses.py::indexer_kl_loss`, then reduced for logging in
 `verl/trainer/sft_trainer.py`.
+
+**wandb sections.** wandb groups panels by the key prefix before the first `/`, so the metrics land in
+three sections:
+
+| section | keys | contents |
+|---|---|---|
+| **`indexer/`** | `kl`, `kl_layer_{mean,min,max}`, `topk_recall`, `topk_overlap`, `score_{mean,std}`, `nan_frac` | the loss + indexer training-health scalars |
+| **`kl_by_layer/`** | `L00`, `L01`, … | per-layer KL breakdown (only when `log_per_layer=True`) |
+| **`entropy/`** | `indexer`, `indexer_frac`, `attn`, `attn_frac` (+ `*_frac_by_layer/L##`) | student (indexer `softmax(I)`) **and** teacher (base attention `p`) entropy, side by side |
 
 Related: [`dsa_grad_norm_debugging.md`](dsa_grad_norm_debugging.md).
 
@@ -64,15 +73,24 @@ KL^(ℓ)   = ( Σ_{i ∈ valid} KL_i ) / #{valid i}
 `KL^(ℓ)` is a **scalar per layer** (sum over allowed keys `j`; mean over valid queries `i`). These stack
 across layers → `kl_stack`, shape `[L]`.
 
+The loss reduces `kl_stack` over layers via `kl_reduction` (`dsa_indexer.py:74`), **default `"mean"`**
+(interpretable per-layer scale; `"sum"` is the reference variant — same optimum, gradient rescaled by `1/L`):
+
 | metric | code | formula | reduction |
 |---|---|---|---|
-| **`indexer/kl`** | `:141` `kl_stack.sum()` | `Σ_ℓ KL^(ℓ)` | **the loss** — summed over layers |
-| **`indexer/kl_layer_mean`** | `:143` `kl_stack.mean()` | `(1/L) Σ_ℓ KL^(ℓ)` | mean over layers |
-| **`indexer/kl_layer_min`** | `:144` | `min_ℓ KL^(ℓ)` | min over layers |
-| **`indexer/kl_layer_max`** | `:145` | `max_ℓ KL^(ℓ)` | max over layers |
+| **`indexer/kl`** | `kl_stack.mean()` (default) | `(1/L) Σ_ℓ KL^(ℓ)` | **the loss** — mean over layers by default (`sum` if `kl_reduction="sum"`) |
+| **`indexer/kl_layer_mean`** | `kl_stack.mean()` | `(1/L) Σ_ℓ KL^(ℓ)` | mean over layers |
+| **`indexer/kl_layer_min`** | `kl_stack.min()` | `min_ℓ KL^(ℓ)` | min over layers |
+| **`indexer/kl_layer_max`** | `kl_stack.max()` | `max_ℓ KL^(ℓ)` | max over layers |
 
-Note `indexer/kl = L · kl_layer_mean`. `kl_layer_min`/`max` show the spread across layers (are some
-layers learning while others are stuck).
+With the default `mean` reduction `indexer/kl == indexer/kl_layer_mean`. `kl_layer_min`/`max` show the
+spread across layers (are some layers learning while others are stuck).
+
+### `kl_by_layer/L##` (own section, only when `log_per_layer=True`)
+
+The per-layer KL `KL^(ℓ)` emitted as one scalar key per layer — `kl_by_layer/L00`, `kl_by_layer/L01`, …
+— so wandb renders each layer as its own line instead of collapsing to the `kl_layer_*` summary. Lives in
+its own `kl_by_layer/` section (off by default: ~`L` extra keys). Their mean equals `indexer/kl_layer_mean`.
 
 ---
 
@@ -122,39 +140,58 @@ Detects score collapse/explosion (dead ReLU → μ→0; blow-up → σ huge).
 
 Fraction of valid `I` entries that are NaN, `d_nan / N`. Pure guard; should be exactly 0.
 
-### `indexer/entropy` / `indexer/entropy_frac`
+## The entropy section (`entropy/*`, only every `diag_interval` forwards)
 
-Entropy of the **student** distribution `q = softmax(I)` per query row — how peaked vs. spread the indexer's
-selection is. `torch.special.entr` (`= −q·ln q`, with `entr(0)=0` so masked keys contribute nothing),
-summed over keys → per-query entropy in **nats**; averaged over valid queries, then over layers.
+Two distributions' entropies, grouped in their own `entropy/` wandb section so the **student** (indexer) and
+**teacher** (base attention) read side by side. Both use `torch.special.entr` (`= −P·ln P`, with `entr(0)=0`
+so masked keys contribute nothing), summed over keys → per-query entropy in **nats**; averaged over valid
+queries, then over layers. The `*_frac` variant normalizes by `ln(#allowed keys)` so it's comparable across
+query positions and sequence lengths (`1.0 = uniform`; single-valid-key rows → `1.0`).
 
 ```
-entropy_i      = Σ_j  −q[i,j] · ln q[i,j]           (over allowed keys j)
-entropy_frac_i = entropy_i / ln(#valid keys_i)      ∈ [0,1]   (1.0 = uniform; single-valid-key rows → 1.0)
+entropy_i      = Σ_j  −P[i,j] · ln P[i,j]           (over allowed keys j)
+entropy_frac_i = entropy_i / ln(#valid keys_i)      ∈ [0,1]
 ```
 
-`entropy_frac` normalizes by `ln(#allowed keys)` so it's comparable across query positions and sequence
-lengths. **Read it as init/training health:** ~1.0 = near-uniform (healthy KL-distillation start — unbiased,
+### `entropy/indexer` / `entropy/indexer_frac`
+
+Entropy of the **student** distribution `q = softmax(I)` (`P = q` above) — how peaked vs. spread the indexer's
+selection is. **Read it as init/training health:** ~1.0 = near-uniform (healthy KL-distillation start — unbiased,
 gentle gradients, maximal softmax responsiveness); a low or falling value flags a **saturated / over-committed**
 indexer (some keys dominate). Since the score scale grows with `‖x‖`, deeper layers can start peakier — watch
-for `entropy_frac` well below 1.0 at step 0, which would indicate the init temperature is too high (see
+for `indexer_frac` well below 1.0 at step 0, which would indicate the init temperature is too high (see
 [`dsa_indexer_init_proposal.md`](dsa_indexer_init_proposal.md)). Empirically the per-fan-in init starts at
-`entropy_frac ≈ 0.995` at unit input scale. The full derivation — how the init `σ`, the score spread
+`indexer_frac ≈ 0.995` at unit input scale. The full derivation — how the init `σ`, the score spread
 `std(I) ≈ 0.177·x_std`, and `entropy_frac ≈ 1 − C·x_std²` connect — is in
 [`dsa_indexer_init_entropy_math.md`](dsa_indexer_init_entropy_math.md).
+
+### `entropy/attn` / `entropy/attn_frac`
+
+Entropy of the **teacher** distribution `p` (the base model's head-averaged softmax attention, `P = p` above) —
+how peaked the *true* attention the indexer is distilling actually is. This is a property of the frozen base
+model + data, **not** of the indexer (no gradient), so it's a fixed reference curve rather than a training
+signal. Reading it alongside the indexer: a low `attn_frac` (attention near-argmax → concentrated mass) means
+the top-`k` selection is inherently easy and you should expect high `topk_recall`; a high `attn_frac` (flat
+attention) is a harder target and caps how much recall the sparse selection can retain. It contextualizes
+`topk_recall`/`topk_overlap` and the KL floor — the indexer can only get as peaked as the teacher it matches.
+
+### `entropy/indexer_frac_by_layer/L##` / `entropy/attn_frac_by_layer/L##`
+
+Per-layer breakdowns of the two `*_frac` metrics (only when `log_per_layer=True`), in the `entropy/` section.
 
 ---
 
 ## Three reduction levels (easy to conflate)
 
 1. **Within a layer**: sum over keys/blocks, divide by valid-query count → per-layer scalar.
-2. **Across layers**: `kl` *sums* (`:141`); everything else *means* (`:143`, `:151`).
-3. **Across micro-batches in a step**: `_reduce_metric` in `sft_trainer.py:400–417` takes the list-mean of
+2. **Across layers**: controlled by `kl_reduction` — the loss (`indexer/kl`) and every diagnostic *mean*
+   over layers by default; only `kl_reduction="sum"` makes `indexer/kl` a layer-sum.
+3. **Across micro-batches in a step**: `_reduce_metric` in `sft_trainer.py` takes the list-mean of
    the per-forward scalars before logging.
 
-**Consequence:** because `indexer/kl` sums over `L` (=62) layers while `kl_layer_mean` averages,
-`indexer/kl ≈ 62 × kl_layer_mean` — the headline loss magnitude (~712 noise in the debugging doc) is a
-62-layer sum, and the per-layer figure is ~11–12.
+**Consequence:** with the default `mean` reduction `indexer/kl == indexer/kl_layer_mean` (~a single-layer
+scale, e.g. ~3.7 in the real-data run). With `kl_reduction="sum"`, `indexer/kl ≈ L × kl_layer_mean` instead
+(for MiniCPM3-4B's `L=62`, ~62× larger) — the same optimum, just a rescaled headline magnitude.
 
 ---
 
