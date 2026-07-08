@@ -574,6 +574,35 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
     modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
 
+    # DSA Phase-1 (dense warm-up), Option B2: wrap each lightning indexer as its OWN fully_shard unit,
+    # nested inside its decoder layer, with reshard_after_forward=False. The indexer is the only trainable
+    # module and its KL is a side-channel loss that never flows through the decoder layer's output, so the
+    # layer-unit's backward gates never fire and the grad reduce-scatter onto the sharded (optimizer) master
+    # never runs -> flat loss (docs/dsa_fsdp_sharding_notes.md, §3b/§4). Giving the indexer its own unit,
+    # whose OUTPUT (the projection) requires grad, makes ITS pre-backward gate fire on the KL backward, so
+    # post_backward/reduce-scatter runs and the master gets a grad. Wrap BEFORE the decoder layers so the
+    # (outer) layer units exclude these nested params. Gated on dense_warmup only: Phase-2's CE loss flows
+    # through block outputs, so the standard layer gates fire and this special-casing must NOT apply.
+    indexer_units = []
+    if getattr(getattr(model, "config", None), "dsa_enabled", False):
+        for name, sub in model.named_modules():
+            if sub.__class__.__name__ == "LightningIndexer" and (
+                getattr(getattr(sub, "cfg", None), "mode", None) == "dense_warmup"
+            ):
+                indexer_units.append((name, sub))
+    if indexer_units:
+        indexer_kwargs = {**fsdp_kwargs, "reshard_after_forward": False}
+        for _name, sub in indexer_units:
+            with maybe_patch_fsdp_module(sub):
+                fully_shard(sub, **indexer_kwargs)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info(
+                "[DSA B2] wrapped %d lightning-indexer module(s) as own FSDP2 units "
+                "(reshard_after_forward=False); base reshard_after_forward=%s",
+                len(indexer_units),
+                fsdp_kwargs.get("reshard_after_forward"),
+            )
+
     for idx, module in enumerate(modules):
         # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
         #     print(f"wrap module {module.__class__.__name__}")
