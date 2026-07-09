@@ -29,8 +29,15 @@ class _FakeModel:
 
 
 def _micro_batch(mb_tokens: int, global_tokens: int, dp_size: int) -> TensorDict:
-    data = TensorDict({"loss_mask": torch.ones(1, mb_tokens)}, batch_size=[1])
-    tu.assign_non_tensor(data, batch_num_tokens=global_tokens)
+    # normalization is by valid (non-pad) query rows: attention_mask all-ones => mb_valid == mb_tokens
+    data = TensorDict(
+        {
+            "input_ids": torch.zeros(1, mb_tokens, dtype=torch.long),
+            "attention_mask": torch.ones(1, mb_tokens),
+        },
+        batch_size=[1],
+    )
+    tu.assign_non_tensor(data, batch_num_valid_queries=global_tokens)
     tu.assign_non_tensor(data, dp_size=dp_size)
     return data
 

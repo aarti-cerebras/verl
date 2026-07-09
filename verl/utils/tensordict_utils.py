@@ -159,6 +159,22 @@ def get_non_tensor_data(data: TensorDict, key: str, default):
     return unwrap_non_tensor_data(output)
 
 
+def num_valid_queries(data: TensorDict) -> torch.Tensor:
+    """Count real (non-pad) tokens in ``data`` — the valid query rows the DSA indexer KL averages over.
+
+    This is the data-side equivalent of ``total_cnt`` inside ``_dense_warmup_kl`` (the number of non-pad
+    query rows the KL sums over), and it is decoupled from ``loss_mask`` (which may mark only response
+    tokens, or be all-ones). Nested / ``no_padding`` inputs carry no padding, so every token is a valid
+    query — count them via the offsets. A padded ``[bsz, T]`` input uses ``attention_mask`` to exclude pad.
+
+    Returns a scalar tensor on ``input_ids``'s device (call ``.sum()`` already applied).
+    """
+    input_ids = data["input_ids"]
+    if input_ids.is_nested:
+        return input_ids.offsets().diff().sum()
+    return data["attention_mask"].sum()
+
+
 def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int | None = None) -> torch.Tensor:
     assert len(tensors) > 0, "Must provide at least one tensor"
     sample_dim = tensors[0].dim()

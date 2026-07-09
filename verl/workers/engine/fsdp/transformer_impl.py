@@ -631,6 +631,17 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        # DSA indexer KL normalizes by the number of *valid (non-pad) query rows* it averages over
+        # (== the KL's own total_cnt), which is decoupled from loss_mask (loss_mask may be response-only
+        # or all-ones). Compute the global count here from the same non-pad definition as the loss.
+        # Gated on DSA so non-DSA SFT runs don't pay an extra all-reduce every step.
+        if getattr(getattr(self.module, "config", None), "dsa_enabled", False):
+            batch_num_valid_queries = tu.num_valid_queries(data).to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_valid_queries, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_valid_queries=batch_num_valid_queries.item())
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )

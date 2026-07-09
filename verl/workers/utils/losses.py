@@ -39,9 +39,13 @@ def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model
     gradients over the ``train_batch_size / micro_batch_size_per_gpu`` micro-batches before one optimizer step,
     and FSDP/DDP then averages gradients across dp ranks. To make the optimized objective a true MEAN over the
     whole global batch (so the effective LR is independent of the micro-batch split and dp size), we weight this
-    micro-batch by its token share of the all-reduced global ``batch_num_tokens`` and multiply by ``dp_size`` to
-    cancel the dp-mean — exactly the convention ``sft_loss`` uses. Without this, ``train/loss`` = n_micro * kl.
-    (Falls back to the raw ``kl`` when batch metadata is absent, e.g. standalone unit tests.)
+    micro-batch by its share of the all-reduced global **valid-query** count (``batch_num_valid_queries``) and
+    multiply by ``dp_size`` to cancel the dp-mean. We normalize by the *valid (non-pad) query rows the KL
+    actually averages over* (``total_cnt`` in ``_dense_warmup_kl``), NOT ``loss_mask`` — the two coincide only
+    when ``loss_mask`` is all-ones (Phase-1 ``PackedPretrainDataset``). Using the valid-query count makes the
+    objective exactly ``mean over layers of (sum over all valid queries globally of KL) / total_valid_queries``,
+    robust to a prompt-masked ``loss_mask``. Without this, ``train/loss`` = n_micro * kl. (Falls back to the raw
+    ``kl`` when batch metadata is absent, e.g. standalone unit tests.)
 
     Args:
         model: the (FSDP-wrapped) module; attribute access forwards through FSDP. Required.
@@ -54,11 +58,13 @@ def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model
     )
 
     loss = kl
-    batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None) if data is not None else None
-    if batch_num_tokens:
+    num_valid = (
+        tu.get_non_tensor_data(data=data, key="batch_num_valid_queries", default=None) if data is not None else None
+    )
+    if num_valid:
         dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
-        mb_tokens = data["loss_mask"].sum()  # this micro-batch's query rows; shares sum to batch_num_tokens
-        loss = kl * mb_tokens / batch_num_tokens * dp_size
+        mb_valid = tu.num_valid_queries(data)  # this micro-batch's valid query rows (== its total_cnt)
+        loss = kl * mb_valid / num_valid * dp_size
 
     metrics = {"indexer/kl": kl.detach()}  # log the interpretable per-batch mean, not the normalized loss
     dsa_metrics = getattr(model, "_dsa_metrics", None)
