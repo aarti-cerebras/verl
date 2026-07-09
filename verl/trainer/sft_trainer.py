@@ -47,6 +47,21 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
+def _scalarize_metric(v):
+    """Reduce a metric to a float mean for logging.
+
+    Custom loss-fn metrics (e.g. the DSA ``indexer/*`` diagnostics) arrive as per-micro-batch (and, after
+    dp all-gather, per-rank) lists and/or tensors; the logger only renders scalars. Returns None for an
+    empty list (e.g. a diagnostic that was absent on every micro-batch) so the caller can drop the key.
+    """
+    if isinstance(v, torch.Tensor):
+        return v.detach().float().mean().item()
+    if isinstance(v, (list, tuple)):
+        vals = [_scalarize_metric(x) for x in v if x is not None]
+        return sum(vals) / len(vals) if vals else None
+    return v
+
+
 class SFTTrainer:
     def __init__(
         self,
@@ -202,6 +217,10 @@ class SFTTrainer:
         if self.test_freq == "after_each_epoch":
             self.test_freq = self.steps_per_epoch
 
+        # wandb section prefix for validation metrics (e.g. "val", or "val_ood" / "val_ood_L2048" for a
+        # separate OOD eval run). Lets a later val-only run label its metrics distinctly from training val.
+        self.val_prefix = getattr(self.config.trainer, "val_prefix", "val")
+
         self.training_client.reset()
 
     def _build_dataset(self):
@@ -312,10 +331,68 @@ class SFTTrainer:
         batch_seqlens = output_tensor.tolist()
         return batch_seqlens
 
+    def validate(self, meta_info, tracking=None, global_step=0, prefix="val"):
+        """Run the val_dataloader once (forward-only) and log ``<prefix>/loss`` + the ``<prefix>/indexer/*``
+        & ``<prefix>/attn/*`` panel. Reused by fit()'s periodic eval and by val-only mode. Returns the
+        logged metric dict on the logging rank, else None.
+        """
+        is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
+        val_losses = []
+        val_panel = {}  # DSA indexer/attn diagnostics -> [one scalar per val batch]
+        for val_data in self.val_dataloader:
+            val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
+            output = self.training_client.infer_batch(val_data)
+
+            if self.engine.is_mp_src_rank_with_outputs():
+                metrics = tu.get(output, "metrics")
+                val_losses.append(metrics["loss"])
+                # Surface the DSA indexer/attn diagnostics (kl, top-k recall/overlap, entropy) on held-out
+                # data. Each is a per-micro-batch(/dp) list already dp-gathered in _postprocess_output;
+                # reduce to one scalar per batch (diag is forced on in eval, so recall/overlap are present).
+                # No-op for non-DSA runs (sft_loss emits no such keys).
+                for mk, mv in metrics.items():
+                    if mk.startswith("indexer/") or mk.startswith("attn/"):
+                        s = _scalarize_metric(mv)
+                        if s is not None:
+                            val_panel.setdefault(mk, []).append(s)
+
+        if self.engine.is_mp_src_rank_with_outputs():
+            val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+            # average over data parallel group
+            dp_group = self.engine.get_data_parallel_group()
+            if dp_group is not None:
+                torch.distributed.all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+
+        metric = None
+        if is_logging:
+            metric = {f"{prefix}/loss": val_loss.detach().item()}
+            # mean each diagnostic over val batches, logged under the `<prefix>/` section
+            for mk, vals in val_panel.items():
+                if vals:
+                    metric[f"{prefix}/{mk}"] = sum(vals) / len(vals)
+            if tracking is not None:
+                tracking.log(data=metric, step=global_step)
+        torch.distributed.barrier()
+        return metric
+
+    def _meta_info(self):
+        """Per-batch non-tensor config injected into every train/val batch."""
+        return {
+            "use_remove_padding": self.config.model.use_remove_padding,
+            "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
+            "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
+            "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
+            "temperature": 1.0,
+            "global_batch_size": self.global_batch_size,
+            "pad_mode": self.config.data.pad_mode,
+            "pad_token_id": self.model_config.tokenizer.pad_token_id,
+        }
+
     def fit(self):
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
 
         # TODO: add a unified tracking
+        tracking = None  # defined on all ranks so validate() can receive it; only the logging rank logs
         if is_logging:
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
@@ -347,16 +424,18 @@ class SFTTrainer:
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
 
-        meta_info = {
-            "use_remove_padding": self.config.model.use_remove_padding,
-            "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
-            "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
-            "micro_batch_size_per_gpu": self.config.data.micro_batch_size_per_gpu,
-            "temperature": 1.0,
-            "global_batch_size": self.global_batch_size,
-            "pad_mode": self.config.data.pad_mode,
-            "pad_token_id": self.model_config.tokenizer.pad_token_id,
-        }
+        meta_info = self._meta_info()
+
+        # val-only mode: skip training, run one pass over the val set from the loaded checkpoint, exit.
+        # Use to evaluate a trained indexer on a held-out set later (e.g. OOD): set trainer.val_only=true,
+        # resume_from_path=<ckpt>, resume_mode=resume_path, data.val_files=<ood parquet>, and (recommended)
+        # trainer.val_prefix=val_ood. Requires a valid data.train_files (not iterated) for engine build.
+        if getattr(self.config.trainer, "val_only", False):
+            assert self.val_dataloader is not None, "trainer.val_only=true requires data.val_files"
+            metric = self.validate(meta_info, tracking=tracking, global_step=global_step, prefix=self.val_prefix)
+            if is_logging:
+                print(f"[val_only] {self.val_prefix} metrics @ step {global_step}: {metric}")
+            return
 
         train_time = 0
         total_tokens = 0
@@ -400,16 +479,8 @@ class SFTTrainer:
                     # Custom loss-fn metrics (e.g. the DSA `indexer/*` diagnostics) arrive as per-micro-batch
                     # lists (from append_to_dict) and/or tensors; the logger only renders scalars, so reduce
                     # each to a scalar mean. loss/grad_norm/lr/mfu/perf are already scalars and pass through.
-                    def _reduce_metric(v):
-                        if isinstance(v, torch.Tensor):
-                            return v.detach().float().mean().item()
-                        if isinstance(v, (list, tuple)):
-                            vals = [_reduce_metric(x) for x in v if x is not None]
-                            return sum(vals) / len(vals) if vals else None
-                        return v
-
                     for k in list(metrics.keys()):
-                        reduced = _reduce_metric(metrics[k])
+                        reduced = _scalarize_metric(metrics[k])
                         if reduced is None:
                             metrics.pop(k)
                         else:
@@ -436,28 +507,11 @@ class SFTTrainer:
 
                 # early exit or validation step
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
-                        output = self.training_client.infer_batch(val_data)
-
-                        if self.engine.is_mp_src_rank_with_outputs():
-                            metrics = tu.get(output, "metrics")
-                            val_losses.append(metrics["loss"])
-
-                    if self.engine.is_mp_src_rank_with_outputs():
-                        val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
-                        # average over data parallel group
-                        dp_group = self.engine.get_data_parallel_group()
-                        if dp_group is not None:
-                            torch.distributed.all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
-
-                    if is_logging:
-                        metric = {"val/loss": val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
+                    metric = self.validate(
+                        meta_info, tracking=tracking, global_step=global_step, prefix=self.val_prefix
+                    )
+                    if metric is not None:
                         last_valid_metric = metric
-                    torch.distributed.barrier()
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     aggressive_empty_cache(force_sync=True)

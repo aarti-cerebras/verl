@@ -138,7 +138,9 @@ def install_kl_accumulation(model) -> None:
         model._dsa_fwd_count = cnt
         dsa = layers[0].self_attn.dsa  # shared across layers
         interval = max(1, getattr(dsa, "diag_interval", 1))
-        dsa._do_diag = (cnt - 1) % interval == 0  # diag on the 1st forward, then every `interval`
+        # eval/validation (module in eval mode): always compute diagnostics so every held-out batch gets
+        # recall/overlap/entropy. training: gate on `interval` (diag adds top-k compute). diag on 1st forward.
+        dsa._do_diag = (not model.training) or ((cnt - 1) % interval == 0)
         return None
 
     def _post_hook(module, args, output):

@@ -145,3 +145,99 @@ the shared `prepare_model_outputs` for the Phase-1 memory skip.
 - **Packed masking (6b):** attention/target have zero cross-document mass (extend the Part-B mask test).
 - **End-to-end smoke:** short run on a real InfLLM shard → decreasing `train/indexer/kl`, rising
   `train/indexer/topk_recall`, stable memory/throughput, wandb logging.
+
+---
+
+# Training & Validation Runs
+
+The sections above are the *wiring* plan (mostly done). This section is the plan for the actual
+indexer **training runs and held-out validation**. Decisions locked in: real run at **32K on 4×H100**;
+validate on **held-out same-corpus (in-distribution) + a second OOD corpus**.
+
+## Objective & success criteria
+
+Train **only the lightning indexer** (base frozen) so its per-position key ranking matches the base
+model's dense attention, and **prove it generalizes to unseen documents** (in-dist and OOD).
+
+- **Primary:** `val/indexer/topk_recall` at the *deployment* sparsity ratio — fraction of true attention
+  mass captured by the indexer's top-k keys on held-out docs. Predicts Phase-2 sparse quality. Target **≥ 0.9**.
+- **Secondary:** `val/indexer/kl` (+ the train↔val gap), `val/indexer/topk_overlap`,
+  `val/indexer/entropy_frac` (health — must not collapse), `val/indexer/nan_frac` ≈ 0.
+- **Convergence:** `train/indexer/kl` ↓ and plateaus; `val/indexer/kl` tracks it with a small gap;
+  OOD gap quantifies cross-domain generalization.
+
+## Data — disjoint train / val / OOD-val
+
+All windows are one-doc-per-row, retokenized with the MiniCPM3-4B tokenizer, filtered to ≥ `seq_len`,
+truncated to exactly `seq_len` (item 6a shape).
+
+1. **Train + in-dist val (disjoint, one pass):** extend `prepare_real_data.py` with `--val_out` /
+   `--val_windows` — after collecting `--num_windows` train windows it keeps scanning and collects the
+   next `--val_windows` into `--val_out`. Disjoint by construction (different source docs), same
+   tokenizer/seq_len.
+2. **OOD val (second corpus):** a different long-context distribution than InfLLM-V2 (which is web/mixed).
+   Recommended: **PG19** (books) — clearly OOD, long docs, easy HF access. Needs generalizing the loader
+   (the current shard-path pattern + `text` column is InfLLM-specific); add a `--repo`/`--path-scheme`
+   path or a small second loader that yields the OOD `text` column, then the same clean/tokenize/truncate.
+
+## Recipe — two phases
+
+**Phase A — pipeline shakeout (cheap, 1 GPU, 4K).** Validate the full train+val loop before spending
+long-context compute.
+- `seq_len 4096`, 512 train / 128 in-dist val / 128 OOD val windows, ~200 steps, `test_freq` every 25 steps.
+- **Pass criteria:** `train/indexer/kl` drops, the `val/…` panel logs (both val sets), recall rises,
+  `nan_frac ≈ 0`, `entropy_frac` doesn't collapse. (Complements the existing overfit-a-batch test.)
+
+**Phase B — real run (32K, 4×H100).** Memory notes confirm 32K Phase-1 fits on 4×H100 (~66 GB peak).
+- `seq_len 32768`, `NPROC=4`, ~2048 train / 256 in-dist val / 256 OOD val windows.
+- Longer schedule (≈3–4 epochs) with **LR warmup** (current script is constant `8e-3`; add warmup for the
+  real run), `test_freq=after_each_epoch`, periodic `save_freq`, keep best by `val/indexer/topk_recall`.
+
+## Validation methodology
+
+- **Cadence:** `trainer.test_freq` (per-N-steps or `after_each_epoch`) drives the val loop, which now emits
+  `val/loss` + the full `val/indexer/*` & `val/attn/*` panel (diagnostics are force-enabled in eval mode).
+- **Two named val sets:** log in-dist and OOD separately (e.g. `val_indist/*`, `val_ood/*`). The current
+  trainer supports a **single** `val_dataloader`; supporting two prefixed val sets is a work item
+  (iterate a dict of named val loaders, prefix the logged keys). Interim fallback: run eval on one set at
+  a time, or concatenate (loses the in-dist vs OOD split — not recommended for the real run).
+- **Sparsity-honest recall:** `TOPK=2048` at 4K keeps 50% (not a real sparsity test); at 32K it is ~6%
+  (meaningful). Log recall at **2–3 k values** to see the recall-vs-k curve (small diag addition).
+- **Checkpoint selection:** track best `val_indist/indexer/topk_recall`; the indexer is tiny so keeping
+  several checkpoints is cheap. Report both in-dist and OOD recall/KL for the chosen checkpoint.
+
+## Remaining work items
+
+1. ~~`prepare_real_data.py`: disjoint seeded in-dist val split.~~ **Done** — seeded shuffle + `--val_out`/
+   `--val_windows`, reproducible (pinned revision + seed + `MANIFEST.json`).
+2. ~~OOD data prep.~~ **Done** — `prepare_ood_data.py` builds the OOD val from **`openbmb/Ultra-FineWeb`**
+   (`content`) at **multiple lengths** (one parquet per length). One-command build:
+   `examples/dsa/build_phase_a_datasets.sh` (see `examples/dsa/README_datasets.md`). Shared helper:
+   `examples/dsa/_dsa_data_utils.py`.
+3. ~~Run-script val knobs.~~ **Done** — `run_minicpm3_dsa_phase1.sh` has `VAL_FILES` / `TEST_FREQ` /
+   `VAL_MAX_SAMPLES`; sets `data.val_files`, `data.val_max_samples`, `trainer.test_freq` only when
+   `VAL_FILES` is set (else forces `test_freq=-1` so the empty val loop can't crash). A single-val-set
+   validated run is now launchable.
+4. Trainer: support **multiple named val sets** in ONE run with logged prefixes (`val_indist/*`,
+   `val_ood_L{len}/*`) — the OOD set is per-length, so this also drives the recall-vs-length curve.
+   **Interim available:** `trainer.val_only` + `trainer.val_prefix` (see below) let you eval each set in a
+   **separate** invocation now; item 4 is only needed to log them all in a single run.
+
+**Val-only / eval-from-checkpoint (done).** `sft_trainer.py` has a reusable `validate()` plus a
+`trainer.val_only` mode: load a checkpoint, run one val pass, log `<val_prefix>/loss` + `<val_prefix>/indexer/*`,
+exit. Run OOD eval later on a trained run via the run script:
+`VAL_ONLY=1 RESUME_PATH=<ckpt> SEQ_LEN=<L> VAL_FILES=<ood_L parquet> VAL_PREFIX=val_ood_L<L> run_minicpm3_dsa_phase1.sh`.
+5. (Optional) recall@multiple-k in the diag block for the sparsity-vs-k curve.
+6. (Optional) LR warmup schedule for Phase B.
+
+Data (items 1–2) + run-script wiring (item 3) are done. Item 4 is the only thing left to log in-dist and
+all OOD-length val sets in one run.
+
+## Already done (val wiring)
+
+- `indexer_kl_loss` normalizes by **valid (non-pad) query count** (`num_valid_queries`), not `loss_mask`
+  (`losses.py`, `tensordict_utils.py`; `batch_num_valid_queries` all-reduced in `transformer_impl.py`,
+  gated on `dsa_enabled`).
+- Val loop emits `val/loss` **and** the `val/indexer/*` + `val/attn/*` panel (`sft_trainer.py`,
+  `_scalarize_metric`); diagnostics are forced on in eval mode (`minicpm_dsa.py` KL pre-hook via
+  `not model.training`).
