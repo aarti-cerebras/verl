@@ -71,6 +71,7 @@ def dsa_overrides_from_config(model_config) -> dict:
         "fp8",
         "diag_interval",
         "log_per_layer",
+        "diag_overlap_sample",
     ):
         val = getattr(model_config, f"dsa_{field}", None)
         if val is not None:
@@ -238,6 +239,7 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     block = getattr(attn.dsa, "kl_block_size", 0) or T
     do_diag = bool(getattr(attn.dsa, "_do_diag", False))  # set by the KL pre-hook every diag_interval
     diag_k = min(getattr(attn.dsa, "top_k", T), T)
+    diag_ov_sample = int(getattr(attn.dsa, "diag_overlap_sample", 0) or 0)  # >0 -> subsample rows for topk_overlap
 
     if position_ids is None:
         position_ids = torch.arange(T, device=device).unsqueeze(0).expand(bsz, T)
@@ -257,6 +259,7 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     d_recall = query_states.new_zeros((), dtype=torch.float32)
     d_overlap = query_states.new_zeros((), dtype=torch.float32)
     d_rc = query_states.new_zeros((), dtype=torch.float32)
+    d_ovcnt = query_states.new_zeros((), dtype=torch.float32)  # overlap's own row count (may be subsampled)
     d_ssum = query_states.new_zeros((), dtype=torch.float32)
     d_ssq = query_states.new_zeros((), dtype=torch.float32)
     d_scnt = query_states.new_zeros((), dtype=torch.float32)
@@ -307,16 +310,34 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
                 k = min(diag_k, T)
                 topk_i = idf.topk(k, dim=-1).indices  # indexer-selected keys [bsz, B, k]
                 recall = p_blk.gather(-1, topk_i).sum(-1)  # [bsz, B] (NaN at pad-query rows)
-                topk_p = p_blk.topk(k, dim=-1).indices
-                overlap = (topk_i.unsqueeze(-1) == topk_p.unsqueeze(-2)).any(-1).float().sum(-1) / k
                 if qv is not None:
                     qb_bool = qv.bool()
                     recall = torch.where(qb_bool, recall, torch.zeros_like(recall))  # drop NaN pad rows
-                    overlap = torch.where(qb_bool, overlap, torch.zeros_like(overlap))
                     d_rc = d_rc + qv.sum()
                 else:
                     d_rc = d_rc + recall.numel()
                 d_recall = d_recall + recall.sum()
+                # topk_overlap is O(B*k^2) (materializes [bsz, B, k, k]); at long context cap the query rows
+                # sampled for it (diag_overlap_sample>0) so peak stays bounded. Its own counter d_ovcnt keeps
+                # the average correct over the (possibly subsampled) rows; recall/entropy/score use all rows.
+                B = q1 - q0
+                sel = (
+                    torch.linspace(0, B - 1, diag_ov_sample, device=device).round().long()
+                    if (diag_ov_sample and B > diag_ov_sample)
+                    else slice(None)
+                )
+                p_sel = p_blk[:, sel]
+                topk_p = p_sel.topk(k, dim=-1).indices  # [bsz, n, k] target-selected keys
+                # overlap = |indexer-topk ∩ target-topk| / k via a boolean membership mask over keys (O(n*T))
+                # instead of the O(n*k^2) pairwise compare, so the [.., k, k] tensor never forms (fits at 32K).
+                mask = torch.zeros_like(p_sel, dtype=torch.bool).scatter_(-1, topk_p, True)  # target keys
+                overlap = mask.gather(-1, topk_i[:, sel]).float().sum(-1) / k  # [bsz, n] frac of indexer topk in target
+                ov_qv = qv[:, sel] if qv is not None else None
+                if ov_qv is not None:
+                    overlap = torch.where(ov_qv.bool(), overlap, torch.zeros_like(overlap))
+                    d_ovcnt = d_ovcnt + ov_qv.sum()
+                else:
+                    d_ovcnt = d_ovcnt + overlap.numel()
                 d_overlap = d_overlap + overlap.sum()
                 fin = idf[allow]  # finite valid scores only (excludes pad keys / masked / pad rows)
                 d_ssum = d_ssum + fin.sum()
@@ -355,7 +376,7 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
         var = (d_ssq / d_scnt.clamp_min(1) - mean * mean).clamp_min(0)
         attn._dsa_diag = {
             "recall": (d_recall / d_rc.clamp_min(1)).detach(),
-            "overlap": (d_overlap / d_rc.clamp_min(1)).detach(),
+            "overlap": (d_overlap / d_ovcnt.clamp_min(1)).detach(),
             "score_mean": mean.detach(),
             "score_std": var.sqrt().detach(),
             "nan_frac": (d_nan / d_scnt.clamp_min(1)).detach(),

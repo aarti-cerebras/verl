@@ -80,6 +80,9 @@ class DSAConfig:
     diag_interval: int = 10  # compute monitoring diagnostics (topk recall/overlap/score) every N forwards
     log_per_layer: bool = False  # also emit per-layer kl_by_layer/L## (+ indexer/entropy_frac_by_layer/L## and attn/entropy_frac_by_layer/L##
     # on diag forwards) — a debug breakdown (~3*n_layers extra scalar keys); the mean/min/max always log
+    diag_overlap_sample: int = 0  # cap query rows per block used for the O(k^2) topk_overlap diagnostic
+    # (materializes [bsz, block, k, k]); 0 = use all rows (fine at short context), >0 = evenly subsample this
+    # many rows so peak diag memory stays bounded at long context. recall/entropy/score always use all rows.
 
     def __post_init__(self):
         if self.kl_reduction not in ("sum", "mean"):

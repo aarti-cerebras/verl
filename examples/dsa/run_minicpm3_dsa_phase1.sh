@@ -23,6 +23,10 @@ export PYTHONPATH=${DEVLIBS}:${PYTHONPATH:-}
 export WANDB_BASE_URL=https://cerebras.wandb.io
 export WANDB_ENTITY=aartighatkesar
 
+# Reclaim fragmented HBM (the 32K forward runs with <1 GB free; ~0.8 GB sits reserved-but-unallocated).
+# Overridable; PyTorch itself recommends this on the OOM it throws at long context.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 # seq_len MUST match the parquet's window length (prepare_real_data.py --seq_len); rows are pre-tokenized
 # to exactly this many tokens, so a larger value skips every row and a smaller one truncates.
 TRAIN_FILES=${TRAIN_FILES:-${REPO_ROOT}/data/dsa/infllm_minicpm3_4k.parquet}
@@ -31,8 +35,20 @@ SEQ_LEN=${SEQ_LEN:-4096}
 STEPS=${STEPS:-200}
 BATCH=${BATCH:-8}                      # global batch (windows/step); 512 windows -> ~64 steps/epoch
 TOPK=${TOPK:-2048}                     # diagnostic only (recall@k in dense_warmup); track Phase-2 deploy k
+DIAG_OVERLAP_SAMPLE=${DIAG_OVERLAP_SAMPLE:-0}  # cap query rows/block for the O(k^2) topk_overlap diag (0=all).
+                                       # Set >0 at long context (e.g. 256 at 32K) so the [B,k,k] tensor fits.
+KL_BLOCK=${KL_BLOCK:-1024}             # query tile for the KL recompute; bounds the [block,n_heads,T] score
+                                       # tensor. Lower at long context (e.g. 256 at 32K) to fit memory; pure
+                                       # tiling granularity, no effect on numerics.
 GRAD_CKPT=${GRAD_CKPT:-False}          # base is frozen -> not needed; also conflicts with the _dsa_kl side-effect
+MODEL_DTYPE=${MODEL_DTYPE:-fp32}       # dtype the (frozen) base is initialized in. fp32 = accurate KL teacher
+                                       # but ~2x memory; set bf16 at long context (32K) to fit on 4xH100.
+ACT_OFFLOAD=${ACT_OFFLOAD:-False}      # CPU-offload activations saved for backward (per-FSDP-layer, async). The
+                                       # lever for the O(n_layers*T^2) indexer-KL graph at 32K; transparent, so
+                                       # it does NOT re-trigger the _dsa_kl side-effect (unlike GRAD_CKPT).
+ACT_GPU_LIMIT=${ACT_GPU_LIMIT:-0}      # GB of activations to keep resident on GPU before offloading (0 = default)
 SAVE_FREQ=${SAVE_FREQ:-${STEPS}}       # set -1 to skip the end-of-run indexer checkpoint
+MAX_CKPT=${MAX_CKPT:-}                  # keep at most this many checkpoints (prunes oldest); empty => keep all
 LR=${LR:-1e-3}                         # PEAK lr (cosine warmup+decay); loss is mean-normalized so lr is batch-independent
 LR_SCHED=${LR_SCHED:-cosine}           # "cosine" (warmup -> peak -> cosine decay to MIN_LR_RATIO*peak) or "constant"
 WARMUP_RATIO=${WARMUP_RATIO:-0.03}     # fraction of total steps spent warming up 0 -> peak (~30 steps at 1000)
@@ -65,10 +81,14 @@ if [[ "${VAL_ONLY}" == "1" ]]; then
     SAVE_FREQ=-1                         # never checkpoint an eval-only run
 fi
 
-# --- all logs + artifacts under the repo, in one TIMESTAMPED run subfolder (never clobbers a prior run) ---
+# --- run artifacts under RUNS_BASE, in one subfolder whose NAME encodes stage/dataset/steps/bsz + a
+#     timestamp (never clobbers a prior run); wandb experiment_name mirrors RUN_NAME (set below). ---
+RUNS_BASE=${RUNS_BASE:-/cb/ml-eng/aarti/dsa/indexer_warmup}
+STAGE=${STAGE:-phase1}                                   # DSA stage (phase1 = dense warm-up)
 RUN_TS=$(date +%Y%m%d_%H%M%S)
-RUN_NAME=${RUN_NAME:-${EXP_NAME}-${RUN_TS}}
-RUN_DIR=${RUN_DIR:-${REPO_ROOT}/dsa_runs/${RUN_NAME}}
+DATA_TAG=$(basename "${TRAIN_FILES}" .parquet); DATA_TAG=${DATA_TAG%_train}  # dataset id from the train parquet
+RUN_NAME=${RUN_NAME:-${STAGE}_${DATA_TAG}_st${STEPS}_bs${BATCH}_${RUN_TS}}
+RUN_DIR=${RUN_DIR:-${RUNS_BASE}/${RUN_NAME}}
 mkdir -p "${RUN_DIR}"
 LOG_FILE=${LOG_FILE:-${RUN_DIR}/run-${RUN_TS}.log}
 export WANDB_DIR="${RUN_DIR}"                 # wandb local files -> ${RUN_DIR}/wandb
@@ -84,8 +104,8 @@ echo "[dsa-phase1] cwd=$(pwd)"
 echo "[dsa-phase1] cmdline: $(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)"
 echo "[dsa-phase1] argv: $0 $*"
 echo "[dsa-phase1] env: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} NPROC=${NPROC} SEQ_LEN=${SEQ_LEN}" \
-     "STEPS=${STEPS} BATCH=${BATCH} TOPK=${TOPK} LR=${LR} LR_SCHED=${LR_SCHED} WARMUP_RATIO=${WARMUP_RATIO}" \
-     "MIN_LR_RATIO=${MIN_LR_RATIO} GRAD_CKPT=${GRAD_CKPT} SAVE_FREQ=${SAVE_FREQ}" \
+     "STEPS=${STEPS} BATCH=${BATCH} TOPK=${TOPK} DIAG_OVERLAP_SAMPLE=${DIAG_OVERLAP_SAMPLE} KL_BLOCK=${KL_BLOCK} LR=${LR} LR_SCHED=${LR_SCHED} WARMUP_RATIO=${WARMUP_RATIO}" \
+     "MIN_LR_RATIO=${MIN_LR_RATIO} GRAD_CKPT=${GRAD_CKPT} MODEL_DTYPE=${MODEL_DTYPE} ACT_OFFLOAD=${ACT_OFFLOAD} ACT_GPU_LIMIT=${ACT_GPU_LIMIT} SAVE_FREQ=${SAVE_FREQ} MAX_CKPT=${MAX_CKPT:-all}" \
      "EXP_NAME=${EXP_NAME} TRAIN_FILES=${TRAIN_FILES} VAL_FILES=${VAL_FILES:-none}" \
      "TEST_FREQ=${TEST_FREQ} VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES} VAL_PREFIX=${VAL_PREFIX}" \
      "VAL_ONLY=${VAL_ONLY} RESUME_PATH=${RESUME_PATH:-none} DSA_DEBUG_MASTER=${DSA_DEBUG_MASTER:-unset}" \
@@ -139,11 +159,13 @@ LAUNCH=(
     model.trust_remote_code=True
     model.use_remove_padding=False
     model.enable_gradient_checkpointing="${GRAD_CKPT}"
-    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: dense_warmup, dsa_kl_block_size: 1024, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true}"
+    model.enable_activation_offload="${ACT_OFFLOAD}"
+    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: dense_warmup, dsa_kl_block_size: ${KL_BLOCK}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true, dsa_diag_overlap_sample: ${DIAG_OVERLAP_SAMPLE}}"
     engine=fsdp
     engine.strategy=fsdp2
     engine.reshard_after_forward=True
     engine.use_orig_params=True
+    engine.model_dtype="${MODEL_DTYPE}"
     optim.lr="${LR}"
     optim.lr_scheduler_type="${LR_SCHED}"
     optim.lr_warmup_steps_ratio="${WARMUP_RATIO}"
@@ -153,6 +175,7 @@ LAUNCH=(
     trainer.experiment_name="${RUN_NAME}"
     trainer.logger='["console","wandb"]'
     trainer.save_freq="${SAVE_FREQ}"
+    ${MAX_CKPT:+trainer.max_ckpt_to_keep="${MAX_CKPT}"}
     "${VAL_ARGS[@]}"
     ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
     trainer.n_gpus_per_node="${NPROC}"

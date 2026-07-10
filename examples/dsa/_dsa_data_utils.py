@@ -155,6 +155,61 @@ def collect_windows(tok, docs, seq_len: int, n_needed: int, *, strip_markers: bo
     return windows, scanned
 
 
+def collect_doc_windows(tok, docs, seq_len: int, n_needed: int, *, strip_markers: bool, min_len=None, max_per_doc=8, char_cap=None):
+    """Slice each streamed doc into up to ``max_per_doc`` consecutive, non-overlapping ``seq_len`` windows.
+
+    Unlike :func:`collect_windows` (one window per doc), a long doc here yields MULTIPLE windows. Returns
+    ``(doc_groups, scanned)`` where ``doc_groups`` is a list of per-document window lists (each inner list
+    holds 1..``max_per_doc`` windows from a single doc). Grouping by doc lets the caller split train/val at
+    the DOCUMENT level (see :func:`split_doc_groups`) so no document's windows leak across the split.
+
+    ``n_needed`` bounds the TOTAL windows collected across all docs. ``char_cap`` bounds per-doc tokenization
+    work and defaults to enough chars for ``max_per_doc`` windows (~4 chars/token, 2x margin).
+    """
+    min_len = min_len or seq_len
+    char_cap = char_cap or seq_len * 8 * max_per_doc
+    doc_groups: list[list[list[int]]] = []
+    total = 0
+    scanned = 0
+    for text in docs:
+        if total >= n_needed:
+            break
+        scanned += 1
+        t = clean_text(text, strip_markers)[:char_cap]
+        ids = tok(t, add_special_tokens=True)["input_ids"]
+        if len(ids) < min_len:
+            continue
+        n_win = min(max_per_doc, len(ids) // seq_len)
+        if n_win <= 0:
+            continue
+        group = [[int(x) for x in ids[i * seq_len : (i + 1) * seq_len]] for i in range(n_win)]
+        doc_groups.append(group)
+        total += len(group)
+    return doc_groups, scanned
+
+
+def split_doc_groups(doc_groups, n_train: int, n_val: int, seed=None):
+    """Split per-doc window groups into flat train/val lists that share NO document (leak-free).
+
+    Groups are shuffled with ``seed`` (deterministic), then whole docs are assigned to VAL until it holds
+    ``n_val`` windows and the rest to TRAIN. A doc whose group straddles the val boundary keeps all its
+    windows in val; the overflow past ``n_val`` is dropped (never moved to train), so train and val remain
+    document-disjoint. Returns ``(train, val)`` truncated to the requested counts.
+    """
+    order = list(range(len(doc_groups)))
+    if seed is not None:
+        random.Random(seed).shuffle(order)
+    train: list[list[int]] = []
+    val: list[list[int]] = []
+    for i in order:
+        group = doc_groups[i]
+        if len(val) < n_val:
+            val.extend(group)
+        else:
+            train.extend(group)
+    return train[:n_train], val[:n_val]
+
+
 def collect_multilen_windows(tok, docs, lengths, per_len: int, *, strip_markers: bool, char_cap=None):
     """Collect ``per_len`` windows for EACH target length, using every doc at most once.
 
