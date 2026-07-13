@@ -40,6 +40,9 @@ DIAG_OVERLAP_SAMPLE=${DIAG_OVERLAP_SAMPLE:-0}  # cap query rows/block for the O(
 KL_BLOCK=${KL_BLOCK:-1024}             # query tile for the KL recompute; bounds the [block,n_heads,T] score
                                        # tensor. Lower at long context (e.g. 256 at 32K) to fit memory; pure
                                        # tiling granularity, no effect on numerics.
+KL_CKPT=${KL_CKPT:-False}              # activation-checkpoint the per-layer indexer KL (recompute scores in
+                                       # backward). Cuts retained mem from O(n_layers*T^2) to ~O(T^2) at 32K;
+                                       # no effect on numerics. Off by default (short context fits without it).
 GRAD_CKPT=${GRAD_CKPT:-False}          # base is frozen -> not needed; also conflicts with the _dsa_kl side-effect
 MODEL_DTYPE=${MODEL_DTYPE:-fp32}       # dtype the (frozen) base is initialized in. fp32 = accurate KL teacher
                                        # but ~2x memory; set bf16 at long context (32K) to fit on 4xH100.
@@ -104,7 +107,7 @@ echo "[dsa-phase1] cwd=$(pwd)"
 echo "[dsa-phase1] cmdline: $(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)"
 echo "[dsa-phase1] argv: $0 $*"
 echo "[dsa-phase1] env: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} NPROC=${NPROC} SEQ_LEN=${SEQ_LEN}" \
-     "STEPS=${STEPS} BATCH=${BATCH} TOPK=${TOPK} DIAG_OVERLAP_SAMPLE=${DIAG_OVERLAP_SAMPLE} KL_BLOCK=${KL_BLOCK} LR=${LR} LR_SCHED=${LR_SCHED} WARMUP_RATIO=${WARMUP_RATIO}" \
+     "STEPS=${STEPS} BATCH=${BATCH} TOPK=${TOPK} DIAG_OVERLAP_SAMPLE=${DIAG_OVERLAP_SAMPLE} KL_BLOCK=${KL_BLOCK} KL_CKPT=${KL_CKPT} LR=${LR} LR_SCHED=${LR_SCHED} WARMUP_RATIO=${WARMUP_RATIO}" \
      "MIN_LR_RATIO=${MIN_LR_RATIO} GRAD_CKPT=${GRAD_CKPT} MODEL_DTYPE=${MODEL_DTYPE} ACT_OFFLOAD=${ACT_OFFLOAD} ACT_GPU_LIMIT=${ACT_GPU_LIMIT} SAVE_FREQ=${SAVE_FREQ} MAX_CKPT=${MAX_CKPT:-all}" \
      "EXP_NAME=${EXP_NAME} TRAIN_FILES=${TRAIN_FILES} VAL_FILES=${VAL_FILES:-none}" \
      "TEST_FREQ=${TEST_FREQ} VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES} VAL_PREFIX=${VAL_PREFIX}" \
@@ -160,7 +163,7 @@ LAUNCH=(
     model.use_remove_padding=False
     model.enable_gradient_checkpointing="${GRAD_CKPT}"
     model.enable_activation_offload="${ACT_OFFLOAD}"
-    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: dense_warmup, dsa_kl_block_size: ${KL_BLOCK}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true, dsa_diag_overlap_sample: ${DIAG_OVERLAP_SAMPLE}}"
+    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: dense_warmup, dsa_kl_block_size: ${KL_BLOCK}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true, dsa_diag_overlap_sample: ${DIAG_OVERLAP_SAMPLE}, dsa_kl_checkpoint: ${KL_CKPT}}"
     engine=fsdp
     engine.strategy=fsdp2
     engine.reshard_after_forward=True

@@ -83,6 +83,9 @@ class DSAConfig:
     diag_overlap_sample: int = 0  # cap query rows per block used for the O(k^2) topk_overlap diagnostic
     # (materializes [bsz, block, k, k]); 0 = use all rows (fine at short context), >0 = evenly subsample this
     # many rows so peak diag memory stays bounded at long context. recall/entropy/score always use all rows.
+    kl_checkpoint: bool = False  # activation-checkpoint the per-layer KL: recompute the indexer scores in
+    # backward instead of storing them across all layers. Cuts retained mem from O(n_layers*T^2) to ~O(T^2).
+    # Needed at long context (32K); no effect on numerics. See docs/dsa_kl_checkpoint (Option 1).
 
     def __post_init__(self):
         if self.kl_reduction not in ("sum", "mean"):

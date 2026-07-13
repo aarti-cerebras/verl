@@ -33,6 +33,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from verl.models.transformers.dsa_indexer import DSAConfig, LightningIndexer
 
@@ -72,6 +73,7 @@ def dsa_overrides_from_config(model_config) -> dict:
         "diag_interval",
         "log_per_layer",
         "diag_overlap_sample",
+        "kl_checkpoint",
     ):
         val = getattr(model_config, f"dsa_{field}", None)
         if val is not None:
@@ -240,6 +242,7 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     do_diag = bool(getattr(attn.dsa, "_do_diag", False))  # set by the KL pre-hook every diag_interval
     diag_k = min(getattr(attn.dsa, "top_k", T), T)
     diag_ov_sample = int(getattr(attn.dsa, "diag_overlap_sample", 0) or 0)  # >0 -> subsample rows for topk_overlap
+    tile_ckpt = bool(getattr(attn.dsa, "kl_checkpoint", False)) and attn.training  # per-tile checkpoint the score graph
 
     if position_ids is None:
         position_ids = torch.arange(T, device=device).unsqueeze(0).expand(bsz, T)
@@ -269,6 +272,16 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     d_attn_ent = query_states.new_zeros((), dtype=torch.float32)  # base-model attention entropy (nats), summed
     d_attn_entfrac = query_states.new_zeros((), dtype=torch.float32)  # attn entropy / log(#valid keys) in [0,1]
 
+    def _tile_kl(q_idx_t, k_idx_t, w_t, bias_t, allow_t, p_t):
+        """Per-tile grad-carrying KL. Recomputes the indexer scores (the [bsz, B, n_heads, T] ``dots``) so that,
+        under checkpoint, only ONE tile's score graph is live in backward. Returns per-query-row KL [bsz, B].
+        ``where`` yields 0 for masked keys, so an all-masked (pad-query) row sums to a finite 0 (its p_t NaN is
+        confined to masked entries and discarded)."""
+        I_blk = attn.indexer.scores(q_idx_t, k_idx_t, w_t, attn_bias=bias_t)  # [bsz, B, T]
+        log_q = torch.log_softmax(I_blk.float(), dim=-1)
+        term = p_t * (torch.log(p_t.clamp_min(_KL_EPS)) - log_q)
+        return torch.where(allow_t, term, torch.zeros_like(term)).sum(dim=-1)  # [bsz, B]
+
     for q0 in range(0, T, block):
         q1 = min(q0 + block, T)
         bias = _causal_doc_bias_block(position_ids, q0, q1, T, device, key_mask=key_mask)  # [bsz, B, T]
@@ -289,14 +302,15 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
             # Assumes a single block (kl_block_size >= T) so this is the full [bsz, T, T].
             attn._dsa_p = p_blk.detach()
 
-        # --- indexer I_blk (grad into indexer only) ---
-        I_blk = attn.indexer.scores(q_idx[:, q0:q1], k_idx, weights[:, q0:q1], attn_bias=bias)  # [bsz, B, T]
-        log_q = torch.log_softmax(I_blk.float(), dim=-1)
-
-        term = p_blk * (torch.log(p_blk.clamp_min(_KL_EPS)) - log_q)
-        # `where` yields 0 for every masked key, so an all-masked (pad-query) row sums to a finite 0 — the
-        # NaN in p_blk at such rows is confined to masked entries and discarded, so kl_blk is always finite.
-        kl_blk = torch.where(allow, term, torch.zeros_like(term)).sum(dim=-1)  # [bsz, B]
+        # --- indexer KL for this tile (grad into indexer only). When kl_checkpoint is on, checkpoint the score
+        # graph so its [B, n_heads, T] `dots` is recomputed in backward -> only one tile is ever live (nested
+        # under the per-layer checkpoint at the attn-forward call site). ---
+        if tile_ckpt:
+            kl_blk = torch.utils.checkpoint.checkpoint(
+                _tile_kl, q_idx[:, q0:q1], k_idx, weights[:, q0:q1], bias, allow, p_blk, use_reentrant=False
+            )  # [bsz, B]
+        else:
+            kl_blk = _tile_kl(q_idx[:, q0:q1], k_idx, weights[:, q0:q1], bias, allow, p_blk)  # [bsz, B]
         if qv is not None:
             total_kl = total_kl + (kl_blk * qv).sum()  # count only real (non-pad) query rows
             total_cnt = total_cnt + qv.sum()
@@ -306,7 +320,8 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
 
         if do_diag:
             with torch.no_grad():
-                idf = I_blk.detach().float()
+                # recompute scores here (I_blk now lives inside _tile_kl); no_grad -> transient, no graph held
+                idf = attn.indexer.scores(q_idx[:, q0:q1], k_idx, weights[:, q0:q1], attn_bias=bias).float()
                 k = min(diag_k, T)
                 topk_i = idf.topk(k, dim=-1).indices  # indexer-selected keys [bsz, B, k]
                 recall = p_blk.gather(-1, topk_i).sum(-1)  # [bsz, B] (NaN at pad-query rows)
@@ -444,9 +459,20 @@ def minicpm3_dsa_attn_forward(
     dsa = getattr(self, "dsa", None)
     if dsa is not None and dsa.enabled:
         if dsa.mode == "dense_warmup":
-            self._dsa_kl = _dense_warmup_kl(
-                self, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask
-            )
+            # Activation-checkpoint the KL only when training (backward exists) and enabled: recompute the
+            # O(T^2) score graph in backward instead of holding it across all layers. use_reentrant=False is
+            # required — the inputs (frozen base) don't require grad; the grad-carrying tensors are the indexer
+            # params referenced inside, and the recompute re-fires the indexer FSDP2 all-gather via __call__.
+            if getattr(dsa, "kl_checkpoint", False) and self.training:
+                self._dsa_kl = torch.utils.checkpoint.checkpoint(
+                    _dense_warmup_kl,
+                    self, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                self._dsa_kl = _dense_warmup_kl(
+                    self, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask
+                )
         elif dsa.mode == "sparse":
             raise NotImplementedError("DSA 'sparse' mode (Phase 2 top-k attention) is not implemented yet.")
         else:
