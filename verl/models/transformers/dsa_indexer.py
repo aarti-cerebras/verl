@@ -85,7 +85,7 @@ class DSAConfig:
     # many rows so peak diag memory stays bounded at long context. recall/entropy/score always use all rows.
     kl_checkpoint: bool = False  # activation-checkpoint the per-layer KL: recompute the indexer scores in
     # backward instead of storing them across all layers. Cuts retained mem from O(n_layers*T^2) to ~O(T^2).
-    # Needed at long context (32K); no effect on numerics. See docs/dsa_kl_checkpoint (Option 1).
+    # Needed at long context (32K); no effect on numerics. See docs/dsa_kl_checkpoint.md.
 
     def __post_init__(self):
         if self.kl_reduction not in ("sum", "mean"):

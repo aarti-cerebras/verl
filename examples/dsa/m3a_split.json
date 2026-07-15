@@ -1,0 +1,9 @@
+{
+  "Code":                 {"frac": 0.30, "lang": "en"},
+  "Math":                 {"frac": 0.30, "lang": "en"},
+  "Multi-lang-Math":       {"frac": 0.10, "lang": "zh"},
+  "Multi-lang-Knowledge":  {"frac": 0.10, "lang": "zh"},
+  "Knowledge":            {"frac": 0.10, "lang": "en"},
+  "Chinese-general":      {"frac": 0.05, "lang": "zh"},
+  "IF":                   {"frac": 0.05, "lang": "en"}
+}
