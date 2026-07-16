@@ -451,7 +451,23 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        indexer_lr = getattr(self.optimizer_config, "indexer_lr", None)
+        if indexer_lr is not None:
+            # DSA Phase-2: two param groups — base at config.lr, `*.indexer.*` at indexer_lr. Both follow the
+            # same LR-schedule shape (the scheduler scales each group's base lr). Filter to requires_grad.
+            base_params, idx_params = [], []
+            for name, p in module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (idx_params if ".indexer." in name else base_params).append(p)
+            params = [{"params": base_params}, {"params": idx_params, "lr": indexer_lr}]
+            if self.rank == 0:
+                print(f"[optim] DSA two groups: base lr={self.optimizer_config.lr} ({len(base_params)} tensors), "
+                      f"indexer lr={indexer_lr} ({len(idx_params)} tensors)")
+        else:
+            params = module.parameters()
+
+        optimizer = build_optimizer(params, self.optimizer_config)
 
         return optimizer
 

@@ -173,7 +173,7 @@ class SFTTrainer:
 
     def _build_engine(self):
         from verl.workers.engine_workers import TrainingWorkerConfig
-        from verl.workers.utils.losses import indexer_kl_loss, sft_loss
+        from verl.workers.utils.losses import dsa_sparse_loss, indexer_kl_loss, sft_loss
 
         loss_mode = self.config.get("loss_mode", "sft")
         if loss_mode == "indexer_kl":
@@ -181,6 +181,12 @@ class SFTTrainer:
             # forward hooks set model._dsa_indexer_kl). self.engine is resolved lazily at call time (set
             # below), so it exists by the first loss invocation during training.
             self.loss_fn = lambda **kw: indexer_kl_loss(**kw, config=None, model=self.engine.module)
+        elif loss_mode == "dsa_sparse":
+            # DSA Phase-2 sparse: LM cross-entropy + λ · selected-set indexer KL (read off the model).
+            kl_lambda = float(self.config.get("indexer_kl_lambda", 1.0))
+            self.loss_fn = lambda **kw: dsa_sparse_loss(
+                **kw, config=None, model=self.engine.module, kl_lambda=kl_lambda
+            )
         else:
             self.loss_fn = partial(sft_loss, config=None)
 

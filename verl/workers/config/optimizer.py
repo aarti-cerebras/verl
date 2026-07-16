@@ -112,6 +112,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
     num_cycles: float = 0.5
     override_optimizer_config: Optional[dict] = None
     zero_indexed_step: bool = True
+    indexer_lr: Optional[float] = None  # DSA Phase-2: separate LR for *.indexer.* params (two param groups)
 
     def __post_init__(self):
         if self.warmup_style is not None:

@@ -406,6 +406,125 @@ def _dense_warmup_kl(attn, hidden_states, qr, query_states, key_states, cos, sin
     return (total_kl / total_cnt.clamp_min(1)).to(compute_dtype)
 
 
+def _sparse_attn(
+    attn, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids, attention_mask=None
+):
+    """DSA Phase-2 sparse LM attention (T1). Selects top-k keys per query via the lightning indexer and attends
+    ONLY over the selected set (gathered-KV, tiled over query blocks to bound the ``[b, H, B, k, d]`` peak).
+
+    Gradient wiring (the crux, per arxiv 2512.02556 §2.1.1):
+      * The LM path (``attn_output``) uses ``query/key/value_states`` (base activations) gathered at the
+        selected indices, so the **LM loss trains the base**. ``idx`` is ``.detach()``-ed — top-k is
+        non-differentiable — so **no LM-loss gradient reaches the indexer**.
+      * The indexer is called on **detached** base activations, so its scores carry gradient only into the
+        indexer's own params (consumed by the selected-set KL, T2), **never into the base**.
+
+    Returns ``(attn_output [bsz, T, num_heads*v_head_dim] (post o_proj), idx [bsz, T, k], indexer_scores
+    [bsz, T, T])``. ``idx``/``indexer_scores`` are reused by ``_sparse_indexer_kl`` (T2).
+
+    Parity: with ``top_k >= T`` the selected set is the full causal+document set, so the output equals the
+    dense flash path (softmax is permutation-invariant and V is gathered in the same order as K; masked keys
+    carry ``-inf`` bias -> zero weight). This is the M0 parity test.
+    """
+    bsz, H, T, dqk = query_states.shape
+    dv = value_states.shape[-1]
+    device = query_states.device
+    scale = attn.softmax_scale
+    top_k = min(getattr(attn.dsa, "top_k", T) or T, T)
+    block = getattr(attn.dsa, "kl_block_size", 0) or T
+
+    if position_ids is None:
+        position_ids = torch.arange(T, device=device).unsqueeze(0).expand(bsz, T)
+    key_mask = attention_mask.bool() if (attention_mask is not None and attention_mask.dim() == 2) else None
+    cos_g, sin_g = cos[position_ids], sin[position_ids]
+
+    # Indexer scores from DETACHED base activations -> gradient only into indexer params (not the base).
+    # Route through __call__ (return_projection=True) so FSDP2 hooks on the indexer unit fire (see fsdp notes B2).
+    q_idx, k_idx, w = attn.indexer(hidden_states.detach(), qr.detach(), cos_g, sin_g, return_projection=True)
+    indexer_scores = attn.indexer.scores(q_idx, k_idx, w)  # [bsz, T, T] raw (causal/doc bias applied per block)
+
+    o_tiles, idx_tiles = [], []
+    for q0 in range(0, T, block):
+        q1 = min(q0 + block, T)
+        B = q1 - q0
+        bias_b = _causal_doc_bias_block(position_ids, q0, q1, T, device, key_mask=key_mask)  # [bsz, B, T]
+        idx_b = (indexer_scores[:, q0:q1] + bias_b).topk(top_k, dim=-1).indices.detach()  # [bsz, B, k] (stop-grad)
+        idx_tiles.append(idx_b)
+        bias_sel = torch.gather(bias_b, 2, idx_b)  # [bsz, B, k] (-inf where a selected key is masked/cross-doc)
+        # gather the k selected K/V per (batch, query). index_select avoids the O(B*T) broadcast; stack keeps
+        # autograd clean (grad flows back to key/value_states at the selected positions).
+        Kg = torch.stack([key_states[b].index_select(1, idx_b[b].reshape(-1)).reshape(H, B, top_k, dqk)
+                          for b in range(bsz)])  # [bsz, H, B, k, dqk]
+        Vg = torch.stack([value_states[b].index_select(1, idx_b[b].reshape(-1)).reshape(H, B, top_k, dv)
+                          for b in range(bsz)])  # [bsz, H, B, k, dv]
+        s = torch.einsum("bhBd,bhBkd->bhBk", query_states[:, :, q0:q1], Kg) * scale + bias_sel[:, None]
+        a = torch.softmax(s.float(), dim=-1).to(Vg.dtype)
+        o_tiles.append(torch.einsum("bhBk,bhBkd->bhBd", a, Vg))  # [bsz, H, B, dv]
+
+    o = torch.cat(o_tiles, dim=2)  # [bsz, H, T, dv]
+    idx_full = torch.cat(idx_tiles, dim=1)  # [bsz, T, k]
+    attn_output = attn.o_proj(o.transpose(1, 2).reshape(bsz, T, H * dv).contiguous())
+    return attn_output, idx_full, indexer_scores
+
+
+def _sparse_indexer_kl(attn, query_states, key_states, indexer_scores, idx, position_ids, attention_mask=None):
+    """DSA Phase-2 selected-set indexer KL (T2), paper eq. 4: ``sum_t KL(p_{t,S_t} || softmax(I_{t,S_t}))``.
+
+    ``indexer_scores`` come from ``_sparse_attn`` (computed on DETACHED base activations, so gradient flows
+    only into the indexer's params — never the base). ``idx`` is the stop-grad top-k selection ``S_t``. The
+    target ``p`` = head-averaged softmax of the **main** attention over the causal+document set, restricted to
+    ``S_t`` and renormalized, and is **detached** (a fixed target). So this loss trains ONLY the indexer.
+
+    Tiled over query blocks (``block = dsa.kl_block_size``); the target ``p`` accumulates head-by-head to keep
+    peak at ~``[bsz, block, T]``. Averaged over valid (non-pad) query rows. Masked/cross-doc selected keys
+    carry ``-inf`` bias and are zeroed out of the KL (avoids ``0*-inf`` NaNs). Feeds ``attn._dsa_kl``.
+    """
+    bsz, H, T, _ = query_states.shape
+    device, compute_dtype = query_states.device, query_states.dtype
+    scale = attn.softmax_scale
+    block = getattr(attn.dsa, "kl_block_size", 0) or T
+    if position_ids is None:
+        position_ids = torch.arange(T, device=device).unsqueeze(0).expand(bsz, T)
+    key_mask = attention_mask.bool() if (attention_mask is not None and attention_mask.dim() == 2) else None
+
+    total_kl = query_states.new_zeros((), dtype=torch.float32)
+    total_cnt = query_states.new_zeros((), dtype=torch.float32)
+    for q0 in range(0, T, block):
+        q1 = min(q0 + block, T)
+        B = q1 - q0
+        bias_b = _causal_doc_bias_block(position_ids, q0, q1, T, device, key_mask=key_mask)  # [bsz, B, T]
+        idx_b = idx[:, q0:q1]  # [bsz, B, k]
+        bias_sel = torch.gather(bias_b, 2, idx_b)  # [bsz, B, k]
+        allow_sel = bias_sel == 0.0
+        qv = key_mask[:, q0:q1].to(torch.float32) if key_mask is not None else None  # [bsz, B] real-query mask
+
+        # target p_blk (detached): head-averaged softmax main attention over causal+doc, accumulate over heads
+        with torch.no_grad():
+            qb = query_states[:, :, q0:q1, :]
+            p_blk = query_states.new_zeros(bsz, B, T, dtype=torch.float32)
+            for h in range(H):
+                sdot = torch.matmul(qb[:, h], key_states[:, h].transpose(1, 2)) * scale  # [bsz, B, T]
+                p_blk += torch.softmax(sdot.float() + bias_b, dim=-1)
+            p_blk /= H  # rows with no valid keys (pad queries) are NaN here — dropped by qv below
+
+        p_S = torch.gather(p_blk, 2, idx_b)  # [bsz, B, k]
+        p_S = torch.where(allow_sel, p_S, torch.zeros_like(p_S))
+        p_S = p_S / p_S.sum(dim=-1, keepdim=True).clamp_min(_KL_EPS)  # renormalize over the selected set
+        I_S = torch.gather(indexer_scores[:, q0:q1], 2, idx_b) + bias_sel  # [bsz, B, k] (-inf at masked)
+        logq_S = torch.log_softmax(I_S.float(), dim=-1)
+        term = p_S * (p_S.clamp_min(_KL_EPS).log() - logq_S)
+        kl_bB = torch.where(allow_sel, term, torch.zeros_like(term)).sum(dim=-1)  # [bsz, B]
+        if qv is not None:
+            kl_bB = torch.where(qv.bool(), kl_bB, torch.zeros_like(kl_bB))  # drop pad-query (NaN) rows
+            total_kl = total_kl + kl_bB.sum()
+            total_cnt = total_cnt + qv.sum()
+        else:
+            total_kl = total_kl + kl_bB.sum()
+            total_cnt = total_cnt + kl_bB.numel()
+
+    return (total_kl / total_cnt.clamp_min(1)).to(compute_dtype)
+
+
 def minicpm3_dsa_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -474,7 +593,15 @@ def minicpm3_dsa_attn_forward(
                     self, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask
                 )
         elif dsa.mode == "sparse":
-            raise NotImplementedError("DSA 'sparse' mode (Phase 2 top-k attention) is not implemented yet.")
+            # Phase-2: attend only over the top-k selected keys (T1). This REPLACES the dense flash path, so we
+            # return directly. The selected-set indexer KL (T2) will be attached to self._dsa_kl here.
+            attn_output, idx, indexer_scores = _sparse_attn(
+                self, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids, attention_mask
+            )
+            self._dsa_kl = _sparse_indexer_kl(
+                self, query_states, key_states, indexer_scores, idx, position_ids, attention_mask
+            )
+            return attn_output, None, past_key_value
         else:
             raise ValueError(f"unknown DSA mode: {dsa.mode}")
 

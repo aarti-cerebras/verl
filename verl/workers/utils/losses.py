@@ -73,6 +73,47 @@ def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model
     return loss, metrics
 
 
+def dsa_sparse_loss(config, model_output, data: TensorDict, dp_group=None, model=None, kl_lambda: float = 1.0):
+    """DSA Phase-2 (sparse) loss: LM cross-entropy + ``kl_lambda`` · selected-set indexer KL.
+
+    Decoupled per the paper (arxiv 2512.02556 §2.1.1): the main model trains via the LM CE (``sft_loss``,
+    through the sparse attention output); the indexer trains via its selected-set KL, read off the model at
+    ``model._dsa_indexer_kl`` (set by the DSA sparse forward, summed by ``install_kl_accumulation``). The two
+    are separate subgraphs (top-k selection is stop-grad; the indexer input is detached), so summing them here
+    is safe — each gradient reaches only its own params.
+
+    Both terms are normalized to a global mean (matching ``sft_loss`` / ``indexer_kl_loss``) so the
+    per-microbatch backward-accumulate + dp all-reduce yields the true global objective and the effective LR
+    is independent of the micro-batch/dp split. Bound to the model via a closure in the SFT trainer.
+    """
+    assert model is not None, "dsa_sparse_loss must be bound to the model (pass model=...)"
+    lm_loss, _ = sft_loss(config, model_output, data, dp_group)  # already ÷ batch_num_tokens × dp_size
+
+    kl = getattr(model, "_dsa_indexer_kl", None)
+    assert kl is not None, (
+        "model._dsa_indexer_kl is not set — is DSA enabled (dsa_enabled), dsa_mode=='sparse', and the forward run?"
+    )
+    kl_term = kl  # per-batch mean over layers & valid queries; normalize to a global mean like indexer_kl_loss
+    num_valid = (
+        tu.get_non_tensor_data(data=data, key="batch_num_valid_queries", default=None) if data is not None else None
+    )
+    if num_valid:
+        dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
+        mb_valid = tu.num_valid_queries(data)
+        kl_term = kl * mb_valid / num_valid * dp_size
+
+    loss = lm_loss + kl_lambda * kl_term
+    metrics = {
+        "loss/lm": lm_loss.detach(),
+        "indexer/kl": kl.detach(),
+        "loss/kl_weighted": (kl_lambda * kl_term).detach(),
+    }
+    dsa_metrics = getattr(model, "_dsa_metrics", None)
+    if dsa_metrics:
+        metrics.update(dsa_metrics)
+    return loss, metrics
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
