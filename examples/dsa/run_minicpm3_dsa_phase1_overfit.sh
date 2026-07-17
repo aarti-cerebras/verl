@@ -37,7 +37,7 @@ export DSA_DEBUG_MASTER=${DSA_DEBUG_MASTER:-1}
 
 # --- all logs + artifacts under the repo, in one run subfolder ---
 RUN_TS=$(date +%Y%m%d_%H%M%S)
-RUN_DIR=${RUN_DIR:-${REPO_ROOT}/dsa_runs/${EXP_NAME}-${RUN_TS}}
+RUN_DIR=${RUN_DIR:-${RUNS_BASE:-/cb/ml-eng/aarti/dsa/dsa_runs}/${EXP_NAME}-${RUN_TS}}  # writable NFS w/ space (NOT repo ws)
 mkdir -p "${RUN_DIR}"
 LOG_FILE=${LOG_FILE:-${RUN_DIR}/run-${RUN_TS}.log}
 export WANDB_DIR="${RUN_DIR}"

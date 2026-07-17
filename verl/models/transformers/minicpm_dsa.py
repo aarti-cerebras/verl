@@ -74,6 +74,7 @@ def dsa_overrides_from_config(model_config) -> dict:
         "log_per_layer",
         "diag_overlap_sample",
         "kl_checkpoint",
+        "warmstart_path",
     ):
         val = getattr(model_config, f"dsa_{field}", None)
         if val is not None:
@@ -96,13 +97,35 @@ def build_dsa_config(model_config, **overrides) -> DSAConfig:
 
 def attach_indexers(model, dsa_cfg: DSAConfig) -> None:
     """Attach a `LightningIndexer` (+ the DSAConfig) to every decoder layer's `self_attn` instance,
-    matching the attention's device/dtype."""
+    matching the attention's device/dtype. Then optionally warm-start (see `_warmstart_from_consolidated`)."""
     for layer in model.model.layers:
         attn = layer.self_attn
         attn.dsa = dsa_cfg
         idx = LightningIndexer(dsa_cfg)  # indexer uses its own softmax_scale = head_dim**-0.5
         ref = next(attn.parameters())
         attn.indexer = idx.to(device=ref.device, dtype=ref.dtype)
+    path = getattr(dsa_cfg, "warmstart_path", None)
+    if path:
+        _warmstart_from_consolidated(model, path)
+
+
+def _warmstart_from_consolidated(model, path: str) -> None:
+    """Warm-start weights from a CONSOLIDATED (world-size-agnostic) state dict — indexer-only (Phase-1 ckpt;
+    base stays stock) OR full base+indexer (Phase-2 ckpt). Runs BEFORE FSDP wrap, so it is GPU-count-agnostic
+    and yields a FRESH optimizer + step 0. Keys are full param names (`model.layers.N.self_attn.indexer.*`,
+    `model.layers.N.self_attn.q_a_proj.weight`, ...), matching `model.state_dict()`; loaded with strict=False
+    so whatever the file does NOT carry keeps its base init. Asserts the file has indexer keys (guards against
+    a typo'd/empty path silently no-op'ing) and no unexpected keys (guards against a key-name mismatch)."""
+    sd = torch.load(path, weights_only=False, map_location="cpu")
+    ref = next(model.parameters())
+    sd = {k: v.to(device=ref.device, dtype=ref.dtype) for k, v in sd.items()}
+    n_idx = sum(1 for k in sd if ".indexer." in k)
+    assert n_idx > 0, f"warmstart_path {path} has no *.indexer.* keys — is it a consolidated indexer/model dict?"
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    assert not unexpected, f"warmstart_path {path} has keys absent from the model: {list(unexpected)[:5]}"
+    n_base = len(sd) - n_idx
+    print(f"DSA warm-start: loaded {len(sd)} tensors ({n_idx} indexer + {n_base} base) from {path}; "
+          f"{len(missing)} model params kept from base init (fresh optimizer, step 0)")
 
 
 def freeze_base_train_indexer(model) -> list:
@@ -525,6 +548,28 @@ def _sparse_indexer_kl(attn, query_states, key_states, indexer_scores, idx, posi
     return (total_kl / total_cnt.clamp_min(1)).to(compute_dtype)
 
 
+def _sparse_attn_and_kl(
+    attn, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids, attention_mask
+):
+    """Fused sparse attention (T1) + selected-set indexer KL (T2) so the whole DSA sparse graph can be wrapped
+    in ONE ``torch.utils.checkpoint.checkpoint`` (see the ``kl_checkpoint`` branch in the forward).
+
+    Why fused (vs checkpointing the two separately): Phase-2 TRAINS the base, so the gathered-KV attention
+    (``Kg/Vg/scores`` per query tile) is the memory-heavy graph — and its ``idx``/``indexer_scores`` are also
+    the KL's inputs. Fusing keeps ``idx``/``indexer_scores`` (incl. the ``[bsz,T,T]`` score matrix) as
+    *internal* intermediates that are recomputed in backward rather than retained across all 62 layers; only
+    ``attn_output`` (grad→base) and the scalar ``kl`` (grad→indexer) cross the checkpoint boundary. Numerics
+    are identical to the non-checkpointed path (top-k is deterministic on the recomputed scores).
+
+    Returns ``(attn_output, kl)``.
+    """
+    attn_output, idx, indexer_scores = _sparse_attn(
+        attn, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids, attention_mask
+    )
+    kl = _sparse_indexer_kl(attn, query_states, key_states, indexer_scores, idx, position_ids, attention_mask)
+    return attn_output, kl
+
+
 def minicpm3_dsa_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -593,14 +638,24 @@ def minicpm3_dsa_attn_forward(
                     self, hidden_states, qr, query_states, key_states, cos, sin, position_ids, attention_mask
                 )
         elif dsa.mode == "sparse":
-            # Phase-2: attend only over the top-k selected keys (T1). This REPLACES the dense flash path, so we
-            # return directly. The selected-set indexer KL (T2) will be attached to self._dsa_kl here.
-            attn_output, idx, indexer_scores = _sparse_attn(
-                self, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids, attention_mask
-            )
-            self._dsa_kl = _sparse_indexer_kl(
-                self, query_states, key_states, indexer_scores, idx, position_ids, attention_mask
-            )
+            # Phase-2: attend only over the top-k selected keys (T1) + selected-set indexer KL (T2). This
+            # REPLACES the dense flash path, so we return directly (self._dsa_kl feeds install_kl_accumulation).
+            # kl_checkpoint (same knob as dense_warmup): the base is TRAINED here, so the gathered-KV attention
+            # graph is large — recompute the whole DSA sparse graph in backward instead of holding it across all
+            # layers. use_reentrant=False (grad-carrying tensors are the base activations + indexer params
+            # referenced inside; recompute re-fires the indexer FSDP2 all-gather). Numerics unchanged.
+            if getattr(dsa, "kl_checkpoint", False) and self.training:
+                attn_output, self._dsa_kl = torch.utils.checkpoint.checkpoint(
+                    _sparse_attn_and_kl,
+                    self, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                attn_output, self._dsa_kl = _sparse_attn_and_kl(
+                    self, hidden_states, qr, query_states, key_states, value_states, cos, sin, position_ids,
+                    attention_mask,
+                )
             return attn_output, None, past_key_value
         else:
             raise ValueError(f"unknown DSA mode: {dsa.mode}")

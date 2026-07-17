@@ -107,6 +107,7 @@ def dsa_sparse_loss(config, model_output, data: TensorDict, dp_group=None, model
         "loss/lm": lm_loss.detach(),
         "indexer/kl": kl.detach(),
         "loss/kl_weighted": (kl_lambda * kl_term).detach(),
+        "train/kl_lambda": float(kl_lambda),  # KL weight (constant here; logged for provenance). NOT loss/* (not summed).
     }
     dsa_metrics = getattr(model, "_dsa_metrics", None)
     if dsa_metrics:

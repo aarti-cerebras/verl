@@ -27,7 +27,8 @@ export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-/cb/ml-eng/aarti/dsa/.vllm/cache}
 TRAIN_FILES=${TRAIN_FILES:-/cb/ml-eng/aarti/dsa/m3a_sft.parquet}
 VAL_FILES=${VAL_FILES:-}
 NPROC=${NPROC:-8}
-SEQ_LEN=${SEQ_LEN:-4096}               # pad/truncate length; covers MiniCPM3-4B math/code after runaway filter
+SEQ_LEN=${SEQ_LEN:-4096}               # max sequence length
+TRUNCATION=${TRUNCATION:-right}        # samples > SEQ_LEN: 'right' truncate (keep all samples) | 'error' crash
 MICRO_BSZ=${MICRO_BSZ:-1}
 BATCH=${BATCH:-64}                     # global batch (sequences/step)
 STEPS=${STEPS:-500}
@@ -35,6 +36,7 @@ STEPS=${STEPS:-500}
 # --- DSA sparse config ---
 TOPK=${TOPK:-512}                      # sparse key budget (train == deploy)
 KL_BLOCK=${KL_BLOCK:-1024}             # query-tile for the sparse forward + selected-set KL
+KL_CKPT=${KL_CKPT:-true}               # activation-checkpoint the DSA sparse graph (base is trained -> big graph)
 LAMBDA=${LAMBDA:-1.0}                  # indexer-KL weight in the combined loss
 
 # --- optim: two param groups (base + indexer) via the LR schedule; both follow the same shape ---
@@ -49,8 +51,15 @@ GRAD_CKPT=${GRAD_CKPT:-True}
 MODEL_DTYPE=${MODEL_DTYPE:-bf16}
 ACT_OFFLOAD=${ACT_OFFLOAD:-False}
 
-# --- init: optionally resume the Phase-1 warmed indexer (weights). Empty => indexer starts fresh and the
-#     sparse stage warms it via the selected-set KL. See docs/dsa_phase2_impl.md (T5 init note). ---
+# --- init (two independent options; pick one) ---
+#  WARMSTART_PATH: a CONSOLIDATED (world-size-agnostic) state dict from consolidate_indexer_ckpt.py —
+#    indexer-only (Phase-1 ckpt; base stays stock) OR full base+indexer (Phase-2 ckpt). Loaded via
+#    model.load_state_dict(strict=False) BEFORE FSDP wrap => works on ANY GPU count, FRESH optimizer + step 0.
+#    This is the normal way to start Phase-2 from a Phase-1 (or branch from a Phase-2) checkpoint.
+#  RESUME_PATH: verl NATIVE resume (loads model+optimizer+step); CONTINUES a run but is locked to the SAME
+#    GPU count the ckpt was saved with. Use only to resume an interrupted Phase-2 run.
+#  Empty both => fresh indexer (the sparse-stage KL warms it).
+WARMSTART_PATH=${WARMSTART_PATH:-}
 RESUME_PATH=${RESUME_PATH:-}
 SAVE_FREQ=${SAVE_FREQ:-${STEPS}}
 MAX_CKPT=${MAX_CKPT:-}
@@ -82,7 +91,13 @@ fi
 RESUME_ARGS=()
 if [[ -n "${RESUME_PATH}" ]]; then
     RESUME_ARGS=(trainer.resume_mode=resume_path trainer.resume_from_path="${RESUME_PATH}")
-    echo "[dsa-phase2] resuming (warmed indexer) from ${RESUME_PATH}"
+    echo "[dsa-phase2] NATIVE resume (model+optim+step, same GPU count) from ${RESUME_PATH}"
+fi
+# warm-start weights (consolidated; fresh optimizer/step; any GPU count) go into the DSA override_config
+DSA_WARMSTART_KV=""
+if [[ -n "${WARMSTART_PATH}" ]]; then
+    DSA_WARMSTART_KV=", dsa_warmstart_path: ${WARMSTART_PATH}"
+    echo "[dsa-phase2] WARM-START weights from ${WARMSTART_PATH} (fresh optimizer, step 0)"
 fi
 
 LAUNCH=(
@@ -93,8 +108,9 @@ LAUNCH=(
     +loss_mode=dsa_sparse
     +indexer_kl_lambda="${LAMBDA}"
     data.train_files="${TRAIN_FILES}"
-    data.pad_mode=right
+    data.pad_mode=no_padding
     data.max_length="${SEQ_LEN}"
+    data.truncation="${TRUNCATION:-right}"   # right-truncate the rare >SEQ_LEN samples (default 'error' would crash)
     data.micro_batch_size_per_gpu="${MICRO_BSZ}"
     data.train_batch_size="${BATCH}"
     data.use_dynamic_bsz=False
@@ -103,7 +119,7 @@ LAUNCH=(
     model.use_remove_padding=False
     model.enable_gradient_checkpointing="${GRAD_CKPT}"
     model.enable_activation_offload="${ACT_OFFLOAD}"
-    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: sparse, dsa_kl_block_size: ${KL_BLOCK}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true}"
+    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: sparse, dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true${DSA_WARMSTART_KV}}"
     engine=fsdp
     engine.strategy=fsdp2
     engine.reshard_after_forward=True

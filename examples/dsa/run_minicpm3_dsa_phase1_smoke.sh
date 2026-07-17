@@ -27,7 +27,7 @@ EXP_NAME=${EXP_NAME:-phase1-smoke}     # names the run: dsa_runs/${EXP_NAME}/ + 
 
 # --- all logs + artifacts under the repo, in one run subfolder ---
 REPO_ROOT=${REPO_ROOT:-/cb/home/aarti/ws/code/ws_repos/dsa/verl}
-RUN_DIR=${RUN_DIR:-${REPO_ROOT}/dsa_runs/${EXP_NAME}}
+RUN_DIR=${RUN_DIR:-${RUNS_BASE:-/cb/ml-eng/aarti/dsa/dsa_runs}/${EXP_NAME}}  # writable NFS w/ space (NOT repo ws)
 RUN_TS=$(date +%Y%m%d_%H%M%S)
 mkdir -p "${RUN_DIR}"
 LOG_FILE=${LOG_FILE:-${RUN_DIR}/run-${RUN_TS}.log}

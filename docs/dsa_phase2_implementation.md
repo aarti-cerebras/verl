@@ -55,7 +55,16 @@ a fresh session.
 | Split (config×lang) | Code(EN) 30 / Math(EN) 30 / ML-Math(ZH) 10 / ML-Knowledge(ZH) 10 / Knowledge(EN) 10 / Chinese-general(ZH) 5 / IF(EN) 5 → ~75% EN / 25% ZH | Code = sparsity workhorse; ZH from Multi-lang-* not tiny Chinese-general |
 | `max_new_tokens` | **Math/Code/Multi-lang-Math = 16K**, others 4K | "cap high, filter after"; drop runaways post-hoc |
 | Decoding | **temperature 0.7**, top_p 0.9, n=1, seed 1234 | clones deployment-temp behavior |
-| Dataset class | **`MultiTurnSFTDataset`** (NOT `PackedPretrainDataset`), `pad_mode=right`, `use_remove_padding=False` | SFT path; DSA forward expects `[bsz,T]` |
+| Dataset class | **`MultiTurnSFTDataset`** (NOT `PackedPretrainDataset`), **`pad_mode=no_padding`**, `use_remove_padding=False` | SFT path; DSA forward expects `[bsz,T]` — see pad_mode note below |
+
+> **pad_mode correction (2026-07-16):** the original plan said `pad_mode=right`, but the FSDP engine's
+> `prepare_model_inputs` (`transformer_impl.py:1022`) **asserts `pad_mode==no_padding`** — `right` is not
+> implemented and crashes at the first train step (`AssertionError: pad_mode right not supported`). Use
+> **`pad_mode=no_padding`** (the proven Phase-1 path): the engine still hands the model a rectangular
+> `[bsz,T]` + `attention_mask` (it re-pads each micro-batch to its *own* `max_seq_len` via
+> `to_padded_tensor`), which is exactly what the DSA sparse forward needs — and it wastes no compute on a
+> fixed global pad. `MultiTurnSFTDataset` supports `no_padding` (returns unpadded tensors; the collator
+> makes them a NestedTensor).
 | Generation parallelism | **DP=8, TP=1** (data-parallel replicas) | TP=8 on a 4B model is comms-bound |
 | Writing | **chunked append + resume** (`--chunk-size 512`) | crash-safe on the flaky shared host |
 

@@ -131,3 +131,6 @@ logs
 log
 outputs
 .history
+# DSA training runs (logs, wandb, checkpoints)
+dsa_runs/
+.devlibs/

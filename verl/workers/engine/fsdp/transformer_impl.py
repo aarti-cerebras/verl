@@ -460,7 +460,7 @@ class FSDPEngine(BaseEngine):
                 if not p.requires_grad:
                     continue
                 (idx_params if ".indexer." in name else base_params).append(p)
-            params = [{"params": base_params}, {"params": idx_params, "lr": indexer_lr}]
+            params = [{"params": base_params, "name": "base"}, {"params": idx_params, "lr": indexer_lr, "name": "indexer"}]
             if self.rank == 0:
                 print(f"[optim] DSA two groups: base lr={self.optimizer_config.lr} ({len(base_params)} tensors), "
                       f"indexer lr={indexer_lr} ({len(idx_params)} tensors)")
@@ -710,6 +710,25 @@ class FSDPEngine(BaseEngine):
         # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
         if scaler is not None:
             scaler.unscale_(self.optimizer)
+
+        # Per-optimizer-group grad-norm breakdown (DSA two-group runs: "base" vs "indexer"), for diagnostics.
+        # Computed PRE-clip (like the returned total norm), shard-aware via the same _get_total_norm torch uses.
+        # Surfaced by base.train_batch as metrics grad_norm/base and grad_norm/indexer.
+        self._group_grad_norms = {}
+        if len(self.optimizer.param_groups) > 1 and any("name" in g for g in self.optimizer.param_groups):
+            from torch.nn.utils.clip_grad import _get_total_norm
+
+            for g in self.optimizer.param_groups:
+                gname = g.get("name")
+                if gname is None:
+                    continue
+                grads = [p.grad for p in g["params"] if p.grad is not None]
+                if not grads:
+                    continue
+                gn = _get_total_norm(grads, 2.0, False, None)
+                if isinstance(gn, DTensor):
+                    gn = gn.full_tensor()
+                self._group_grad_norms[f"grad_norm/{gname}"] = gn.to(get_device_id()).item()
 
         if isinstance(self.module, FSDP):
             grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)

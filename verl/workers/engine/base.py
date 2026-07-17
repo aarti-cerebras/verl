@@ -128,6 +128,9 @@ class BaseEngine:
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
+            # optional per-param-group grad-norm breakdown (e.g. DSA base vs indexer), if the engine computed it
+            for k, v in getattr(self, "_group_grad_norms", {}).items():
+                outputs["metrics"][k] = v
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:

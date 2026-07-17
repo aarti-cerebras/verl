@@ -86,6 +86,11 @@ class DSAConfig:
     kl_checkpoint: bool = False  # activation-checkpoint the per-layer KL: recompute the indexer scores in
     # backward instead of storing them across all layers. Cuts retained mem from O(n_layers*T^2) to ~O(T^2).
     # Needed at long context (32K); no effect on numerics. See docs/dsa_kl_checkpoint.md.
+    warmstart_path: Optional[str] = None  # warm-start weights: path to a CONSOLIDATED (world-size-agnostic)
+    # state dict from scripts/dsa/consolidate_indexer_ckpt.py — indexer-only (from a Phase-1 ckpt; base stays
+    # stock) OR full base+indexer (from a Phase-2 ckpt). Loaded via model.load_state_dict(strict=False) in
+    # attach_indexers BEFORE FSDP wrap, so it works on ANY GPU count, with a FRESH optimizer + step 0. None =>
+    # fresh indexer. (To CONTINUE a Phase-2 run with its optimizer/step, use verl native resume instead.)
 
     def __post_init__(self):
         if self.kl_reduction not in ("sum", "mean"):

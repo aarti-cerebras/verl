@@ -89,11 +89,33 @@ def main():
         logger.info("by lang: %s", df["lang"].value_counts().to_dict())
     if "total_tokens" in df.columns and len(df):
         q = df["total_tokens"].quantile([0.5, 0.9, 0.99]).astype(int).to_dict()
-        logger.info("total_tokens p50/p90/p99 = %s  >=1024: %.0f%%",
-                    q, 100 * (df["total_tokens"] >= 1024).mean())
+        logger.info("total_tokens p50/p90/p99 = %s", q)
+        _log_seqlen_histogram(logger, df["total_tokens"], top_k=512)
 
     df.to_parquet(args.out, index=False)
     logger.info("wrote %d rows -> %s", len(df), args.out)
+
+
+def _log_seqlen_histogram(logger, series, top_k=512):
+    """Log a text histogram of sequence lengths (total_tokens) + the fraction that will engage sparse
+    attention (>= top_k; shorter sequences run dense since top_k covers the whole causal set)."""
+    import numpy as np
+
+    edges = [0, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 1 << 30]
+    vals = series.to_numpy()
+    n = len(vals)
+    counts, _ = np.histogram(vals, bins=edges)
+    peak = max(int(counts.max()), 1)
+    logger.info("sequence-length (total_tokens) histogram over %d samples:", n)
+    for i, c in enumerate(counts):
+        lo, hi = edges[i], edges[i + 1]
+        label = f">={lo}" if hi >= (1 << 30) else f"{lo}-{hi - 1}"
+        bar = "#" * int(40 * c / peak)
+        logger.info("  %-12s %8d (%5.1f%%) %s", label, int(c), 100.0 * c / n, bar)
+    for thr in (top_k, 1024, 2048, 4096):
+        logger.info("  >= %-6d : %5.1f%% (%d samples)", thr, 100.0 * (vals >= thr).mean(), int((vals >= thr).sum()))
+    logger.info("  sparse-active fraction (>= top_k=%d): %.1f%%  | dense (< top_k): %.1f%%",
+                top_k, 100.0 * (vals >= top_k).mean(), 100.0 * (vals < top_k).mean())
 
 
 if __name__ == "__main__":

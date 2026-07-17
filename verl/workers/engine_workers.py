@@ -195,11 +195,28 @@ class TrainingWorker(Worker, DistProfilerExtension):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
 
+        # Additive loss-component metrics (e.g. DSA `loss/lm`, `loss/kl_weighted`) are already
+        # global-batch-normalized per micro-batch (÷ global tokens/queries × dp_size), exactly like the loss.
+        # Reduce them the SAME way as the loss — SUM over this rank's micro-batches, then dp-AVG — NOT meaned
+        # like diagnostics. This makes each the true whole-batch average AND makes them sum to `train/loss`
+        # (no micro-batch-count factor). Keys must start with "loss/"; non-additive diagnostics use other
+        # prefixes (`indexer/`, `kl_by_layer/`, `perf/`) and keep the mean reduction below.
+        loss_components = {}
+        for k in [k for k in metrics if isinstance(k, str) and k.startswith("loss/")]:
+            comp = torch.stack(
+                [c.to(self.device_name) if torch.is_tensor(c) else torch.tensor(float(c), device=self.device_name)
+                 for c in metrics.pop(k)]
+            ).sum()
+            if dp_group is not None:
+                torch.distributed.all_reduce(comp, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+            loss_components[k] = comp.item()
+
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:
             final_metrics = allgather_dict_into_dict(data=metrics, group=dp_group)
         else:
             final_metrics = metrics
+        final_metrics.update(loss_components)
         final_metrics["loss"] = loss
         if grad_norm is not None:
             final_metrics["grad_norm"] = grad_norm
@@ -364,6 +381,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
             output.pop("model_output")
             if lr is not None:
                 output["metrics"]["lr"] = lr
+                # Per-optimizer-group LRs (e.g. DSA base vs indexer), read off the optimizer AFTER the
+                # scheduler step. `lr` above is only the first group; log each named group as lr/<name> so a
+                # two-LR run shows both. Only fires when groups are named (single-group runs are unaffected).
+                opt = getattr(self.engine, "optimizer", None)
+                groups = getattr(opt, "param_groups", []) if opt is not None else []
+                if len(groups) > 1:
+                    for g in groups:
+                        nm = g.get("name") if isinstance(g, dict) else None
+                        if nm is not None:
+                            output["metrics"][f"lr/{nm}"] = g["lr"]
             final_output = self._postprocess_output(
                 output,
                 global_token_num=global_token_num,
