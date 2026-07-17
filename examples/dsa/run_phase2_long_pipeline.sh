@@ -31,6 +31,8 @@ SEQ_LEN=${SEQ_LEN:-4096}
 EPOCHS=${EPOCHS:-1}                       # ~1 epoch over the data
 BASE_LR=${BASE_LR:-1e-5}                  # MiniCPM3-4B official full-finetune LR (OpenBMB LLaMA-Factory recipe)
 WARMUP_RATIO=${WARMUP_RATIO:-0.1}         # 10% warmup, matching that recipe
+SAVE_FREQ=${SAVE_FREQ:-10}                # checkpoint every 10 steps
+MAX_CKPT=${MAX_CKPT:-20}                  # keep only the last N checkpoints (~12GB each) -> bounds disk; empty = keep all
 # leave INDEXER_LR / TOPK / KL_BLOCK / KL_CKPT / LAMBDA / LR_SCHED at run_minicpm3_dsa_phase2.sh defaults
 #   (1e-3 / 512 / 1024 / true / 1.0 / cosine) unless overridden here.
 
@@ -92,7 +94,7 @@ set -x
 WARMSTART_PATH="${INDEXER_FULL}" \
 TRAIN_FILES="${CODE_PARQUET}" \
 NPROC="${NPROC}" BATCH="${BATCH}" MICRO_BSZ="${MICRO_BSZ}" SEQ_LEN="${SEQ_LEN}" STEPS="${STEPS}" \
-BASE_LR="${BASE_LR}" WARMUP_RATIO="${WARMUP_RATIO}" \
+BASE_LR="${BASE_LR}" WARMUP_RATIO="${WARMUP_RATIO}" SAVE_FREQ="${SAVE_FREQ}" MAX_CKPT="${MAX_CKPT}" \
 RUN_DIR="${RUN_DIR}/train" EXP_NAME="phase2_${DOMAINS,,}_1ep_${RUN_TS}" \
 bash examples/dsa/run_minicpm3_dsa_phase2.sh "$@"
 

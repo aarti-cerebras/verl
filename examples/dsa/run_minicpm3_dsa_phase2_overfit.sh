@@ -47,7 +47,9 @@ GRAD_CKPT=${GRAD_CKPT:-True}
 MODEL_DTYPE=${MODEL_DTYPE:-bf16}
 ACT_OFFLOAD=${ACT_OFFLOAD:-False}
 
-# --- optionally warm-start the indexer from a Phase-1 checkpoint (else fresh; KL warms it during this run) ---
+# --- init: WARMSTART_PATH = consolidated weights (world-size-agnostic, fresh optim/step); RESUME_PATH = native
+#     resume (same GPU count). Empty both => fresh indexer. See docs/dsa_ckpt_loading.md. ---
+WARMSTART_PATH=${WARMSTART_PATH:-}
 RESUME_PATH=${RESUME_PATH:-}
 
 EXP_NAME=${EXP_NAME:-phase2-overfit16}
@@ -61,6 +63,11 @@ echo "[dsa-p2-overfit] run_dir=${RUN_DIR} host=$(hostname) CUDA_VISIBLE_DEVICES=
 echo "[dsa-p2-overfit] seq_len=${SEQ_LEN} batch=${BATCH} epochs=${EPOCHS} steps=${STEPS} topk=${TOPK}" \
      "base_lr=${BASE_LR} indexer_lr=${INDEXER_LR} lambda=${LAMBDA} grad_ckpt=${GRAD_CKPT}"
 
+DSA_WARMSTART_KV=""
+if [[ -n "${WARMSTART_PATH}" ]]; then
+    DSA_WARMSTART_KV=", dsa_warmstart_path: ${WARMSTART_PATH}"
+    echo "[dsa-p2-overfit] WARM-START weights from ${WARMSTART_PATH} (fresh optimizer, step 0)"
+fi
 RESUME_ARGS=()
 if [[ -n "${RESUME_PATH}" ]]; then
     RESUME_ARGS=(trainer.resume_mode=resume_path trainer.resume_from_path="${RESUME_PATH}")
@@ -85,7 +92,7 @@ LAUNCH=(
     model.use_remove_padding=False
     model.enable_gradient_checkpointing="${GRAD_CKPT}"
     model.enable_activation_offload="${ACT_OFFLOAD}"
-    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: sparse, dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true}"
+    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: sparse, dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true${DSA_WARMSTART_KV}}"
     engine=fsdp
     engine.strategy=fsdp2
     engine.reshard_after_forward=True
