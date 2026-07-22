@@ -70,6 +70,7 @@ def dsa_overrides_from_config(model_config) -> dict:
         "kl_block_size",
         "kl_reduction",
         "fp8",
+        "fp8_ue8m0",
         "diag_interval",
         "log_per_layer",
         "diag_overlap_sample",

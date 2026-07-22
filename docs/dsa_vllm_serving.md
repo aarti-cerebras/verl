@@ -169,6 +169,20 @@ Phase-2 finetune so the weights adapt to the kernel's numerics. Net for *this* c
 Hadamard (one free op, avoids compounding) but expect ~2% selection drift — inherent unless training is
 realigned to UE8M0.
 
+**Update (2026-07-22) — fix landed under a flag.** `_fake_quant_fp8` now takes `use_ue8m0`, wired to the new
+`DSAConfig.fp8_ue8m0` (default **False** so prior runs reproduce; set via `+model.override_config={...
+dsa_fp8_ue8m0: true}`). When on, training quantizes the indexer's per-row scale to the same power-of-2 the
+kernel uses. Verified at two levels:
+- **CPU unit** (`tests/dsa/test_indexer_fp8_ue8m0_parity.py`): the training UE8M0 dequant is **bit-identical**
+  (`torch.equal`) to the serve reference `_quant_fp8_rows(use_ue8m0=True)`; legacy path unchanged; STE
+  gradient intact.
+- **GPU kernel** (`tests/dsa/test_minicpm3_dsa_indexer_parity.py`, extended): top-256 selection overlap vs the
+  real DeepGEMM kernel rises from **0.9698 mean / 0.9297 min (legacy)** to **1.0000 mean / 0.9961 min (UE8M0)**
+  — i.e. the ~3% drift closes to ~0. (UE8M0-fp8 even beats bf16-exact 0.9777, since the kernel is itself FP8.)
+
+To *realize* the gain the indexer must be (re)trained with `dsa_fp8_ue8m0: true`; the existing
+`phase2_full_k256_1ep` checkpoint was trained legacy, so it still carries the drift until retrained.
+
 ---
 
 ## 5. Other weight-remap items for the custom class

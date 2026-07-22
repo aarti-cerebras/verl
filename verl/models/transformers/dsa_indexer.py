@@ -75,6 +75,11 @@ class DSAConfig:
     # per-layer scale, loss ~= per-layer KL) | "sum" (reference; each layer weighted equally, loss ~=
     # n_layers * per-layer KL). Same optimum; "sum" scales the gradient by ~n_layers vs "mean" at a given LR.
     fp8: bool = True  # run the indexer score matmul in FP8 (E4M3), as in the reference
+    fp8_ue8m0: bool = False  # quantize the FP8 per-row scale to UE8M0 (power-of-2), matching the serving
+    # FLASHMLA_SPARSE kernel (scripts/dsa/vllm_minicpm3_dsa/indexer.py::_quant_fp8_rows). Default False keeps
+    # the legacy plain-absmax (continuous fp32) scale that prior Phase-2 runs trained with; set True to close
+    # the ~2% train/serve indexer-selection drift by training against the exact serve-time quant. See
+    # docs/dsa_eval_report.md §5 and docs/dsa_vllm_serving.md.
     block_size: int = 128  # FP8 act_quant block size (reference default)
     rotate_activation: bool = True  # Hadamard pre-quant rotation (V3.2), only in the FP8 path
     diag_interval: int = 10  # compute monitoring diagnostics (topk recall/overlap/score) every N forwards
@@ -164,7 +169,7 @@ def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return _fwht(x) * scale
 
 
-def _fake_quant_fp8(x: torch.Tensor) -> torch.Tensor:
+def _fake_quant_fp8(x: torch.Tensor, use_ue8m0: bool = False) -> torch.Tensor:
     """Blockwise FP8 (E4M3) fake-quantization with a straight-through estimator (QAT).
 
     Forward returns the dequantized E4M3 round-trip ``round_fp8(x / scale) * scale`` (``scale = amax /
@@ -174,12 +179,21 @@ def _fake_quant_fp8(x: torch.Tensor) -> torch.Tensor:
     support), so without the STE *no* gradient reaches ``wq_b``/``wk``. ``head_dim <= block_size`` (enforced
     by DSAConfig) => a single block per head/token, i.e. one fp32 scale per row.
 
+    ``use_ue8m0``: round the scale up to a power of two (``2**ceil(log2(scale))``) and clamp before the cast,
+    exactly matching the serving kernel's UE8M0 quant (``vllm_minicpm3_dsa/indexer.py::_quant_fp8_rows``).
+    This trains the indexer against the serve-time numerics, closing the ~2% selection drift. False keeps the
+    legacy continuous-scale behavior that earlier Phase-2 runs used.
+
     See Jacob et al. 2018 (arXiv:1712.05877) and PyTorch ``FakeQuantize`` for the fake-quant + STE pattern.
     """
     with torch.no_grad():  # x_q is a value-only reference point; no graph is kept for it
         amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
         scale = amax / FP8_MAX
-        x_q = (x / scale).to(FP8_DTYPE).float() * scale
+        if use_ue8m0:
+            scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))  # UE8M0: power-of-2 scale (match serve)
+            x_q = (x / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE).float() * scale
+        else:
+            x_q = (x / scale).to(FP8_DTYPE).float() * scale
     return x + (x_q - x).detach()  # STE: forward == x_q, backward == identity into x
 
 
@@ -279,8 +293,8 @@ class LightningIndexer(nn.Module):
             if self.cfg.rotate_activation:
                 q_idx = _rotate_activation(q_idx)
                 k_idx = _rotate_activation(k_idx)
-            q_dq = _fake_quant_fp8(q_idx)  # dequantized E4M3 (with STE): [b, s_q, n_heads, head_dim]
-            k_dq = _fake_quant_fp8(k_idx)  # dequantized E4M3 (with STE): [b, s_k, head_dim]
+            q_dq = _fake_quant_fp8(q_idx, self.cfg.fp8_ue8m0)  # dequantized E4M3 (with STE): [b, s_q, n_heads, head_dim]
+            k_dq = _fake_quant_fp8(k_idx, self.cfg.fp8_ue8m0)  # dequantized E4M3 (with STE): [b, s_k, head_dim]
             dots = torch.relu(torch.einsum("bqhd,bkd->bqhk", q_dq, k_dq))
             eff_w = (weights * self.softmax_scale).to(dots.dtype)
             scores = torch.einsum("bqhk,bqh->bqk", dots, eff_w)
