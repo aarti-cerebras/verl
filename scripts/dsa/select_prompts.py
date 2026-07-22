@@ -67,6 +67,34 @@ def _extract_prompt(messages) -> str:
     return "\n".join(parts).strip()
 
 
+def load_exclude_shas(paths, logger):
+    """Load a set of prompt_sha256 to skip. Each path may be a plain sha-per-line file OR a
+    prompts.jsonl (rows carrying ``prompt_sha256``). Used to make a run generate *net-new* prompts
+    relative to earlier run(s)."""
+    excl = set()
+    for p in paths or []:
+        if not os.path.exists(p):
+            logger.warning("--exclude-sha: %s does not exist — skipping", p)
+            continue
+        n0 = len(excl)
+        with open(p) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                if line[:1] == "{":  # jsonl row
+                    try:
+                        sha = json.loads(line).get("prompt_sha256")
+                    except json.JSONDecodeError:
+                        sha = None
+                    if sha:
+                        excl.add(sha)
+                elif len(line) == 64 and all(c in "0123456789abcdef" for c in line):
+                    excl.add(line)  # bare sha256 hex
+        logger.info("--exclude-sha: +%d shas from %s (total %d)", len(excl) - n0, p, len(excl))
+    return excl
+
+
 def resolve_specs(args, logger):
     """Return list of (config, target_count, lang_filter). lang_filter in {'en','zh','any'}."""
     if args.split_json:
@@ -88,8 +116,11 @@ def resolve_specs(args, logger):
     return [(d, args.per_domain, "any") for d in args.domains]
 
 
-def collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logger):
-    """Adaptively scan shards for one config until the filtered/deduped pool reaches `count`."""
+def collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logger, exclude_shas=None):
+    """Adaptively scan shards for one config until the filtered/deduped pool reaches `count`.
+
+    ``exclude_shas`` (optional): prompt_sha256 seen in earlier runs — skipped so this run is net-new."""
+    exclude_shas = exclude_shas or set()
     ds_prefix = f"datasets/{REPO}"
     ddir = f"{ds_prefix}/data/{args.split}/{cfg}"
     try:
@@ -100,6 +131,7 @@ def collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logg
     seen = set()
     pool = []
     scanned = 0
+    n_excluded = 0
     for sh in shards:
         if len(pool) >= count and scanned >= args.min_shards:
             break
@@ -126,6 +158,9 @@ def collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logg
                 if sha in seen:
                     continue
                 seen.add(sha)
+                if sha in exclude_shas:
+                    n_excluded += 1
+                    continue
                 pool.append(
                     {
                         "source_uid": row.get("uid"),
@@ -139,8 +174,8 @@ def collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logg
                 )
     rng.shuffle(pool)
     kept = pool[:count]
-    logger.info("[%s] scanned=%d shards pool=%d kept=%d/%d lang_filter=%s%s",
-                cfg, scanned, len(pool), len(kept), count, lang_filter,
+    logger.info("[%s] scanned=%d shards pool=%d kept=%d/%d lang_filter=%s excluded=%d%s",
+                cfg, scanned, len(pool), len(kept), count, lang_filter, n_excluded,
                 "  ⚠SHORT" if len(kept) < count else "")
     return kept
 
@@ -163,6 +198,9 @@ def main():
     ap.add_argument("--min-prompt-chars", type=int, default=1)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--local-dir", default="/tmp/udsftcache", help="HF download cache dir")
+    ap.add_argument("--exclude-sha", nargs="*", default=None,
+                    help="file(s) of prompt_sha256 to SKIP (plain sha-per-line OR a prior prompts.jsonl); "
+                         "makes this run net-new relative to earlier run(s)")
     # accepted for backward-compat with the uniform wrapper; treated as max-shards if set
     ap.add_argument("--shards-per-domain", type=int, default=0)
     args = ap.parse_args()
@@ -181,12 +219,14 @@ def main():
     fs = HfFileSystem()
     rng = random.Random(args.seed)
     specs = resolve_specs(args, logger)
+    exclude_shas = load_exclude_shas(args.exclude_sha, logger)
 
     total_kept = 0
     lang_counts = {}
     with open(args.out, "w") as fout:
         for cfg, count, lang_filter in specs:
-            kept = collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logger)
+            kept = collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logger,
+                                   exclude_shas=exclude_shas)
             for r in kept:
                 fout.write(json.dumps(r, ensure_ascii=False) + "\n")
                 lang_counts[r["lang"]] = lang_counts.get(r["lang"], 0) + 1
