@@ -29,6 +29,9 @@ BATCH=${BATCH:-64}                       # global batch (must be divisible by NP
 MICRO_BSZ=${MICRO_BSZ:-1}                # keep 1 for the long code docs (micro_bsz>1 OOMs)
 SEQ_LEN=${SEQ_LEN:-4096}
 TOPK=${TOPK:-512}                        # sparse key budget (train == deploy)
+FP8_UE8M0=${FP8_UE8M0:-false}            # true => UE8M0 indexer fake-quant (match serve kernel; closes ~2% drift)
+VAL_FILES=${VAL_FILES:-}                  # optional held-out val parquet (self-gen, disjoint prompts) for val loss
+TEST_FREQ=${TEST_FREQ:-190}              # eval val every N steps (aligned with SAVE_FREQ); ignored if no VAL_FILES
 EPOCHS=${EPOCHS:-1}                       # ~1 epoch over the data
 BASE_LR=${BASE_LR:-1e-5}                  # MiniCPM3-4B official full-finetune LR (OpenBMB LLaMA-Factory recipe)
 WARMUP_RATIO=${WARMUP_RATIO:-0.1}         # 10% warmup, matching that recipe
@@ -67,7 +70,7 @@ echo "[pipeline] host=$(hostname) date=$(date -Is) git=$(git rev-parse --short H
 echo "[pipeline] RUN_DIR=${RUN_DIR}  MASTER_LOG=${MASTER_LOG}"
 echo "[pipeline] CORPUS=${CORPUS}"
 echo "[pipeline] PHASE1_CKPT=${PHASE1_CKPT}"
-echo "[pipeline] knobs: DOMAINS=${DOMAINS} MIN_TOTAL=${MIN_TOTAL} NPROC=${NPROC} BATCH=${BATCH} MICRO_BSZ=${MICRO_BSZ} SEQ_LEN=${SEQ_LEN} TOPK=${TOPK} EPOCHS=${EPOCHS} BASE_LR=${BASE_LR} WARMUP_RATIO=${WARMUP_RATIO}"
+echo "[pipeline] knobs: DOMAINS=${DOMAINS} MIN_TOTAL=${MIN_TOTAL} NPROC=${NPROC} BATCH=${BATCH} MICRO_BSZ=${MICRO_BSZ} SEQ_LEN=${SEQ_LEN} TOPK=${TOPK} FP8_UE8M0=${FP8_UE8M0} EPOCHS=${EPOCHS} BASE_LR=${BASE_LR} WARMUP_RATIO=${WARMUP_RATIO}"
 echo "[pipeline] INDEXER_FULL=${INDEXER_FULL}  TRAIN_PARQUET=${TRAIN_PARQUET}"
 [ $((BATCH % NPROC)) -eq 0 ] || { echo "[pipeline] ERROR: BATCH ${BATCH} not divisible by NPROC ${NPROC}"; exit 1; }
 
@@ -102,6 +105,7 @@ set -x
 WARMSTART_PATH="${INDEXER_FULL}" \
 TRAIN_FILES="${TRAIN_PARQUET}" \
 NPROC="${NPROC}" BATCH="${BATCH}" MICRO_BSZ="${MICRO_BSZ}" SEQ_LEN="${SEQ_LEN}" TOPK="${TOPK}" STEPS="${STEPS}" \
+FP8_UE8M0="${FP8_UE8M0}" VAL_FILES="${VAL_FILES}" TEST_FREQ="${TEST_FREQ}" \
 BASE_LR="${BASE_LR}" WARMUP_RATIO="${WARMUP_RATIO}" SAVE_FREQ="${SAVE_FREQ}" MAX_CKPT="${MAX_CKPT}" \
 RUN_DIR="${RUN_DIR}/train" EXP_NAME="phase2_${DATA_TAG}_k${TOPK}_1ep_${RUN_TS}" \
 bash examples/dsa/run_minicpm3_dsa_phase2.sh "$@"

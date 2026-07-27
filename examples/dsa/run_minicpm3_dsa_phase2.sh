@@ -38,6 +38,9 @@ TOPK=${TOPK:-512}                      # sparse key budget (train == deploy)
 KL_BLOCK=${KL_BLOCK:-1024}             # query-tile for the sparse forward + selected-set KL
 KL_CKPT=${KL_CKPT:-true}               # activation-checkpoint the DSA sparse graph (base is trained -> big graph)
 LAMBDA=${LAMBDA:-1.0}                  # indexer-KL weight in the combined loss
+FP8_UE8M0=${FP8_UE8M0:-false}          # true => train indexer fake-quant with UE8M0 (power-of-2) scale to
+# match the serving FLASHMLA kernel and close the ~2% train/serve selection drift (docs/dsa_eval_report.md §5;
+# tests/dsa/test_indexer_fp8_ue8m0_parity.py). false = legacy plain-absmax scale (prior runs reproduce).
 
 # --- optim: two param groups (base + indexer) via the LR schedule; both follow the same shape ---
 BASE_LR=${BASE_LR:-7.3e-6}             # main-model LR (paper sparse stage)
@@ -78,7 +81,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[dsa-phase2] run_dir=${RUN_DIR} host=$(hostname)"
 echo "[dsa-phase2] argv: $0 $*"
 echo "[dsa-phase2] env: NPROC=${NPROC} SEQ_LEN=${SEQ_LEN} MICRO_BSZ=${MICRO_BSZ} BATCH=${BATCH} STEPS=${STEPS}" \
-     "TOPK=${TOPK} KL_BLOCK=${KL_BLOCK} LAMBDA=${LAMBDA} BASE_LR=${BASE_LR} INDEXER_LR=${INDEXER_LR}" \
+     "TOPK=${TOPK} KL_BLOCK=${KL_BLOCK} LAMBDA=${LAMBDA} FP8_UE8M0=${FP8_UE8M0} BASE_LR=${BASE_LR} INDEXER_LR=${INDEXER_LR}" \
      "LR_SCHED=${LR_SCHED} WARMUP_RATIO=${WARMUP_RATIO} MIN_LR_RATIO=${MIN_LR_RATIO} GRAD_CKPT=${GRAD_CKPT}" \
      "MODEL_DTYPE=${MODEL_DTYPE} ACT_OFFLOAD=${ACT_OFFLOAD} TRAIN_FILES=${TRAIN_FILES} VAL_FILES=${VAL_FILES:-none}" \
      "RESUME_PATH=${RESUME_PATH:-none} SAVE_FREQ=${SAVE_FREQ} PYTHONPATH=${PYTHONPATH}"
@@ -119,7 +122,7 @@ LAUNCH=(
     model.use_remove_padding=False
     model.enable_gradient_checkpointing="${GRAD_CKPT}"
     model.enable_activation_offload="${ACT_OFFLOAD}"
-    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: sparse, dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_fp8: true, dsa_diag_interval: 5, dsa_log_per_layer: true${DSA_WARMSTART_KV}}"
+    "+model.override_config={dsa_enabled: true, dsa_n_heads: 16, dsa_head_dim: 64, dsa_rope_head_dim: 32, dsa_top_k: ${TOPK}, dsa_mode: sparse, dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_fp8: true, dsa_fp8_ue8m0: ${FP8_UE8M0}, dsa_diag_interval: 5, dsa_log_per_layer: true${DSA_WARMSTART_KV}}"
     engine=fsdp
     engine.strategy=fsdp2
     engine.reshard_after_forward=True

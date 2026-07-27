@@ -24,15 +24,16 @@ results, how sparsity was verified genuine, the HumanEval+ investigation, and th
 | IFEval (prompt-strict) | 68.4 | 70.79 | 71.72 | +0.93 | 72.27 |
 | HumanEval+ (0-shot) | 68.3 | 69.5 | 65.2 (base 72.0) | −4.3 | — |
 | MBPP+ (0-shot) | 63.2 | 56.3 | 61.9 (base 70.1) | +5.6* | — |
-| LiveCodeBench v3 | 22.6 | 20.7 | re-running (mp=6) — see §4 | — | — |
+| LiveCodeBench v3 | 22.6 | 20.7 | 20.52 (fixed harness) | −0.2 | — |
 
 `*` MBPP+: the dense baseline (56.3) was itself anomalously low (a baseline "set-version" harness gap, −6.9 vs
 reported). Read DSA-sparse MBPP+ as **≈ reported** (61.9 vs 63.2), not a real +5.6 gain.
 
 **Headline:** the sparse model **matches dense within noise** on knowledge (MMLU/CMMLU/CEval), math
-(GSM8K/MATH), and instruction-following (IFEval) — at/above dense on 5 of them. Mean |Δ vs dense| ≈ **1.1** over
-the clean comparisons. **top_k=128 ≈ top_k=256** everywhere (±0.6). The one real cost is **HumanEval+ (−4.3)** —
-see §3. LiveCodeBench had a harness bug (§4), being re-run.
+(GSM8K/MATH), instruction-following (IFEval), and competitive-programming (LiveCodeBench 20.52 vs 20.7) — at/above
+dense on 5 of them. Mean |Δ vs dense| ≈ **1.1** over the clean comparisons. **top_k=128 ≈ top_k=256** everywhere
+(±0.6). The one real cost is **HumanEval+ (−4.3)** — see §3. LiveCodeBench's earlier ~0.8% was a harness
+alignment bug, now fixed (§4).
 
 ## 2. Verification — is it *genuinely* sparse? (not silently dense)
 
@@ -54,6 +55,30 @@ strict loader (not random); engine chose `FLASHMLA_SPARSE` as the sole backend +
 **100% of items** (~1000-token few-shot contexts), so the indexer sub-selected on every query — the near-dense
 scores are genuine sparse results, not a degenerate ≤top_k regime. (IFEval prompts are short — sparsity bites
 during generation, ~58% of items >256 for prompt+gen.)
+
+**Random-indexer ablation (GSM8K, k128 ckpt @ step 2805).** The top_k sweep above varies the *budget* on the
+trained indexer; this is the dual control — hold the budget and destroy the *selection*. We rebuilt the serving
+checkpoint with the base weights bit-identical but the 310 `*.indexer.*` tensors overwritten by a fresh,
+untrained `LightningIndexer.reset_parameters()` init (seed 0), then re-served and re-scored — changing only
+`index_topk` between the two random runs:
+
+| indexer weights | index_topk | GSM8K |
+|---|--:|--:|
+| trained (step 2805) | 128 | 78.54 |
+| **random init** | **128** | **0.08** |
+| **random init** | **2048** | **79.61** |
+
+Same broken indexer, opposite outcomes: at k=128 the model must trust the indexer's (garbage) top-128 of a
+~1000-token context → collapse to the 0.08 floor (identical to starving the trained indexer to 2 keys); at
+k=2048 ≥ context, top-k over *any* scores returns the whole sequence, so the selection is irrelevant and
+accuracy recovers to dense (79.61 ≈ trained 78.54 ≈ the 79.76 dense-equivalent control). This isolates the
+inference path cleanly: **accuracy is caused by *which* tokens the indexer selects, not by the sparse machinery
+being silently bypassed** — a silently-dense model would have scored ~79 at k=128 too. It didn't.
+
+- **Gotcha found while setting this up:** the vLLM plugin gates the sparse path on `hasattr(config, "index_topk")`
+  (`scripts/dsa/vllm_minicpm3_dsa/model.py`). `scripts/dsa/build_vllm_serving_dir.py` does **not** emit that key
+  (only `dsa_*`), so a freshly-built serving dir silently serves **dense** `FLASH_ATTN_MLA`. Add `index_topk` to
+  `config.json` after building; confirm `FLASHMLA_SPARSE` + `DEEPSEEK_V32_INDEXER` in the serve log.
 
 ## 3. HumanEval+ (−4.3) — the one real regression, and how it splits into drift vs sparsity
 
@@ -150,6 +175,10 @@ pending → will complete the 9th benchmark.
 - Plugin: `scripts/dsa/vllm_minicpm3_dsa/`. Probes/tests: `tests/dsa/probe_flashmla_padding.py`,
   `tests/dsa/test_stage2b_sparse.py`, `tests/dsa/test_stage3_decode_parity.py`.
 - Scorecard: `<eval_root>/DSA_SCORECARD.md`. Per-run manifests+logs under each `<bench>/logs/`.
+- Random-indexer ablation (§2): `scripts/dsa/randomize_indexer_ckpt.py --consolidated <consolidated_model.pt>
+  --out <rand.pt> --seed 0` → `build_vllm_serving_dir.py` → **add `index_topk` to `config.json`** → serve + eval.
+  Runs: eval roots `minicpm3-4B-dsa-k128-randindexer` (k128) and `…-randindexer-topk2048` (k2048, symlinked
+  weights + patched config); serving dirs under `…/inference/global_step_2805_randindexer/`.
 
 ## 7. Open items
 1. **LiveCodeBench** — mp=6 re-run finishing; slot the valid pass@1 into the scorecard.
