@@ -516,6 +516,54 @@ def apply_monkey_patch(
             print("DSA dense_warmup: froze base, only *.indexer.* params trainable")
         print("Monkey patch MiniCPMFlashAttention2.forward for DSA indexer")
         return
+    elif model.config.model_type == "qwen3" and getattr(model.config, "msa_enabled", False):
+        # MiniMax Sparse Attention (MSA) index branch grafted onto Qwen3's GQA (arXiv 2606.13392).
+        # Gated on `config.msa_enabled` so ordinary Qwen3 runs fall through to the generic patches below.
+        #
+        # This must run HERE — after `from_pretrained`, before FSDP wrapping (see
+        # workers/engine/fsdp/transformer_impl.py: apply_monkey_patch at :292, apply_fsdp2 at :427):
+        #   * attach_indexers adds NEW parameters, which must exist before FSDP flattens/shards and
+        #     before the optimizer param groups are built;
+        #   * freeze_base_train_indexer must set requires_grad before the wrap (mixed requires_grad in one
+        #     FSDP1 FlatParameter is DSA Issue #1 — docs/dsa_grad_norm_debugging.md);
+        #   * fsdp_utils.apply_fsdp2 then finds the attached `MSAIndexer` modules and gives each its own
+        #     unit with reshard_after_forward=False (Option B2), without which this side-channel KL
+        #     produces a nonzero-but-fake grad_norm and a flat loss at world_size > 1
+        #     (docs/dsa_fsdp_sharding_notes.md §3b/§4);
+        #   * a warm-start state dict loads on the UNWRAPPED model, so it is GPU-count-agnostic.
+        from transformers.models.qwen3 import modeling_qwen3
+
+        from verl.models.transformers.qwen3_msa import (
+            attach_indexers,
+            build_msa_config,
+            freeze_base_train_indexer,
+            install_kl_accumulation,
+            msa_overrides_from_config,
+            qwen3_msa_attn_forward,
+        )
+
+        # Ulysses shards the sequence across ranks, but the index branch scores every query against the
+        # FULL key sequence and the Eq.-9 teacher is a softmax over the full causal support — a sharded
+        # sequence would silently normalise both over a fragment. Fail loudly instead.
+        assert ulysses_sp_size == 1, (
+            f"MSA does not support ulysses sequence parallelism (got ulysses_sp_size={ulysses_sp_size}): "
+            "the index-branch KL needs the full key sequence on each rank"
+        )
+        msa_cfg = build_msa_config(model.config, **msa_overrides_from_config(model.config))
+        attach_indexers(model, msa_cfg)
+        # Class-level patch: the forward branches on `getattr(self, "msa", None)`, so any Qwen3 instance
+        # without an attached indexer still runs the stock path unchanged.
+        modeling_qwen3.Qwen3Attention.forward = qwen3_msa_attn_forward
+        install_kl_accumulation(model)
+        # Phase 1 (dense warm-up): freeze the base, train only the indexer. Phase 2 (sparse) trains both.
+        if msa_cfg.mode == "dense_warmup":
+            freeze_base_train_indexer(model)
+            print("MSA dense_warmup: froze base, only *.indexer.* params trainable")
+        print(
+            f"Monkey patch Qwen3Attention.forward for MSA (mode={msa_cfg.mode}, B_k={msa_cfg.block_size}, "
+            f"k={msa_cfg.top_k}, kl_reduction={msa_cfg.kl_reduction})"
+        )
+        return
     elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
         # Step 1: patch model to support image-text mixed data
         from transformers.models.qwen3_5.modeling_qwen3_5 import (

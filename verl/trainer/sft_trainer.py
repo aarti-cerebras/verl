@@ -181,8 +181,11 @@ class SFTTrainer:
             # forward hooks set model._dsa_indexer_kl). self.engine is resolved lazily at call time (set
             # below), so it exists by the first loss invocation during training.
             self.loss_fn = lambda **kw: indexer_kl_loss(**kw, config=None, model=self.engine.module)
-        elif loss_mode == "dsa_sparse":
-            # DSA Phase-2 sparse: LM cross-entropy + λ · selected-set indexer KL (read off the model).
+        elif loss_mode in ("dsa_sparse", "msa_sparse"):
+            # Phase-2 sparse (DSA or MSA): LM cross-entropy + λ · selected-set indexer KL (read off the
+            # model). One loss serves both — `dsa_sparse_loss` accepts either `_dsa_*` or `_msa_*`.
+            # NOTE for MSA: with the default kl_reduction='mean' a paper λ needs × n_sparse_layers (33) to
+            # be equivalent to Algorithm 1's SUM over layers. Watch `indexer/kl_share_of_loss`.
             kl_lambda = float(self.config.get("indexer_kl_lambda", 1.0))
             self.loss_fn = lambda **kw: dsa_sparse_loss(
                 **kw, config=None, model=self.engine.module, kl_lambda=kl_lambda

@@ -583,10 +583,16 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     # post_backward/reduce-scatter runs and the master gets a grad. Wrap BEFORE the decoder layers so the
     # (outer) layer units exclude these nested params. Gated on dense_warmup only: Phase-2's CE loss flows
     # through block outputs, so the standard layer gates fire and this special-casing must NOT apply.
+    # Applies identically to MSA (Qwen3 + MiniMax Sparse Attention): its Phase-1 KL is the same
+    # side-channel loss shape (it does NOT flow through the decoder layer's output), so `MSAIndexer`
+    # must get the same treatment. Keying on the class NAME is what made this miss-able — a new indexer
+    # class silently falls back to the broken path with a nonzero-but-fake grad_norm.
+    _indexer_cls_names = ("LightningIndexer", "MSAIndexer")
     indexer_units = []
-    if getattr(getattr(model, "config", None), "dsa_enabled", False):
+    _cfg = getattr(model, "config", None)
+    if getattr(_cfg, "dsa_enabled", False) or getattr(_cfg, "msa_enabled", False):
         for name, sub in model.named_modules():
-            if sub.__class__.__name__ == "LightningIndexer" and (
+            if sub.__class__.__name__ in _indexer_cls_names and (
                 getattr(getattr(sub, "cfg", None), "mode", None) == "dense_warmup"
             ):
                 indexer_units.append((name, sub))

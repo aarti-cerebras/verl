@@ -289,12 +289,21 @@ class FSDPEngine(BaseEngine):
             )
 
             use_fused_kernels = self.model_config.use_fused_kernels
+            # `tiled_mlp` was previously not forwarded here, so `model.tiled_mlp.enabled=True` was a no-op
+            # on this path and the MLP's gate/up activations stayed resident. For a 4B model at 32K those
+            # are [1, T, 9728] each (638 MB at T=32768), ~46 GB of the ~72 GB of base activations across
+            # 36 layers — the difference between fitting in 80 GB and OOM. TiledMLP is a true recompute
+            # (forward under no_grad, per-shard recompute in backward), so it buys that memory with a
+            # little compute.
+            tiled_mlp_cfg = getattr(self.model_config, "tiled_mlp", None) or {}
             apply_monkey_patch(
                 model=module,
                 use_remove_padding=self.use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
+                use_tiled_mlp=bool(tiled_mlp_cfg.get("enabled", False)),
+                tiled_mlp_shards=int(tiled_mlp_cfg.get("num_shards", 4)),
             )
 
             # some parameters may not in torch_dtype

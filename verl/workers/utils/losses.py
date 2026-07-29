@@ -51,10 +51,14 @@ def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model
         model: the (FSDP-wrapped) module; attribute access forwards through FSDP. Required.
     """
     assert model is not None, "indexer_kl_loss must be bound to the model (pass model=...)"
+    # DSA (`_dsa_*`, minicpm_dsa.py) and MSA (`_msa_*`, qwen3_msa.py) stash the reduced KL under their own
+    # attribute names; both install the same shape of side-channel loss, so this loss serves both.
     kl = getattr(model, "_dsa_indexer_kl", None)
+    if kl is None:
+        kl = getattr(model, "_msa_indexer_kl", None)
     assert kl is not None, (
-        "model._dsa_indexer_kl is not set — is DSA enabled (config.dsa_enabled), the forward run, and "
-        "mode == 'dense_warmup'?"
+        "neither model._dsa_indexer_kl nor model._msa_indexer_kl is set — is DSA/MSA enabled "
+        "(config.dsa_enabled / config.msa_enabled), the forward run, and mode == 'dense_warmup'?"
     )
 
     loss = kl
@@ -67,9 +71,9 @@ def indexer_kl_loss(config, model_output, data: TensorDict, dp_group=None, model
         loss = kl * mb_valid / num_valid * dp_size
 
     metrics = {"indexer/kl": kl.detach()}  # log the interpretable per-batch mean, not the normalized loss
-    dsa_metrics = getattr(model, "_dsa_metrics", None)
-    if dsa_metrics:
-        metrics.update(dsa_metrics)
+    extra = getattr(model, "_dsa_metrics", None) or getattr(model, "_msa_metrics", None)
+    if extra:
+        metrics.update(extra)
     return loss, metrics
 
 
@@ -89,9 +93,15 @@ def dsa_sparse_loss(config, model_output, data: TensorDict, dp_group=None, model
     assert model is not None, "dsa_sparse_loss must be bound to the model (pass model=...)"
     lm_loss, _ = sft_loss(config, model_output, data, dp_group)  # already ÷ batch_num_tokens × dp_size
 
+    # Serves both DSA (`_dsa_*`, minicpm_dsa.py) and MSA (`_msa_*`, qwen3_msa.py): both sparse forwards
+    # install the same loss shape — an LM path through the sparse attention plus a selected-set KL on a
+    # disjoint subgraph. See qwen3_msa docs/qwen3_4b_msa/phase2_plan.md §2 for the MSA derivation.
     kl = getattr(model, "_dsa_indexer_kl", None)
+    if kl is None:
+        kl = getattr(model, "_msa_indexer_kl", None)
     assert kl is not None, (
-        "model._dsa_indexer_kl is not set — is DSA enabled (dsa_enabled), dsa_mode=='sparse', and the forward run?"
+        "neither model._dsa_indexer_kl nor model._msa_indexer_kl is set — is DSA/MSA enabled "
+        "(dsa_enabled / msa_enabled), mode == 'sparse', and the forward run?"
     )
     kl_term = kl  # per-batch mean over layers & valid queries; normalize to a global mean like indexer_kl_loss
     num_valid = (
@@ -108,10 +118,14 @@ def dsa_sparse_loss(config, model_output, data: TensorDict, dp_group=None, model
         "indexer/kl": kl.detach(),
         "loss/kl_weighted": (kl_lambda * kl_term).detach(),
         "train/kl_lambda": float(kl_lambda),  # KL weight (constant here; logged for provenance). NOT loss/* (not summed).
+        # How much of the objective the KL actually is. `kl_lambda` has no published value in either paper,
+        # so this ratio is how it gets chosen and monitored (target ~0.05-0.2 at launch); it also makes the
+        # `kl_reduction='mean'` rescaling visible, since "mean" divides the KL by n_sparse_layers.
+        "indexer/kl_share_of_loss": (kl_lambda * kl_term / lm_loss.detach().clamp_min(1e-9)).detach(),
     }
-    dsa_metrics = getattr(model, "_dsa_metrics", None)
-    if dsa_metrics:
-        metrics.update(dsa_metrics)
+    extra = getattr(model, "_dsa_metrics", None) or getattr(model, "_msa_metrics", None)
+    if extra:
+        metrics.update(extra)
     return loss, metrics
 
 
