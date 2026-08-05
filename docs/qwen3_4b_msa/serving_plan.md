@@ -5,12 +5,16 @@ evidence that any number the eval ladder produces is attributable to the model r
 serving path.
 
 **Status:** written 2026-08-04, while both Phase-2b runs are mid-flight.
-**P0–P3 DONE (2026-08-04/05)** — see §9. Environment is `.devlibs/vllm026` (vLLM 0.26.0,
+**P0–P4 DONE (2026-08-04/05)** — see §9. Environment is `.devlibs/vllm026` (vLLM 0.26.0,
 torch 2.11.0+cu130). **Route A** — reuse M3's fused kernel, export main `q_norm`/`k_norm` as
 `w − 1`. Serving dir `/cb/ml-eng/aarti/msa/serving/k8_step1400`; plugin
-`scripts/msa/vllm_qwen3_msa/`. **The model serves and generates coherent text with 33 sparse
-layers and 33 index side caches** (S0). **P4 (parity) is next** — no benchmark number means
-anything until it passes.
+`scripts/msa/vllm_qwen3_msa/`. **The served model computes the trained function**: prefill and
+decode both agree with the training forward inside the measured floors, and the selection kernels
+agree with our torch selection on 98.5% of queries with every disagreement a near-tie (§9 P4).
+**P5 (throughput) is next** — the last gate before benchmarks.
+
+Parity work also uncovered a real **training-side bug** (partial-block aliasing), now fixed —
+[§11](#11-training-side-bug-found-by-parity-partial-block-aliasing), including the restart note.
 
 **The plan is [§9](#9-order-of-work)** — six phases, P0–P5, ~5–6 days, none of them blocked on
 training finishing. §1–§8 are the justification: what changed since [plan.md](plan.md) §7 (§2), how
@@ -422,7 +426,7 @@ next_pow2(G))` (`common/ops/sparse_attn.py:227`), so our 4 real heads occupy 16 
 that axis. Decode only: the prefill kernel uses plain `next_power_of_2(gqa_group_size)` with no floor
 (`:46`). Performance, not correctness — M3 at `G = 16` never sees it.
 
-### 6.3 S2b — first-token correctness
+### 6.3 S2b — first-token correctness  ✅ done, see §9 P4
 
 **Degeneracy.** On prompts shorter than `k · B_k` (1024 tokens at k8, 2048 at k16) the indexer can
 only select valid blocks, so every key is visible and the sparse output **must** equal dense
@@ -448,7 +452,7 @@ the model is sparse at all, they cost a log grep and a startup assert rather tha
 without them a benchmark number is uninterpretable in the specific way DSA already hit once
 (`docs/dsa_eval_report.md` §2: a serving dir silently served dense and posted good scores).
 
-### 6.5 S3 — decode parity, and why a prefill-only oracle suffices
+### 6.5 S3 — decode parity, and why a prefill-only oracle suffices  ✅ done, see §9 P4
 
 Teacher-forced per-position agreement, not free-running sequence equality — one bf16 flip cascades,
 so free-run divergence is expected and is a secondary report only (DSA Stage 3's finding).
@@ -535,7 +539,12 @@ MMLU-Pro ≈ 4 h per GPU) were measured dense. **Measure tokens/s immediately af
 successful serve, before committing to any benchmark schedule.** This is [plan.md](plan.md) item 11
 promoted from a schedule note to a gate.
 
-**R4 — Silent failure is the dominant mode.** §2.2 (rename), §2.3 (norm shift), §5.2 (config gate),
+**R4 — Silent failure is the dominant mode. CONFIRMED, and it generalised past the code.** All four
+predicted silent failures were real (§9 P2/P3), and three *tests* also failed silently — passing
+while measuring nothing, or gating below the achievable floor (§9 P4). Assume any new green result
+is wrong until the test has been shown capable of failing.
+
+Original note: §2.2 (rename), §2.3 (norm shift), §5.2 (config gate),
 §4.2 (buffer shape) all fail without an exception, and all produce a fluent model. This argues for
 building the strict loader and the "531 in, 531 consumed" assertion *first*, not last.
 
@@ -558,7 +567,7 @@ each other and can overlap. **Nothing here depends on training finishing** — b
 | [P1](#p1--kernel-spike--done-2026-08-04--route-a) | kernel spike | **✅ DONE** — **Route A** | 0.5 d |
 | [P2](#p2--export--done-2026-08-05) | export | **✅ DONE** — `k8_step1400` built + verified | 1 d |
 | [P3](#p3--plugin--done-2026-08-05) | plugin | **✅ DONE** — S0 passes, dense + sparse | 1–1.5 d |
-| [P4](#p4--parity) | parity | S1/S2a/S2b/S3 + anti-dense gate pass | 1.5–2 d |
+| [P4](#p4--parity--done-2026-08-05) | parity | **✅ DONE** — S2b, S3, kernel parity all pass | 1.5–2 d |
 | [P5](#p5--throughput) | throughput | tokens/s known; R2, R5 resolved | 0.5 d |
 
 ### P0 — environment ✅ DONE 2026-08-04
@@ -697,15 +706,58 @@ including `--block-size 128` and `--enforce-eager` (R2 still unresolved). The ma
 records git sha + dirty count, venv/vLLM version, model dir, `PYTHONPATH`, `MSA_SPARSE` and the
 full command, as the DSA runs did.
 
-### P4 — parity
+### P4 — parity ✅ DONE 2026-08-05
 
-Everything in §6 that S0 did not already cover: S2b (§6.3), S3 (§6.5), the anti-dense gate (§6.6
-checks 1–2), and the index-score / top-k **set** parity against the vLLM kernels — open item 1, with
-the semantics checklist in [plan.md](plan.md) §4.2 #2 (absolute block grid, mask-before-max on the
-diagonal tile only, max pooling, sentinel forcing before top-k, forced local consuming one of the `k`
-slots, `-1` past `valid_blocks`). Compare **sets**, never score magnitudes (§2.4).
+**Everything is gated against a floor measured in the same run, never against zero.** Two
+independent floors exist on this setup and both were measured, not assumed:
 
-**Exit:** all gates green. This is the point before which no benchmark number means anything.
+| floor | value | source |
+|---|--:|---|
+| `w − 1` round trip, on first-step logprobs | **6.8e-2** | two DENSE runs differing only by the shift (`test_stage2b_degeneracy.py`) |
+| kernel-vs-torch block-score noise | **0.141** | `test_qwen3_msa_index_parity.py`, recomputed per run |
+| decoding determinism (control) | **0.000** | same config twice — proves the first floor is weights, not variance |
+
+| gate | result |
+|---|---|
+| **S2b degeneracy** (`test_stage2b_degeneracy.py`) | **PASS.** Short prompt (5 tok, all blocks selected): sparse-vs-dense = 0.94× floor, greedy 8/8. Long prompt (1627 tok): **5.31× floor** — selection is load-bearing, so the test can detect a difference |
+| **Index-score parity** vs `minimax_m3_index_score` | **PASS.** max\|Δ\| 0.141 on a scale of 64.2 (0.22%), 540k live blocks |
+| **Selected-block SET parity** vs `minimax_m3_index_topk` — [plan.md](plan.md) open item 1, *"must-do before training"* | **PASS.** mean overlap **0.9966**, worst-query 0.7778 over 32,768 (head,query) pairs; 1.53% disagree, and **100% of those are near-ties** (max gap 0.082 vs 0.141 noise) |
+| **HF parity** (vLLM vs the training forward) | **PASS.** top-1 matches; teacher-forced mean \|Δ\| **2.8e-2** vs 7e-2 floor; 1.3% of 1626 positions above 3× floor |
+| **S3 decode parity** (`test_stage3_decode_parity.py`) | **PASS.** Decode kernels agree *better* than prefill on identical tokens — prose 4.7e-3, code 1.7e-2, math 4.0e-2 |
+| **Anti-dense gate** (§6.6 checks 1–2) | **PASS** in S0 — both backend log lines, 33 `.index_cache` layers |
+
+**Bit-exact selection is unreachable, and that is settled by measurement, not opinion.** The two
+implementations reduce over 128 dims in different orders and float addition is not associative.
+Matching serving's bf16 dtype in the reference made agreement *worse* (0.9923 vs 0.9965) — it is
+accumulation order, not precision. Training's fp32 scores are deliberate (there is an existing
+assertion, and they feed the KL's `log_softmax`), so downgrading them would harm training *and*
+agreement. The gate is therefore **"every flip is a near-tie inside the measured noise"**, which is
+a real check: DSA's UE8M0 drift produced flips with large gaps and would fail it.
+
+**Cross-environment oracle.** The training forward must run in the TRAINING env (transformers
+5.3.0, `ray`), not the venv (5.14.1, no `ray`) — it mirrors `Qwen3Attention.forward` for a specific
+transformers version. `scripts/msa/hf_msa_oracle.py` runs there and exchanges tensors on disk. It
+needs the `--no-norm-shift` export (exact weights, standard RMSNorm); feeding it the shifted export
+would compute `x*(w−1)`.
+
+**Four methodology failures worth not repeating.** Every one produced a confident wrong answer:
+
+1. **A test that could not fail.** The set-parity fixture had 8 blocks and `SEL_K=8` — top-8-of-8
+   selects everything, so 1.000000 overlap was guaranteed. Reported as a headline result before the
+   error was caught. The file's own constant block warns about exactly this. Fixture now asserts
+   `n_blocks > SEL_K` and that <50% of queries select all blocks.
+2. **Two thresholds set below the achievable floor.** An absolute `|Δlogprob| ≤ 0.05` "failed" a
+   correct configuration at 6.4e-2 (floor is 6.8e-2); `mean overlap > 0.999` "failed" at 0.9966.
+   Both would have condemned working code.
+3. **A statistic with no resolution.** S3 gated an outlier *rate* at 5% on 48 samples, where one
+   outlier is 2.1 points. Fixed by raising to 256 and gating against prefill on the same sequence.
+4. **A test that measured the wrong thing.** S3 first captured "decode" logprobs by re-scoring the
+   finished sequence as a prompt — a PREFILL pass. It reported math at mean 0.52 / 21% outliers and
+   nearly triggered a hunt for a decode bug that does not exist (real values: 0.040 / 5.9%).
+
+**Unexplained, recorded for completeness:** vLLM prefill re-scoring the math continuation disagrees
+with the oracle far more than the decode kernels do on the same tokens (5.2e-1 vs 4.0e-2). Inside
+S2b's already-passing envelope and not a decode issue, so not chased.
 
 ### P5 — throughput
 
@@ -730,6 +782,70 @@ only measurement that explains *why* a benchmark moved. Cheapest information per
 - [plan.md](plan.md) §7.3's "two kv-cache groups must exist" is **wrong for vLLM 0.26** — it merges
   into one group. Replace with the cached-layer roster check (§6.6 check 2).
 
+- The **decode split-K index path** is still unwired (`test_parity_decode_path_separately`,
+  explicitly skipped). S3 covers decode end-to-end and passes, but the kernel-level comparison for
+  that specific path does not exist.
+- The **prefill-vs-decode gap on the math continuation** (§9 P4, 5.2e-1 vs 4.0e-2) is unexplained.
+
 Deliberately **not** follow-ups, per §6.4: the [../qwen3_4b_dsa/eval_plan.md](../qwen3_4b_dsa/eval_plan.md)
 §3 ladder, a `StockRef` dense reference, and `scripts/msa/randomize_indexer_ckpt.py`. Each is cheap to
 add later; none is on this path.
+
+---
+
+## 11. Training-side bug found by parity: partial-block aliasing
+
+Found because the serving path disagreed with training, and traced back to **training** being wrong.
+
+**Mechanism.** `_selected_token_index` expanded block ids to token positions as
+`block * B_k + offset`, then `clamp_max(seq_len - 1)`. When the final block is only partly filled
+(`seq_len % 128 != 0`) its surplus slots were pinned onto `seq_len - 1`, aliasing onto the last real
+token. `slot_ok` tested only "did this come from a selected block", which is true for them.
+
+Every query except the one at `seq_len - 1` is saved by the causal mask — the alias is in its
+future. That last query is not, so it attended to the final token `128 - (seq_len % 128)` times
+over. At `seq_len = 5` that is 124 of 128 slots (~97% of the attention mass) and the position
+degenerates into echoing its own last token: it answered `' is'` to *"The capital of France is"*,
+and gave the same answer for a different prompt.
+
+**Impact on training: negligible, which is why it survived.** The corrupted position is the final
+one, whose prediction has no next-token target and is dropped by the shifted loss mask
+(`workers/utils/losses.py:148`). It reaches only the KL, at ~1 row in 7,000 (BC rows are p50 ~7K
+tokens, and `micro_batch_size_per_gpu=1` means the tensor width *is* the sample length, so there is
+no padding to absorb it — that setting is the worst case; with `mbs>1` only the longest row of each
+micro-batch is affected). Phase 1 is unaffected (dense path). The serving path was never affected —
+vLLM pages by sequence length and never clamps.
+
+**Fix.** Range-test before the clamp, because clamping is what destroys the evidence:
+
+```python
+raw = sel.clamp_min(0).unsqueeze(-1) * bk + off          # BEFORE clamping
+tok = raw.reshape(b, h, tq, k * bk).clamp_max(seq_len - 1)
+slot_ok = ((sel >= 0).unsqueeze(-1) & (raw < seq_len)).reshape(b, h, tq, k * bk)
+```
+
+**Why the existing suite missed it.** `test_qwen3_msa_phase2.py` D1 asserts dense equivalence and
+would have caught this — at `--seq-len 512`, and `512 % 128 == 0`. Block-aligned is the one case
+with zero surplus slots. Coverage added:
+
+- `tests/msa/test_selected_token_index.py` (new, CPU, <1s) — sweeps every `seq_len` in 1..3·B_k for
+  B_k ∈ {8,128}; **verified non-vacuous** by re-running against the pre-fix code, where 4/11 fail;
+- **D1** extended to `[512, 500, 385, 300]` with `n_blocks` corrected to **ceil** (`T // bk`
+  under-counts a partial block and would set `k` too low) and an explicit last-position assertion;
+- **D7** (new) — `mbs > 1`: padded batch `[300, 411, 512]`, per-row dense equivalence.
+
+Full suite after the fix: phase2 28/28 · unit 11/11 · phase1 24/24 · monkey-patch 17/17 ·
+index-parity 16 passed / 2 skipped.
+
+### 11.1 Training restart
+
+**The Phase-2b runs were stopped and will be restarted on the fixed code** (decision 2026-08-05).
+The bug did not materially damage the stopped runs — no LM gradient ever touched the corrupted
+position — so this is a cleanliness call, not a recovery. Consequences:
+
+- The existing `k8 @ step 1400` and `k16 @ step 800` checkpoints remain **valid for serving-stack
+  work**; every artifact in P0–P4 was built from k8 @ 1400 and none of it needs redoing.
+- Restarted runs produce **bitwise different** trajectories from step 0. Do not compare loss curves
+  across the boundary.
+- Re-export (`build_msa_serving_dir.py`) against the new checkpoints when they land; P2 takes ~2.5
+  min and P4 re-runs unchanged.

@@ -85,9 +85,13 @@ llm = LLM(model=os.environ["MODEL"], tensor_parallel_size=1, block_size=128, max
 
 full, vll = {}, {}
 for name, ids in prompts.items():
+    # logprobs=0 returns the logprob of each SAMPLED token as computed by the DECODE kernels --
+    # that is the quantity S3 is about. Re-scoring the finished sequence with prompt_logprobs would
+    # run PREFILL over it and test nothing new (an earlier version of this file did exactly that).
     o = llm.generate([TokensPrompt(prompt_token_ids=ids)],
-                     SamplingParams(temperature=0.0, max_tokens=n_gen, seed=0))[0]
+                     SamplingParams(temperature=0.0, max_tokens=n_gen, logprobs=0, seed=0))[0]
     gen = list(o.outputs[0].token_ids)
+    decode_lp = [lp[t].logprob for lp, t in zip(o.outputs[0].logprobs, gen)]
     seq = list(ids) + gen
     full[name] = seq
     # Re-run the FULL sequence as a prompt to get vLLM's own per-position logprobs over it. The
@@ -97,7 +101,7 @@ for name, ids in prompts.items():
                       SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0, seed=0))[0]
     pl = [None if p is None else p[t].logprob for p, t in zip(o2.prompt_logprobs, seq)]
     vll[name] = {"n_prompt": len(ids), "n_gen": len(gen), "logprobs": pl[1:],
-                 "gen_text": o.outputs[0].text[:120]}
+                 "decode_lp": decode_lp, "gen_text": o.outputs[0].text[:120]}
 
 json.dump(full, open(os.environ["TOKENS"], "w"))
 json.dump(vll, open(os.environ["VOUT"], "w"))
@@ -108,7 +112,9 @@ print("GEN_OK")
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--step", choices=("generate", "compare"), required=True)
-    ap.add_argument("--n-gen", type=int, default=48)
+    ap.add_argument("--n-gen", type=int, default=256,
+                    help="48 cannot resolve an outlier RATE: one outlier is 2.1 points, so a "
+                         "5%% gate is inside the sampling error. 256 gives real power.")
     ap.add_argument("--floor", type=float, default=7e-2)
     ap.add_argument("--margin", type=float, default=3.0)
     a = ap.parse_args()
@@ -148,18 +154,35 @@ def main() -> int:
         vt = torch.tensor(d_v["logprobs"], dtype=torch.float32)
         n = min(len(ot), len(vt))
         d = (ot[:n] - vt[:n]).abs()
-        # Positions >= n_prompt-1 are the DECODE-produced tokens -- the part S2b never covered.
-        dec = d[n_p - 1:]
-        pre = d[: n_p - 1]
+        pre = d[: n_p - 1]                      # prefill control, vLLM prefill vs oracle
+        # TRUE decode comparison: vLLM's per-step logprobs FROM THE DECODE KERNELS vs the oracle's
+        # teacher-forced logprob for the same token. ot index i is the logprob of token i+1, so the
+        # first generated token sits at ot[n_p-1].
+        dlp = torch.tensor(d_v["decode_lp"], dtype=torch.float32)
+        m_ = min(len(dlp), len(ot) - (n_p - 1))
+        dec = (ot[n_p - 1: n_p - 1 + m_] - dlp[:m_]).abs()
+        # Secondary: vLLM PREFILL re-scored over the same generated tokens. If `dec` is much worse
+        # than this, the gap is the decode kernels; if both are bad, it is the tokens themselves.
+        dec_pre = d[n_p - 1:]
         print(f"{name}  ({n_p} prompt + {n_g} generated):")
         print(f"  prefill positions : {len(pre):5d} | mean|Δ|={pre.mean():.4e} "
               f"p99={pre.quantile(0.99):.4e} | >{tol:.1e}: {(pre > tol).sum().item()}")
-        print(f"  DECODE  positions : {len(dec):5d} | mean|Δ|={dec.mean():.4e} "
+        print(f"  DECODE kernels    : {len(dec):5d} | mean|Δ|={dec.mean():.4e} "
               f"p99={dec.quantile(0.99):.4e} | >{tol:.1e}: {(dec > tol).sum().item()}")
-        frac = (dec > tol).float().mean().item()
-        ok = dec.mean().item() <= a.floor and frac < 0.05
-        print(f"  gate: decode mean|Δ| {dec.mean():.3e} <= {a.floor:.1e} and outliers "
-              f"{frac:.1%} < 5%  -> {'PASS' if ok else 'FAIL'}\n")
+        print(f"  (same tokens, vLLM PREFILL re-score: mean|Δ|={dec_pre.mean():.4e} "
+              f"| >{tol:.1e}: {(dec_pre > tol).sum().item()})")
+        # Gate decode against PREFILL ON THE SAME SEQUENCE, not against an absolute constant. The
+        # question S3 asks is narrow: do the decode kernels (split-K score, partial top-k + merge,
+        # sparse decode attend) degrade anything relative to the prefill kernels we already
+        # validated in S2b? Same weights, same tokens, same floors -- so prefill is the control and
+        # any absolute threshold would just re-litigate the w-1 and near-tie floors.
+        f_dec = (dec > tol).float().mean().item()
+        f_pre = (pre > tol).float().mean().item()
+        ok = (dec.mean().item() <= max(a.floor, 2.0 * pre.mean().item())
+              and f_dec <= max(3.0 * f_pre, 3.0 / max(len(dec), 1)))
+        print(f"  gate: decode mean {dec.mean():.3e} <= max(floor {a.floor:.1e}, 2x prefill "
+              f"{2 * pre.mean():.3e}) | outlier rate {f_dec:.1%} vs prefill {f_pre:.1%} "
+              f"-> {'PASS' if ok else 'FAIL'}\n")
         rc |= 0 if ok else 1
 
     print("S3 DECODE PARITY PASS" if rc == 0 else "S3 DECODE PARITY FAILED")
