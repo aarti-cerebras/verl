@@ -94,7 +94,12 @@ def main():
                          "(base stays stock). Pass '' to consolidate the FULL model => Phase-2 branch/restart "
                          "(base+indexer). Either output loads via dsa_warmstart_path (strict=False).")
     ap.add_argument("--no-verify", action="store_true", help="skip the post-write verification pass")
-    # dims for the LightningIndexer key-match check (defaults = MiniCPM3-4B DSA sizing)
+    ap.add_argument("--arch", choices=("auto", "dsa", "msa"), default="auto",
+                    help="which indexer the checkpoint holds, for the key-match check. 'auto' (default) "
+                         "infers it by matching the first sparse layer's key set against both "
+                         "LightningIndexer (DSA) and MSAIndexer (MSA).")
+    # dims for the LightningIndexer key-match check (defaults = MiniCPM3-4B DSA sizing; MSA ignores these,
+    # since only key NAMES are compared and those are geometry-independent)
     ap.add_argument("--n-heads", type=int, default=16)
     ap.add_argument("--head-dim", type=int, default=64)
     ap.add_argument("--rope-head-dim", type=int, default=32)
@@ -146,8 +151,11 @@ def _verify(args, logger, out, rank_sds, keys):
       2. sanity — nonzero count, every key matches --key-substr, all tensors finite;
       3. reconstruction — for a sample of keys, re-concat the raw rank shards and confirm == the saved tensor
          (also confirms the saved shape == the DTensor's global shape);
-      4. key-match — for an indexer-only consolidation, the per-layer-0 keys must exactly equal a fresh
-         LightningIndexer's state_dict (so the dsa_warmstart_path strict=False load maps with no unexpected keys).
+      4. key-match — for an indexer-only consolidation, the keys of the FIRST layer that actually has an
+         indexer must exactly equal a fresh indexer's state_dict, so the warmstart_path strict=False load
+         maps with no unexpected keys. The reference class is chosen per architecture: DSA's
+         LightningIndexer or MSA's MSAIndexer. Note MSA leaves layers [0, dense_prefix) dense (M3 ships
+         dense_prefix=3), so layer 0 has no indexer and must not be assumed to.
     """
     from torch.distributed.tensor.placement_types import Shard
 
@@ -174,13 +182,49 @@ def _verify(args, logger, out, rank_sds, keys):
     logger.info("verify: reconstruction spot-check %d/%d keys match raw shards ✓", len(sample), len(sample))
 
     if args.key_substr == ".indexer.":
+        # Reference key sets for both architectures. Only NAMES are compared here, and those do not depend
+        # on the geometry, so default configs are sufficient for the DSA side's tunable dims.
         from verl.models.transformers.dsa_indexer import DSAConfig, LightningIndexer
-        cfg = DSAConfig(enabled=True, n_heads=args.n_heads, head_dim=args.head_dim, rope_head_dim=args.rope_head_dim,
-                        q_lora_rank=args.q_lora_rank, hidden_size=args.hidden_size, top_k=512)
-        ref = set(LightningIndexer(cfg).state_dict())
-        l0 = {k.split("self_attn.indexer.")[-1] for k in out if k.startswith("model.layers.0.self_attn.indexer.")}
-        assert l0 == ref, f"layer-0 keys != LightningIndexer keys | missing={ref - l0} extra={l0 - ref}"
-        logger.info("verify: layer-0 keys exactly match a fresh LightningIndexer (%d keys) ✓", len(ref))
+        from verl.models.transformers.msa_indexer import MSAConfig, MSAIndexer
+
+        refs = {
+            "dsa": set(LightningIndexer(DSAConfig(
+                enabled=True, n_heads=args.n_heads, head_dim=args.head_dim, rope_head_dim=args.rope_head_dim,
+                q_lora_rank=args.q_lora_rank, hidden_size=args.hidden_size, top_k=512)).state_dict()),
+            "msa": set(MSAIndexer(MSAConfig(enabled=True)).state_dict()),
+        }
+
+        # MSA keeps layers [0, dense_prefix) dense, so layer 0 need not have an indexer. Use the LOWEST
+        # layer that actually does -- assuming layer 0 is how this check silently fails on an MSA ckpt.
+        layer_re = re.compile(r"model\.layers\.(\d+)\.self_attn\.indexer\.")
+        by_layer = {}
+        for k in out:
+            m = layer_re.match(k)
+            if m:
+                by_layer.setdefault(int(m.group(1)), set()).add(k.split("self_attn.indexer.")[-1])
+        assert by_layer, f"no keys matched 'model.layers.<i>.self_attn.indexer.' (sample: {keys[:3]})"
+        first = min(by_layer)
+        suffixes = by_layer[first]
+
+        arch = args.arch
+        if arch == "auto":
+            hits = [a for a, ref in refs.items() if suffixes == ref]
+            assert len(hits) == 1, (
+                f"layer-{first} keys match no known indexer (or both). got={sorted(suffixes)}\n"
+                + "\n".join(f"  vs {a}: missing={sorted(r - suffixes)} extra={sorted(suffixes - r)}"
+                            for a, r in refs.items())
+            )
+            arch = hits[0]
+        ref = refs[arch]
+        assert suffixes == ref, (
+            f"layer-{first} keys != {arch} indexer keys | missing={sorted(ref - suffixes)} "
+            f"extra={sorted(suffixes - ref)}"
+        )
+        # Every sparse layer must carry the SAME key set, else the strict=False load would silently skip some.
+        ragged = {i: sorted(s ^ ref) for i, s in by_layer.items() if s != ref}
+        assert not ragged, f"layers with a different indexer key set than layer {first}: {ragged}"
+        logger.info("verify: arch=%s -- layers %s each expose exactly the %d %s indexer keys ✓",
+                    arch, f"{first}..{max(by_layer)} ({len(by_layer)} sparse)", len(ref), arch)
     logger.info("verify: ALL CHECKS PASSED")
 
 

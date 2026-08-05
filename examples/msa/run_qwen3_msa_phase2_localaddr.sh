@@ -294,8 +294,15 @@ fi
 # standard layer gates fire and the indexer needs no special unit. Do NOT set this False to "fix" a flat
 # loss: check that the OPTIMIZER'S masters move -- grad_norm > 0 is NOT evidence of training under a
 # side-channel loss.
+# --local-addr: the address workers are told to use as MASTER_ADDR. Without it, torch derives it from
+# `local_addr or socket.getfqdn()` (elastic/rendezvous/api.py:90) -- and on hosts whose own FQDN does NOT
+# resolve (ml-eng-gpu-22: /etc/hosts has only localhost, DNS has no record), every rank then spends 300 s
+# failing to TCP-connect to `<fqdn>:<port>` and the run dies before step 1 with a c10d timeout, not a
+# Python traceback. `--standalone` is single-node by construction (it hardcodes rdzv_endpoint=localhost:0,
+# run.py:964), so loopback is always the right answer here and needs no per-host lookup.
+LOCAL_ADDR=${LOCAL_ADDR:-127.0.0.1}
 LAUNCH=(
-    torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}"
+    torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" --local-addr "${LOCAL_ADDR}"
     -m verl.trainer.sft_trainer
     hydra.run.dir="${RUN_DIR}/hydra/${RUN_TS}"
     # Stable, config-keyed: this is what makes `resume_mode=auto` continue instead of restarting at 0.

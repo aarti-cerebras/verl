@@ -268,8 +268,17 @@ class SFTTrainer:
         dp_rank = self.engine.get_data_parallel_rank()
         dp_size = self.engine.get_data_parallel_size()
 
+        # `sampler_shuffle=False` hands batch composition to the DATASET's row order. Needed by datasets
+        # that group rows deliberately -- e.g. MSASFTDataset's length tiers, where each global batch must
+        # hold rows of similar length because a step's cost is set by its longest row across ranks. Leaving
+        # this True (the default, and every pre-existing run) lets the sampler re-permute and destroys any
+        # such grouping.
         self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
+            self.train_dataset,
+            shuffle=config.data.get("sampler_shuffle", True),
+            num_replicas=dp_size,
+            rank=dp_rank,
+            drop_last=True,
         )
 
         self.global_batch_size = config.data.train_batch_size

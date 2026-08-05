@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,25 @@ from _dsa_log import setup_logging  # noqa: E402
 
 REPO = "openbmb/UltraData-SFT-2605"
 DEFAULT_DOMAINS = ["Math", "Code", "IF", "Knowledge", "Chinese-general"]
+
+# ---------------------------------------------------------------------------------------------------
+# Source backend: allenai/Dolci-Think-RL-32B  (Qwen3-4B Phase-2b; docs/qwen3_4b_msa/phase2_data_gen.md)
+# ---------------------------------------------------------------------------------------------------
+DOLCI_RL_REPO = "allenai/Dolci-Think-RL-32B"
+# dataset_source -> domain. Prefix match, longest first (the IF/General names carry filter suffixes).
+DOLCI_RL_DOMAINS = {
+    "hamishivi/math_rlvr_mixture_dpo": "Math",
+    "saurabh5/code_rlvr_mixture_dpo": "Code",
+    "allenai/IF_multi_constraints": "IF",
+    "allenai/rlvr_general_mix": "General",
+}
+
+
+def _dolci_domain(dataset_source: str) -> str | None:
+    for prefix, dom in DOLCI_RL_DOMAINS.items():
+        if (dataset_source or "").startswith(prefix):
+            return dom
+    return None
 
 
 def _cjk_ratio(text: str) -> float:
@@ -180,10 +200,125 @@ def collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logg
     return kept
 
 
+def collect_dolci_rl(args, rng, logger, exclude_shas=None):
+    """Prompt extraction for allenai/Dolci-Think-RL-32B (see docs/qwen3_4b_msa/phase2_data_gen.md §4).
+
+    Prompts-only: ``outputs`` / ``model`` / ``predicted_label`` are discarded, ``ground_truth`` is kept as
+    metadata for the *diagnostic* accuracy log only (never a filter). Returns {domain: [rows]}.
+
+    Extraction contract, in order: strip the literal ``"user: "`` prefix (100% of rows carry it) -> drop
+    flattened multi-turn rows (~1.6%: Qwen3's template strips reasoning from pre-last-query assistant turns,
+    so a multi-turn BC row would train on trace-deleted history) -> char bounds -> sha256 dedup ->
+    ``--exclude-sha``.
+    """
+    import glob as _glob
+
+    import pandas as pd
+
+    exclude_shas = exclude_shas or set()
+    files = sorted(_glob.glob(os.path.join(args.local_dir, "**", "*.parquet"), recursive=True))
+    if not files:
+        from huggingface_hub import snapshot_download
+
+        logger.info("no parquet under %s — downloading %s", args.local_dir, DOLCI_RL_REPO)
+        snapshot_download(DOLCI_RL_REPO, repo_type="dataset", local_dir=args.local_dir)
+        files = sorted(_glob.glob(os.path.join(args.local_dir, "**", "*.parquet"), recursive=True))
+    assert files, f"no parquet files under {args.local_dir}"
+    logger.info("reading %d parquet shard(s) from %s", len(files), args.local_dir)
+
+    cols = ["prompt", "dataset_source", "original_dataset", "custom_id", "ground_truth"]
+    df = pd.concat([pd.read_parquet(f, columns=cols) for f in files], ignore_index=True)
+    logger.info("loaded %d rows", len(df))
+
+    tok = None
+    if args.tokenizer:
+        tok = _load_tokenizer(args.tokenizer, logger)
+
+    counters = {k: 0 for k in ("no_user_prefix", "multi_turn", "char_bounds", "dup", "excluded", "no_domain")}
+    seen, pools = set(), {}
+    for prompt, src, orig, uid, gt in df.itertuples(index=False, name=None):
+        dom = _dolci_domain(src)
+        if dom is None:
+            counters["no_domain"] += 1
+            continue
+        text = prompt or ""
+        if text.startswith("user: "):
+            text = text[len("user: ") :]
+        else:
+            counters["no_user_prefix"] += 1  # schema drift — logged, and the row is still usable
+        text = text.strip()
+        # flattened multi-turn: an inlined assistant turn, or a second inlined user turn
+        if "\nassistant:" in text or len(re.findall(r"(?m)^user: ", text)) >= 1:
+            counters["multi_turn"] += 1
+            continue
+        if not (args.min_prompt_chars <= len(text) <= args.max_prompt_chars):
+            counters["char_bounds"] += 1
+            continue
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if sha in seen:
+            counters["dup"] += 1
+            continue
+        seen.add(sha)
+        if sha in exclude_shas:
+            counters["excluded"] += 1
+            continue
+        row = {
+            "source_uid": uid,
+            "source_dataset": DOLCI_RL_REPO,
+            "source_config": src,
+            "original_dataset": orig,
+            "domain": dom,
+            "lang": "en",
+            "prompt_sha256": sha,
+            "ground_truth": list(gt) if gt is not None else None,  # metadata only — never a filter
+            "messages": [{"role": "user", "content": text}],
+        }
+        if tok is not None:
+            row["prompt_tokens"] = _prompt_tokens(tok, text)
+        pools.setdefault(dom, []).append(row)
+
+    logger.info("dropped: %s", counters)
+    if counters["no_user_prefix"]:
+        logger.warning("%d rows did NOT start with 'user: ' — verify the dataset has not changed",
+                       counters["no_user_prefix"])
+    for dom in pools:
+        rng.shuffle(pools[dom])
+    logger.info("pools: %s", {d: len(v) for d, v in sorted(pools.items())})
+    return pools
+
+
+def _load_tokenizer(path, logger):
+    """Prefer the standalone ``tokenizers`` fast tokenizer (no transformers needed); fall back to HF."""
+    tj = os.path.join(path, "tokenizer.json")
+    if os.path.exists(tj):
+        from tokenizers import Tokenizer
+
+        logger.info("tokenizer: tokenizers.Tokenizer.from_file(%s)", tj)
+        return Tokenizer.from_file(tj)
+    from transformers import AutoTokenizer
+
+    logger.info("tokenizer: AutoTokenizer.from_pretrained(%s)", path)
+    return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+
+def _prompt_tokens(tok, text):
+    """Token count of the prompt TEXT only (the chat wrapper is accounted for separately: 10 tokens for
+    Qwen3-Thinking, see docs/qwen3_4b_msa/phase2_data_gen.md §5.1)."""
+    if hasattr(tok, "encode_batch"):  # tokenizers.Tokenizer
+        return len(tok.encode(text, add_special_tokens=False).ids)
+    return len(tok(text, add_special_tokens=False)["input_ids"])
+
+
 def main():
     ap = argparse.ArgumentParser(description="Select prompts from UltraData-SFT-2605/no_think for self-gen.")
     ap.add_argument("--out", required=True, help="output JSONL path")
     ap.add_argument("--log-dir", default=None, help="dir for the run log (default: <out dir>/logs)")
+    ap.add_argument("--source", default="ultradata", choices=["ultradata", "dolci-rl"],
+                    help="prompt-source backend: 'ultradata' = openbmb/UltraData-SFT-2605 (MiniCPM3 path), "
+                         "'dolci-rl' = allenai/Dolci-Think-RL-32B (Qwen3-4B Phase-2b path)")
+    ap.add_argument("--tokenizer", default=None,
+                    help="model dir; when given, each row records prompt_tokens (needed to fit the 32K "
+                         "generation window per row — see docs/qwen3_4b_msa/phase2_data_gen.md 5.1)")
     # split-spec mode
     ap.add_argument("--split-json", default=None, help="JSON string or file: {config:{frac|count, lang}}")
     ap.add_argument("--total", type=int, default=0, help="total prompts (for 'frac' specs)")
@@ -214,15 +349,33 @@ def main():
     logger, _ = setup_logging("select_prompts", log_dir)
     logger.info("config: %s", vars(args))
 
-    from huggingface_hub import HfFileSystem, hf_hub_download
-
-    fs = HfFileSystem()
     rng = random.Random(args.seed)
     specs = resolve_specs(args, logger)
     exclude_shas = load_exclude_shas(args.exclude_sha, logger)
 
     total_kept = 0
     lang_counts = {}
+
+    if args.source == "dolci-rl":
+        pools = collect_dolci_rl(args, rng, logger, exclude_shas=exclude_shas)
+        with open(args.out, "w") as fout:
+            for cfg, count, _lang in specs:
+                pool = pools.get(cfg, [])
+                if not pool:
+                    logger.warning("[%s] no rows for this domain (known: %s)", cfg, sorted(pools))
+                kept = pool[:count]
+                logger.info("[%s] pool=%d kept=%d/%d%s", cfg, len(pool), len(kept), count,
+                            "  ⚠SHORT" if len(kept) < count else "")
+                for r in kept:
+                    fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    lang_counts[r["lang"]] = lang_counts.get(r["lang"], 0) + 1
+                total_kept += len(kept)
+        logger.info("DONE: wrote %d prompts (lang %s) -> %s", total_kept, lang_counts, args.out)
+        return
+
+    from huggingface_hub import HfFileSystem, hf_hub_download
+
+    fs = HfFileSystem()
     with open(args.out, "w") as fout:
         for cfg, count, lang_filter in specs:
             kept = collect_config(fs, hf_hub_download, cfg, count, lang_filter, args, rng, logger,

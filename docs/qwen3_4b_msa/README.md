@@ -8,9 +8,10 @@ only those blocks. Target **32K**, preserving long-context and reasoning capabil
 |---|---|
 | **[plan.md](plan.md)** | Target model, why MSA over DSA-on-GQA, config, cost accounting, Phase 0 / 1 / 2a / 2b, **serving plan**, compute budget, risks |
 | **[kl_loss.md](kl_loss.md)** | The loss spec: paper Eq. 9–12 verbatim, worked example, shapes and memory, the paper-vs-vLLM divergences, metrics, provenance ledger |
-| **[phase1_implementation.md](phase1_implementation.md)** | Phase 1 as built: notation, the 34.4 TB/layer problem statement, the six optimisations that bring it to a measured 46.9 GB, and the measured throughput that replaces plan §8's estimate |
+| **[phase1_implementation.md](phase1_implementation.md)** | Phase 1 as built: notation, the 34.4 TB/layer problem statement, the seven optimisations that bring it to a measured 46.9 GB and 42 s/step, the measured budget that replaces plan §8's estimate, and **§8: every logged metric defined with its equation** |
 | **[phase2_plan.md](phase2_plan.md)** | Phase 2 (sparse): the per-token gather decision, the free teacher, the `λ` conversion trap, gradient wiring, code list, 2a/2b gates, Phase-2-specific risks |
 | [../qwen3_4b_dsa/data_plan.md](../qwen3_4b_dsa/data_plan.md) | **Carries over unchanged** — prompts-only/on-policy rule, difficulty-not-length selection, dataset evaluation, three data streams, §11 known gap |
+| **[phase2_data_gen.md](phase2_data_gen.md)** | The data plan made concrete for the S2/S3 (short + decode-long) halves: `allenai/Dolci-Think-RL-32B` as the prompt bank (verified schema, slice policy, IFEval-format caveat), Qwen3-Thinking sampling config, **the `<think>`-stripping landmine in `MultiTurnSFTDataset` and the `input_ids`+`loss_mask` contract that avoids it**, filters, decontamination, budget, pilot gate, commands |
 | [../qwen3_4b_dsa/eval_plan.md](../qwen3_4b_dsa/eval_plan.md) | **Carries over** with the substitutions listed in [plan.md](plan.md) §9 |
 
 ## Config, in one place
@@ -49,5 +50,5 @@ train them in that form. See [plan.md](plan.md) §3.2.
 - **Superseded:** [`docs/qwen3_4b_dsa/plan.md`](../qwen3_4b_dsa/plan.md) (the token-granular
   DSA-on-GQA variant). Kept for the reasoning trail; see [plan.md](plan.md) §2 for why we moved.
 
-**Status:** planning complete, nothing implemented as of 2026-07-28. All feasibility unknowns are
+**Status:** Phase 1 implemented and RUNNING (1B tokens, launched 2026-07-29; ~1.9 days). All feasibility unknowns are
 closed; the remaining blockers are tests — see [plan.md](plan.md) §10.

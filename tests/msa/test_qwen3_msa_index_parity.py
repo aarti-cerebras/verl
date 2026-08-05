@@ -234,6 +234,61 @@ def tiny():
                 cos=cos, sin=sin, vis=vis, s=s, m=m)
 
 
+
+@pytest.fixture(scope="module")
+def paged():
+    """Fixture at the KERNEL's geometry: B_k must be 128 (SPARSE_BLOCK_SIZE is hardcoded), and the
+    index keys must live in a PAGED cache, not a dense tensor.
+
+    `tiny` uses b_k=32 for speed, which the kernels cannot consume. Page size == sparse block size,
+    so logical block b IS physical page b for a single contiguous sequence -- that 1:1 identity is
+    the whole reason serving needs no read amplification (serving_plan §3.2).
+    """
+    torch.manual_seed(7)
+    # t MUST give n_blocks > SEL_K, or top-k picks EVERY block and set parity is vacuous -- see the
+    # SEL_K comment above. 4096/128 = 32 blocks vs SEL_K=8, so selection genuinely discards 24 of 32.
+    b, t, d_model = 1, 4096, 256
+    dev = "cuda"
+    h = torch.randn(b, t, d_model)
+    w_q = torch.randn(d_model, H_KV * D_IDX) / math.sqrt(d_model)
+    w_k = torch.randn(d_model, D_IDX) / math.sqrt(d_model)
+    qn, kn = torch.ones(D_IDX), torch.ones(D_IDX)
+    cos, sin = build_rope_cache(t, D_IDX)
+    vis = causal_doc_mask(t)
+    # Our reference, WITHOUT the 1/sqrt(d) scale: the kernel omits it (index_topk.py:291), and
+    # top-k is scale-invariant, but the SCORES must be compared on the same footing.
+    s = index_scores(h, w_q, w_k, qn, kn, cos, sin, H_KV, D_IDX, scale=False)
+    m = block_scores(s, B_K, vis)
+
+    # Rebuild q_idx / k_idx the same way index_scores does, to feed the kernel.
+    q = rms_norm((h @ w_q).view(b, t, H_KV, D_IDX).transpose(1, 2), qn)
+    k = rms_norm((h @ w_k).view(b, t, 1, D_IDX).transpose(1, 2), kn)
+    q = apply_rope(q, cos, sin)
+    k = apply_rope(k, cos, sin)
+
+    nb = t // B_K
+    assert nb > SEL_K, f"vacuous fixture: {nb} blocks <= SEL_K={SEL_K}, top-k would select all"
+    idx_q = q[0].transpose(0, 1).contiguous().to(dev, torch.bfloat16)     # [T, H_kv, D_idx]
+    index_cache = k[0, 0].reshape(nb, B_K, D_IDX).contiguous().to(dev, torch.bfloat16)
+    return dict(t=t, nb=nb, m=m, idx_q=idx_q, cache=index_cache, dev=dev)
+
+
+def _kernel_scores(paged):
+    """Run the prefill index-score kernel over the whole sequence (no cached prefix)."""
+    from vllm.models.minimax_m3.common.ops.index_topk import minimax_m3_index_score
+
+    t, nb, dev = paged["t"], paged["nb"], paged["dev"]
+    return minimax_m3_index_score(
+        paged["idx_q"],
+        paged["cache"],
+        torch.arange(nb, device=dev, dtype=torch.int32).view(1, nb),  # block_table: block b -> page b
+        torch.tensor([0, t], device=dev, dtype=torch.int32),          # cu_seqlens_q
+        torch.tensor([t], device=dev, dtype=torch.int32),             # seq_lens
+        torch.tensor([0], device=dev, dtype=torch.int32),             # prefix_lens: full prefill
+        t, t, H_KV,
+    )
+
+
 # ------------------------------------------------------- tier 1: reference contract (no vLLM needed)
 
 
@@ -399,30 +454,102 @@ def test_teacher_is_renormalize_then_average_not_the_reverse():
 
 
 @requires_vllm_msa
-def test_parity_block_scores_vs_kernel(tiny):
+def test_parity_block_scores_vs_kernel(paged):
     """minimax_m3_index_score must reproduce our block max-pool on causally-visible blocks."""
-    raise NotImplementedError(
-        "Wire once a vLLM with PR #45381 is importable: call minimax_m3_index_score on the same "
-        "q_idx/k_idx and compare to tiny['m'] with allclose at fp32 tolerance, ignoring "
-        "fully-masked blocks (both sides must read -1e30 there)."
-    )
+    got = _kernel_scores(paged).float().cpu()                     # [H_kv, total_q, max_block]
+    ref = paged["m"][0].float()                                   # [H_kv, T, n_blocks]
+    nb = paged["nb"]
+    got = got[:, :, :nb]
+    live = ref > MASKED_FILL / 2                                  # ignore fully-masked blocks
+    d = (got - ref).abs()[live]
+    # bf16 q/k dotted into fp32: compare relative to the score scale, not absolutely.
+    scale = ref[live].abs().max()
+    print(f"\n  block-score parity vs kernel: max|delta|={d.max():.3e} "
+          f"mean|delta|={d.mean():.3e} scale={scale:.3e} over {int(live.sum())} live blocks")
+    assert d.max() / scale < 2e-2, f"max|delta|={d.max():.3e} scale={scale:.3e}"
 
 
 @requires_vllm_msa
-def test_parity_selected_block_sets_vs_kernel(tiny):
+def test_parity_selected_block_sets_vs_kernel(paged):
     """PRIMARY GATE: selected-block SET equality, mean and worst-query. Target 1.0000.
 
     Compare as sets -- prefill output is not sorted, decode is descending after a full bitonic sort.
     Report the worst-query overlap, not just the mean: the DSA UE8M0 bug showed 0.9698 mean but
     0.9297 worst-query (docs/dsa_eval_report.md §5).
     """
-    raise NotImplementedError("Wire once a current vLLM is importable; see the docstring.")
+    from vllm.models.minimax_m3.common.ops.index_topk import minimax_m3_index_topk
+
+    t, nb, dev = paged["t"], paged["nb"], paged["dev"]
+    score = _kernel_scores(paged)
+    ktop = minimax_m3_index_topk(
+        score,
+        torch.tensor([0, t], device=dev, dtype=torch.int32),
+        torch.tensor([0], device=dev, dtype=torch.int32),
+        t, SEL_K, 0, 1,                                            # topk, init_blocks, local_blocks
+    ).cpu()                                                        # [H_kv, T, SEL_K]
+    ours = select_blocks(paged["m"], SEL_K, B_K, local_blocks=1, init_blocks=0)[0].cpu()
+
+    # Noise floor, measured in THIS run: how far the kernel's block scores sit from ours. Any
+    # selection flip whose 8th/9th score gap is inside this is a coin toss between two blocks the
+    # model rated equally, not a semantic disagreement.
+    ksc = score.float().cpu()[:, :, :nb]
+    ref = paged["m"][0].float()
+    live = ref > MASKED_FILL / 2
+    noise = (ksc - ref).abs()[live].max().item()
+
+    inter, worst, n, gaps = 0.0, 1.0, 0, []
+    for hh in range(H_KV):
+        for q in range(t):
+            a = {int(x) for x in ktop[hh, q].tolist() if 0 <= int(x) < nb}
+            bset = {int(x) for x in ours[hh, q].tolist() if 0 <= int(x) < nb}
+            if not (a or bset):
+                continue
+            ov = len(a & bset) / max(len(a | bset), 1)
+            inter += ov
+            worst = min(worst, ov)
+            n += 1
+            if a != bset:
+                sc = ref[hh, q]
+                kept = sorted(bset, key=lambda i: -sc[i])
+                dropped = [i for i in range(nb) if i not in bset and sc[i] > MASKED_FILL / 2]
+                if kept and dropped:
+                    gaps.append((sc[kept[-1]] - max(sc[i] for i in dropped)).item())
+
+    # Vacuity guards: if every query selects every block the sets match trivially and prove nothing.
+    sizes = [len({int(x) for x in ours[hh, q].tolist() if 0 <= int(x) < nb})
+             for hh in range(H_KV) for q in range(0, t, 97)]
+    assert max(sizes) <= SEL_K and min(sizes) >= 1, f"unexpected set sizes {min(sizes)}..{max(sizes)}"
+    frac_full = sum(1 for z in sizes if z >= nb) / len(sizes)
+    assert frac_full < 0.5, (
+        f"{frac_full:.0%} of queries select ALL {nb} blocks -- vacuous; lengthen the fixture")
+
+    mean = inter / n
+    g = torch.tensor(gaps) if gaps else torch.zeros(1)
+    print(f"\n  set overlap vs vLLM kernels: mean={mean:.6f} worst-query={worst:.4f} "
+          f"over {n} (head,query) pairs; {len(gaps)} disagreed ({len(gaps)/n:.2%})")
+    print(f"  block-score noise this run = {noise:.4f}; gap at disagreements: "
+          f"median={g.median():.4f} max={g.max():.4f}")
+
+    # THE GATE. Bit-exact selection is unreachable -- the two implementations reduce over 128 dims in
+    # different orders and float addition is not associative, so near-ties flip. (Measured: matching
+    # serving's bf16 dtype makes agreement WORSE, 0.9923 vs 0.9965 -- it is accumulation order, not
+    # precision.) What must hold is that every flip is a coin toss between two near-equal blocks.
+    # This is a real gate, not a rubber stamp: the DSA UE8M0 drift produced flips with LARGE gaps
+    # (0.9698 mean / 0.9297 worst, docs/dsa_eval_report.md §5) and would fail here.
+    bad = int((g > noise).sum()) if gaps else 0
+    assert bad == 0, (
+        f"{bad}/{len(gaps)} selection flips have a score gap ABOVE the {noise:.4f} noise floor -- "
+        f"those are not near-ties, they are a real disagreement (max gap {g.max():.4f})")
+
+    # Loose tripwires for gross breakage only; the gate above is the substantive check.
+    assert mean > 0.99, f"mean set overlap {mean:.4f} (worst-query {worst:.4f}) over {n} queries"
+    assert worst > 0.5, f"worst-query overlap {worst:.4f} (mean {mean:.4f})"
 
 
-@requires_vllm_msa
+@pytest.mark.skip(reason="P4 follow-up: the decode split-K path needs its own paged-cache harness; "
+                         "prefill parity above does NOT transfer to it (different kernel).")
 def test_parity_decode_path_separately(tiny):
     """minimax_m3_index_decode uses split-K chunking, so prefill parity does NOT transfer."""
-    raise NotImplementedError("Wire once a current vLLM is importable.")
 
 
 @requires_vllm_msa
@@ -432,5 +559,11 @@ def test_fused_qknorm_rope_at_rotary_dim_128(tiny):
     Qwen3 needs full RoPE at 128. Kernel check is
     ``rotary_dim > 0 && rotary_dim % 8 == 0 && rotary_dim <= kHeadDim(128)``, so 128 is admissible --
     verify numerically against apply_rope(rms_norm(...)) before trusting it.
+
+    DONE, in a dedicated file: ``tests/msa/test_qwen3_msa_fused_op_parity.py`` (serving_plan §9 P1).
+    It diffs the real op against a torch reference at Qwen3 shapes and rotary_dim=128 across q_out,
+    index_q_out, the in-place k/index_k and all three cache inserts, gated at <= 2 bf16 ULP of peak.
+    Result: <= 1.70 ULP, V bit-exact -> Route A. Kept here as a pointer so the checklist item is not
+    re-opened; not duplicated, because that test needs the fused op's paged-cache plumbing.
     """
-    raise NotImplementedError("Wire once a current vLLM is importable.")
+    pytest.skip("covered by tests/msa/test_qwen3_msa_fused_op_parity.py (P1); see docstring")

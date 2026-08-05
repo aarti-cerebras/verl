@@ -365,6 +365,9 @@ before scheduling 2b.
    (c) the teacher equals the group-mean of the forward's own weights (§3.1).
 4. Loss + trainer branch + 2a launch script; run 2a; report the sparsity cost.
 5. vLLM parity (parallel track, blocking for 2b).
-6. 2b data mixture (`../qwen3_4b_dsa/data_plan.md` §5) and launch.
+6. 2b data mixture (`../qwen3_4b_dsa/data_plan.md` §5; build plan for the short + decode-long halves:
+   [phase2_data_gen.md](phase2_data_gen.md)) and launch. Its §6 and §10 are prerequisites — the default
+   SFT dataset path silently deletes Qwen3 reasoning traces, and generation is a ~day-long H100 job, so
+   both land before step 4's 2a run finishes.
 
 Phase 1's position-bucketed metrics are a **prerequisite** for step 4.

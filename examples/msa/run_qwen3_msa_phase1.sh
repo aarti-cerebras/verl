@@ -133,18 +133,50 @@ TRAIN_LIST=$(_expand_files "${TRAIN_FILES}" train) || {
     echo "    --out-dir ${TRAIN_FILES}"
     exit 1; }
 
-# --- run artifacts under RUNS_BASE, one subfolder per run (name encodes stage/data/steps/bsz + timestamp)
+# --- run identity: TWO names, deliberately different ------------------------------------------------
+#   CONFIG_TAG  everything that DEFINES the experiment, with NO timestamp. This keys the CHECKPOINT dir so
+#               that `resume_mode: auto` (verl/trainer/config/sft_trainer_engine.yaml:79) finds the newest
+#               global_step_* when the same command is relaunched. A timestamped checkpoint dir would make
+#               a crashed multi-day run silently restart from step 0 -- that is the failure this splits
+#               apart. It carries the FULL config (incl. lr and the token budget) precisely so two
+#               different configs can never share a checkpoint dir; only a true continuation collides.
+#   RUN_NAME    CONFIG_TAG + timestamp = this ATTEMPT. Drives the wandb experiment name, the log file and
+#               the hydra dir, so a restart appears as a second wandb run continuing the same step count.
 RUNS_BASE=${RUNS_BASE:-/cb/ml-eng/aarti/msa/indexer_warmup}
 STAGE=${STAGE:-phase1}
 RUN_TS=$(date +%Y%m%d_%H%M%S)
-DATA_TAG=$(basename "${TRAIN_FILES%/}" .parquet); DATA_TAG=${DATA_TAG%_train}
-RUN_NAME=${RUN_NAME:-${STAGE}_${DATA_TAG}_L${SEQ_LEN}_k${TOPK}_st${STEPS}_bs${BATCH}_${RUN_TS}}
-RUN_DIR=${RUN_DIR:-${RUNS_BASE}/${RUN_NAME}}
-mkdir -p "${RUN_DIR}"
-LOG_FILE=${LOG_FILE:-${RUN_DIR}/run-${RUN_TS}.log}
-export WANDB_DIR="${RUN_DIR}"
+MODEL_TAG=${MODEL_TAG:-$(basename "${MODEL_PATH%/}" | tr '_' '-')}   # -> qwen3-4b-thinking-2507
+DATA_TAG=$(basename "${TRAIN_FILES%/}" .parquet)                     # longmino_qwen3_32768 | <..>_train
+DATA_TAG=${DATA_TAG%_train}; DATA_TAG=${DATA_TAG%%_*}                # -> longmino; drop the tokenizer/len
+                                                                     #    tail that L<len> already records
+# tokens actually SCHEDULED = steps * global_batch * seq_len -- the run's real budget, not a nominal label
+TOK_TAG=$(awk -v s="${STEPS}" -v b="${BATCH}" -v l="${SEQ_LEN}" 'BEGIN{
+    n=s*b*l; if (n>=1e9) printf "%.2fBt", n/1e9; else printf "%.0fMt", n/1e6 }')
+LEN_TAG=$(awk -v l="${SEQ_LEN}" 'BEGIN{ if (l%1024==0) printf "L%dk", l/1024; else printf "L%d", l }')
+# the sparse set is either dense_prefix or an explicit list -- never mislabel a list as "dp<n>"
+if [[ -n "${SPARSE_LAYERS}" ]]; then
+    LAYER_TAG="sl$(tr -cd , <<<"${SPARSE_LAYERS}" | wc -c | awk '{print $1+1}')"
+else
+    LAYER_TAG="dp${DENSE_PREFIX}"
+fi
+CONFIG_TAG=${CONFIG_TAG:-${STAGE/phase/p}_${MODEL_TAG}_${DATA_TAG}_${TOK_TAG}_${LEN_TAG}_bs${BATCH}_k${TOPK}_B${BLOCK_SIZE}_${LAYER_TAG}_lr${LR}}
+RUN_NAME=${RUN_NAME:-${CONFIG_TAG}_${RUN_TS}}
+CKPT_DIR=${CKPT_DIR:-${RUNS_BASE}/_ckpt/${CONFIG_TAG}}
+# EVERY artifact lives with the checkpoints it produced: logs, the launch manifest, hydra's resolved
+# config and wandb's local dir. One directory answers "what produced these weights", which is the
+# question you actually ask months later -- and it survives restarts, since CKPT_DIR has no timestamp.
+# Per-attempt files are keyed by RUN_TS so successive attempts accumulate instead of overwriting.
+RUN_DIR=${RUN_DIR:-${CKPT_DIR}}
+LOG_DIR="${CKPT_DIR}/logs"
+mkdir -p "${RUN_DIR}" "${CKPT_DIR}" "${LOG_DIR}"
+LOG_FILE=${LOG_FILE:-${LOG_DIR}/run-${RUN_TS}.log}
+MANIFEST="${LOG_DIR}/launch-${RUN_TS}.txt"
+export WANDB_DIR="${CKPT_DIR}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[msa-phase1] run_dir=${RUN_DIR}"
+# print the resume target explicitly: this is the one path whose staleness silently costs days
+echo "[msa-phase1] ckpt_dir=${CKPT_DIR} (stable, keyed on config -> resume_mode=auto continues here)"
+echo "[msa-phase1] existing checkpoints: $(ls -d "${CKPT_DIR}"/global_step_* 2>/dev/null | wc -l)"
 echo "[msa-phase1] log=${LOG_FILE}"
 echo "[msa-phase1] model=${MODEL_PATH}"
 echo "[msa-phase1] train_shards=$(tr -cd , <<<"${TRAIN_LIST}" | wc -c | awk '{print $1+1}') spec=${TRAIN_FILES} wandb=${WANDB_BASE_URL}/${WANDB_ENTITY}/${PROJECT}"
@@ -163,7 +195,76 @@ echo "[msa-phase1] env: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} NPRO
      "WARMSTART=${WARMSTART:-none} EXP_NAME=${EXP_NAME} PROJECT=${PROJECT} MODEL_PATH=${MODEL_PATH}" \
      "TRAIN_FILES=${TRAIN_FILES} VAL_FILES=${VAL_FILES:-none} TEST_FREQ=${TEST_FREQ}" \
      "VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES} VAL_PREFIX=${VAL_PREFIX} VAL_ONLY=${VAL_ONLY}" \
-     "RESUME_PATH=${RESUME_PATH:-none} PYTHONPATH=${PYTHONPATH:-}"
+     "COMPILE_TEACHER=${COMPILE_TEACHER} RESUME_PATH=${RESUME_PATH:-none} PYTHONPATH=${PYTHONPATH:-}"
+
+# --- launch manifest, written NEXT TO THE CHECKPOINTS -------------------------------------------------
+# The run log above is a transcript; this is the reproduction recipe, in one file, so that a checkpoint
+# found months later can be traced to the exact code and environment that produced it. Captures what the
+# transcript cannot: the git sha and the WORKING-TREE DIFF (these runs are launched from a dirty tree, so
+# the sha alone does not identify the code), library versions, and the GPU/driver state.
+{ set +x; } 2>/dev/null
+{
+    echo "# MSA Phase-1 launch manifest"
+    echo "run_ts:        ${RUN_TS}"
+    echo "date:          $(date -Is)"
+    echo "host:          $(hostname -f)   user: $(whoami)"
+    echo "cwd:           $(pwd)"
+    echo "run_name:      ${RUN_NAME}"
+    echo "config_tag:    ${CONFIG_TAG}"
+    echo "ckpt_dir:      ${CKPT_DIR}"
+    echo "log_file:      ${LOG_FILE}"
+    echo "wandb:         ${WANDB_BASE_URL}/${WANDB_ENTITY}/${PROJECT}  experiment=${RUN_NAME}"
+    echo
+    echo "## exact invocation"
+    echo "outer_cmdline: $(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)"
+    echo "argv:          $0 $*"
+    echo "# NOTE: env-var assignments prefixed to the command are consumed by the shell and do NOT appear"
+    echo "#       in outer_cmdline. The resolved values of every knob this script reads are listed below,"
+    echo "#       so reproduce from THOSE, not from the command line."
+    echo
+    echo "## resolved knobs (every variable this script reads)"
+    for v in MODEL_PATH DATA_DIR TRAIN_FILES VAL_FILES NPROC SEQ_LEN STEPS BATCH \
+             TOPK BLOCK_SIZE INIT_BLOCKS LOCAL_BLOCKS DENSE_PREFIX SPARSE_LAYERS \
+             KL_BLOCK KL_CKPT KL_REDUCTION COMPILE_TEACHER DIAG_INTERVAL LOG_PER_LAYER \
+             GRAD_CKPT MODEL_DTYPE ACT_OFFLOAD ACT_GPU_LIMIT \
+             LR LR_SCHED WARMUP_RATIO MIN_LR_RATIO CLIP_GRAD \
+             SAVE_FREQ MAX_CKPT TEST_FREQ VAL_MAX_SAMPLES VAL_PREFIX VAL_ONLY \
+             WARMSTART RESUME_PATH STAGE PROJECT EXP_NAME RUNS_BASE \
+             CUDA_VISIBLE_DEVICES PYTHONPATH PYTORCH_CUDA_ALLOC_CONF WANDB_BASE_URL WANDB_ENTITY; do
+        printf '%-24s %s\n' "${v}=" "${!v-<unset>}"
+    done
+    echo
+    echo "## tokens"
+    awk -v s="${STEPS}" -v b="${BATCH}" -v l="${SEQ_LEN}" 'BEGIN{
+        printf "scheduled_tokens         %d  (= %d steps x %d batch x %d seq_len)\n", s*b*l, s, b, l
+        printf "tokens_per_step          %d\n", b*l }'
+    echo "train_shards             $(tr -cd , <<<"${TRAIN_LIST}" | wc -c | awk '{print $1+1}')"
+    echo "data_manifest            ${TRAIN_FILES%/}/MANIFEST.json"
+    echo
+    echo "## code provenance (the tree is usually DIRTY -- the sha alone is not enough)"
+    echo "repo:          ${REPO_ROOT}"
+    echo "git_branch:    $(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    echo "git_sha:       $(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"
+    echo "git_dirty:"
+    git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | sed 's/^/  /'
+    echo
+    echo "## environment"
+    echo "python:        $(python3 -c 'import sys;print(sys.version.split()[0])' 2>/dev/null) ($(command -v python3))"
+    python3 - <<'PYVER' 2>/dev/null
+import torch, transformers
+print(f"torch:         {torch.__version__}  cuda {torch.version.cuda}")
+print(f"transformers:  {transformers.__version__}")
+print(f"gpu_count:     {torch.cuda.device_count()}")
+PYVER
+    echo "nvidia_driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+    echo "gpus:"
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/  /'
+} > "${MANIFEST}"
+# the full working-tree diff, so the run is reproducible from the sha + this patch alone
+git -C "${REPO_ROOT}" diff HEAD > "${LOG_DIR}/gitdiff-${RUN_TS}.patch" 2>/dev/null || true
+echo "[msa-phase1] manifest=${MANIFEST}"
+echo "[msa-phase1] gitdiff=${LOG_DIR}/gitdiff-${RUN_TS}.patch"
+{ set -x; } 2>/dev/null
 
 # --- MSA override block. verl's `update_model_config` recurses into nested dict values, so only FLAT
 #     scalars survive injection — hence msa_<field> keys (msa_overrides_from_config reads them back).
@@ -214,7 +315,7 @@ LAUNCH=(
     torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}"
     -m verl.trainer.sft_trainer
     hydra.run.dir="${RUN_DIR}/hydra/${RUN_TS}"
-    trainer.default_local_dir="${RUN_DIR}/checkpoints"
+    trainer.default_local_dir="${CKPT_DIR}"
     +loss_mode=indexer_kl
     data.train_files="${TRAIN_LIST}"
     data.custom_cls.path=verl/utils/dataset/packed_pretrain_dataset.py
@@ -259,6 +360,12 @@ LAUNCH=(
     printf '  %q' "${LAUNCH[@]}"; echo
     echo "[msa-phase1] ============================="
 }
+# same argv into the manifest, so that ONE file is the complete recipe (%q makes it paste-runnable)
+{
+    echo
+    echo "## exact torchrun argv (paste-runnable)"
+    printf '%q ' "${LAUNCH[@]}"; echo
+} >> "${MANIFEST}"
 { set -x; } 2>/dev/null
 
 "${LAUNCH[@]}"

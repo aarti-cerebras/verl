@@ -36,9 +36,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _dsa_log import setup_logging  # noqa: E402
+from _dsa_tok import chat_prefix_ids  # noqa: E402
 
 # Per-domain max_new_tokens: math/code (incl. ZH math) = 16K ("cap high, filter after"); all others = 4K.
 DEFAULT_CAPS = {
@@ -68,11 +70,20 @@ def _log_dist(logger, rows):
         )
 
 
-def _row(p, resp_text, prompt_tokens, resp_tokens, finish, args, caps):
-    return {
+def _row(p, resp_text, prompt_tokens, resp_tokens, finish, args, caps, *,
+         resp_token_ids=None, prefix_tokens=None, prefix_token_ids=None, max_new_tokens=None, sample_idx=0):
+    """One trajectory row.
+
+    ``prefix_tokens`` / ``resp_token_ids`` are what make the SFT conversion exact: the converter rebuilds
+    the served prefix from ``messages`` and asserts its length equals ``prefix_tokens``, then splices
+    ``resp_token_ids`` verbatim — no decode/re-encode round trip, which BPE does not guarantee.
+    See docs/qwen3_4b_msa/phase2_data_gen.md §6.
+    """
+    row = {
         "source_uid": p.get("source_uid"),
         "source_dataset": p.get("source_dataset"),
         "source_config": p.get("source_config"),
+        "original_dataset": p.get("original_dataset"),
         "domain": p["domain"],
         "lang": p.get("lang"),
         "prompt_sha256": p.get("prompt_sha256"),
@@ -83,9 +94,21 @@ def _row(p, resp_text, prompt_tokens, resp_tokens, finish, args, caps):
         "finish_reason": finish,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
         "seed": args.seed,
-        "max_new_tokens": caps.get(p["domain"], DEFAULT_CAP_FALLBACK),
+        "sample_idx": sample_idx,
+        "max_new_tokens": max_new_tokens if max_new_tokens is not None
+        else caps.get(p["domain"], DEFAULT_CAP_FALLBACK),
     }
+    if prefix_tokens is not None:
+        row["prefix_tokens"] = prefix_tokens
+    if prefix_token_ids is not None:
+        row["prefix_token_ids"] = list(prefix_token_ids)
+    if resp_token_ids is not None:
+        row["resp_token_ids"] = list(resp_token_ids)
+    if args.fit_window:
+        row["window"] = args.fit_window
+    return row
 
 
 def _load_done_shas(out_path, logger):
@@ -120,36 +143,69 @@ def run_vllm(prompts, tok, args, caps, logger):
         return results
 
     max_cap = max(list(caps.values()) + [DEFAULT_CAP_FALLBACK])
-    max_model_len = args.max_model_len or (max_cap + 4096)
-    logger.info("vLLM: tp=%d dtype=%s max_model_len=%d gpu_mem_util=%.2f chunk=%d",
-                args.tensor_parallel_size, args.dtype, max_model_len, args.gpu_memory_utilization, args.chunk_size)
+    max_model_len = args.max_model_len or (args.fit_window or (max_cap + 4096))
+    logger.info("vLLM: tp=%d dtype=%s max_model_len=%d gpu_mem_util=%.2f chunk=%d fit_window=%s",
+                args.tensor_parallel_size, args.dtype, max_model_len, args.gpu_memory_utilization,
+                args.chunk_size, args.fit_window or "off (per-domain caps)")
     llm = LLM(model=args.model, trust_remote_code=True, tensor_parallel_size=args.tensor_parallel_size,
               dtype=args.dtype, gpu_memory_utilization=args.gpu_memory_utilization,
               max_model_len=max_model_len, seed=args.seed)
 
     written = 0
+    n_skipped_nofit = 0
+    n_prefix_warned = False
     with open(args.out, "a") as fout:  # append -> survives crash/kill; relaunch resumes from here
         for s in range(0, len(todo), args.chunk_size):
             batch = todo[s : s + args.chunk_size]
-            prompt_strs, sps = [], []
+            reqs, sps, kept = [], [], []
             for p in batch:
-                prompt_strs.append(tok.apply_chat_template(p["messages"], add_generation_prompt=True, tokenize=False))
-                sp = SamplingParams(temperature=args.temperature, top_p=args.top_p,
-                                    max_tokens=caps.get(p["domain"], DEFAULT_CAP_FALLBACK), n=args.n, seed=args.seed)
+                # Feed vLLM the TEMPLATED STRING, not prompt_token_ids: vLLM 0.20.2's
+                # _validate_model_input does `max(tokenizer.max_token_id, vocab-1)`, and under
+                # transformers 5.3.0 `max_token_id` is a str -> TypeError on the token-ids path only.
+                # The prefix we record for training comes back from the engine itself as
+                # `o.prompt_token_ids` (what generation actually conditioned on), which is a stronger
+                # guarantee than tokenizing it ourselves. phase2_data_gen.md §6.
+                text = tok.apply_chat_template(p["messages"], add_generation_prompt=True, tokenize=False)
+                prefix_ids = chat_prefix_ids(tok, p["messages"])
+                if args.fit_window:
+                    # generation window == training window: leave room for the closing <|im_end|>
+                    cap = args.fit_window - len(prefix_ids) - 1
+                    if cap <= 0:
+                        n_skipped_nofit += 1
+                        continue
+                else:
+                    cap = caps.get(p["domain"], DEFAULT_CAP_FALLBACK)
+                sp = SamplingParams(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
+                                    min_p=args.min_p, max_tokens=cap, n=args.n, seed=args.seed)
                 if args.repetition_penalty and args.repetition_penalty != 1.0:
                     sp.repetition_penalty = args.repetition_penalty
+                if args.presence_penalty:
+                    sp.presence_penalty = args.presence_penalty
+                reqs.append(text)
                 sps.append(sp)
-            outs = llm.generate(prompt_strs, sps)
-            for p, o in zip(batch, outs):
-                comp = o.outputs[0]
-                row = _row(p, comp.text, len(o.prompt_token_ids), len(comp.token_ids), comp.finish_reason, args, caps)
-                fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-                results.append(row)
+                kept.append((p, len(prefix_ids), cap))
+            if not reqs:
+                continue
+            outs = llm.generate(reqs, sps)
+            for (p, n_local, cap), o in zip(kept, outs, strict=True):
+                served = [int(t) for t in o.prompt_token_ids]  # exactly what generation conditioned on
+                if len(served) != n_local and not n_prefix_warned:
+                    logger.warning("served prefix %d != locally tokenized %d — recording the SERVED prefix; "
+                                   "the --fit-window cap used the local length", len(served), n_local)
+                    n_prefix_warned = True
+                for si, comp in enumerate(o.outputs):  # honour n>1: one row per sample
+                    row = _row(p, comp.text, len(served), len(comp.token_ids), comp.finish_reason, args, caps,
+                               resp_token_ids=comp.token_ids, prefix_tokens=len(served),
+                               prefix_token_ids=served, max_new_tokens=cap, sample_idx=si)
+                    fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    results.append(row)
             fout.flush()
             os.fsync(fout.fileno())  # durable checkpoint
             written += len(batch)
             logger.info("chunk done: %d/%d written (%.0f%%) -> %s",
                         written, len(todo), 100.0 * written / len(todo), args.out)
+    if n_skipped_nofit:
+        logger.warning("skipped %d prompts: no room left in --fit-window=%d", n_skipped_nofit, args.fit_window)
     return results
 
 
@@ -172,7 +228,8 @@ def run_hf(prompts, tok, args, caps, logger):
         cap = caps.get(dom, DEFAULT_CAP_FALLBACK)
         for s in range(0, len(idxs), args.hf_batch_size):
             bi = idxs[s : s + args.hf_batch_size]
-            texts = [tok.apply_chat_template(prompts[i]["messages"], add_generation_prompt=True, tokenize=False) for i in bi]
+            texts = [tok.apply_chat_template(prompts[i]["messages"], add_generation_prompt=True, tokenize=False)
+                     for i in bi]
             enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
                       max_length=(args.max_model_len or cap + 4096)).to(model.device)
             with torch.no_grad():
@@ -202,10 +259,16 @@ def launch_dp(args, logger):
         parts.append(part)
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(devs[r * tp : (r + 1) * tp])
+        # Each replica is an independent single-node vLLM engine that opens its own torch.distributed
+        # TCPStore. Left to themselves, N children racing through get_open_port() collide -> the loser
+        # dies with `EADDRINUSE`. Hand out disjoint port blocks (and stagger the spawns) instead.
+        env["VLLM_PORT"] = str(args.vllm_port_base + r * 16)
         cmd = [sys.executable, os.path.abspath(__file__),
                "--prompts", args.prompts, "--out", part, "--log-dir", args.log_dir,
                "--model", args.model, "--backend", args.backend,
                "--temperature", str(args.temperature), "--top-p", str(args.top_p),
+               "--top-k", str(args.top_k), "--min-p", str(args.min_p),
+               "--presence-penalty", str(args.presence_penalty), "--fit-window", str(args.fit_window),
                "--n", str(args.n), "--seed", str(args.seed),
                "--repetition-penalty", str(args.repetition_penalty), "--chunk-size", str(args.chunk_size),
                "--tensor-parallel-size", str(tp), "--gpu-memory-utilization", str(args.gpu_memory_utilization),
@@ -217,8 +280,11 @@ def launch_dp(args, logger):
             cmd += ["--max-model-len", str(args.max_model_len)]
         if args.limit:
             cmd += ["--limit", str(args.limit)]
-        logger.info("DP rank %d/%d on GPUs [%s] -> %s", r, dp, env["CUDA_VISIBLE_DEVICES"], part)
+        logger.info("DP rank %d/%d on GPUs [%s] VLLM_PORT=%s -> %s",
+                    r, dp, env["CUDA_VISIBLE_DEVICES"], env["VLLM_PORT"], part)
         procs.append(subprocess.Popen(cmd, env=env))
+        if args.launch_stagger and r + 1 < dp:
+            time.sleep(args.launch_stagger)  # keep 8 engine startups from racing each other
     rc = 0
     for r, p in enumerate(procs):
         pr = p.wait()
@@ -227,6 +293,14 @@ def launch_dp(args, logger):
             rc = pr
     if rc:
         sys.exit(rc)
+    if args.no_merge:
+        # The merge duplicates every byte of the .partN files. trajectories_to_sft_parquet.py and
+        # analyze_lengths.py both accept the parts directly, so on a tight filesystem the copy is pure
+        # waste — skip it and read the glob instead.
+        n = sum(1 for p in parts if os.path.exists(p) for _ in open(p))
+        logger.info("--no-merge: leaving %d parts in place (%d rows). Consume them with the glob '%s.part*'",
+                    len(parts), n, args.out)
+        return
     results = []
     with open(args.out, "w") as fout:
         for part in parts:
@@ -248,11 +322,27 @@ def main():
     ap.add_argument("--backend", default="vllm", choices=["vllm", "hf"])
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-p", type=float, default=0.9)
-    ap.add_argument("--n", type=int, default=1)
+    ap.add_argument("--top-k", type=int, default=-1, help="-1 = disabled; Qwen3-4B-Thinking-2507 wants 20")
+    ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--presence-penalty", type=float, default=0.0,
+                    help="last resort for thinking-mode repetition loops; changes the cloned distribution")
+    ap.add_argument("--fit-window", type=int, default=0,
+                    help="generation window == training window (e.g. 32768): per-row max_tokens = "
+                         "window - len(prefix) - 1, so no sample can exceed the training length. "
+                         "Overrides the per-domain caps. See docs/qwen3_4b_msa/phase2_data_gen.md §5.1")
+    ap.add_argument("--n", type=int, default=1, help="samples per prompt; each becomes its own row (sample_idx)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--repetition-penalty", type=float, default=1.0)
     ap.add_argument("--max-new-tokens-json", default=None, help='override caps, e.g. \'{"Math":8192}\'')
     ap.add_argument("--max-model-len", type=int, default=None)
+    ap.add_argument("--vllm-port-base", type=int, default=51000,
+                    help="each DP replica gets VLLM_PORT = base + rank*16; disjoint blocks avoid the "
+                         "EADDRINUSE race between simultaneously starting engines")
+    ap.add_argument("--launch-stagger", type=float, default=3.0,
+                    help="seconds between spawning DP replicas (0 to disable)")
+    ap.add_argument("--no-merge", action="store_true",
+                    help="skip concatenating the .partN files into --out at the end (the copy doubles disk "
+                         "usage; downstream scripts accept the '<out>.part*' glob)")
     ap.add_argument("--data-parallel-size", type=int, default=1, help="N replicas, each on its own GPU slice")
     ap.add_argument("--tensor-parallel-size", type=int, default=1, help="GPUs per replica (1 for a 4B model)")
     ap.add_argument("--dtype", default="bfloat16")

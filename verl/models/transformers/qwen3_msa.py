@@ -274,8 +274,16 @@ def _causal_doc_bias_block(position_ids, q0: int, q1: int, T: int, device, key_m
     return torch.zeros(allow.shape, device=device, dtype=torch.float32).masked_fill(~allow, float("-inf"))
 
 
-def _group_teacher_impl(query_states, key_states, q0, q1, bias, n_kv_heads, scaling) -> torch.Tensor:
+def _group_teacher_impl(q_block, key_states, bias, n_kv_heads, scaling) -> torch.Tensor:
     """Eq. 9's per-GQA-group teacher `P` for a query tile: `[bsz, H_kv, B, T]`, fp32, detached.
+
+    Takes the query tile ALREADY SLICED (`q_block = query_states[:, :, q0:q1]`) rather than the full
+    tensor plus `q0`/`q1`. That is a `torch.compile` requirement, not a style choice: `q0`/`q1` are Python
+    ints, so Dynamo guards on their VALUES and recompiles once per tile. At `kl_block_size=512` and
+    T=32768 there are 64 tiles, so the 8th one tripped `config.recompile_limit` and every tile after it
+    silently ran EAGER -- paying 8 compilations for ~1/8 of the speedup. With the tile pre-sliced there
+    are no int arguments that vary, every tile presents identical shapes/strides, and one compiled kernel
+    serves all 64. `T` therefore comes from `key_states`, not from the (now shorter) query tensor.
 
     Per head: softmax over the (masked) support. THEN the `1/G` average WITHIN each group — the paper
     places the softmax INSIDE the `(1/G) sum`, so each head normalises over the support BEFORE averaging.
@@ -286,10 +294,11 @@ def _group_teacher_impl(query_states, key_states, q0, q1, bias, n_kv_heads, scal
     Heads are accumulated one at a time, so the peak extra allocation is one head's `[bsz, B, T]`
     (64 MiB at 32K/512) rather than all `H_q` at once (2.0 GiB).
     """
-    bsz, H, T, _ = query_states.shape
+    bsz, H, T_q, _ = q_block.shape
+    T = key_states.shape[2]
     G = H // n_kv_heads
-    p = query_states.new_zeros(bsz, n_kv_heads, q1 - q0, T, dtype=torch.float32)
-    qb = query_states[:, :, q0:q1, :]
+    p = q_block.new_zeros(bsz, n_kv_heads, T_q, T, dtype=torch.float32)
+    qb = q_block
     # Accumulate one GROUP at a time (G heads per matmul), not one head at a time. Per-head looping issued
     # H_q * n_tiles * n_sparse_layers small matmuls -- 67,584 launches per 32K sequence at H_q=32 -- and
     # ran them in fp32, so the teacher was launch-bound rather than FLOP-bound. Per group it is 4x fewer,
@@ -326,15 +335,18 @@ def _group_teacher(query_states, key_states, q0, q1, bias, n_kv_heads, scaling) 
     tests are unaffected, and it falls back to eager if compilation fails.
     """
     global _TEACHER_COMPILED
+    # Slice HERE, outside the compiled region: `q0`/`q1` must not reach a compiled function as int args
+    # (see `_group_teacher_impl` -- Dynamo specialises on their values and blows the recompile limit).
+    q_block = query_states[:, :, q0:q1, :]
     if not _COMPILE_TEACHER or not query_states.is_cuda:
-        return _group_teacher_impl(query_states, key_states, q0, q1, bias, n_kv_heads, scaling)
+        return _group_teacher_impl(q_block, key_states, bias, n_kv_heads, scaling)
     if _TEACHER_COMPILED is None:
         try:
             _TEACHER_COMPILED = torch.compile(_group_teacher_impl, dynamic=False)
         except Exception as e:  # never let a compile failure break training
             print(f"MSA: torch.compile of the teacher failed ({type(e).__name__}), using eager: {e}")
             _TEACHER_COMPILED = _group_teacher_impl
-    return _TEACHER_COMPILED(query_states, key_states, q0, q1, bias, n_kv_heads, scaling)
+    return _TEACHER_COMPILED(q_block, key_states, bias, n_kv_heads, scaling)
 
 
 def _dense_warmup_kl(attn, hidden_states, query_states, key_states, cos, sin, rope_fn):
@@ -642,16 +654,34 @@ def _selected_token_index(indexer, sel: torch.Tensor, seq_len: int):
 
     ``sel`` ``[b, H_kv, T_q, k]`` block ids with ``-1`` in unused slots → ``(tok, slot_ok)``:
       * ``tok`` ``[b, H_kv, T_q, k*B_k]`` int64 token positions, clamped into ``[0, seq_len)``
-      * ``slot_ok`` marks slots that came from a real block.
+      * ``slot_ok`` marks slots that are REAL: from a selected block AND holding a token that exists.
 
-    ``slot_ok`` is load-bearing, not defensive: a ``-1`` slot clamps to block 0, whose tokens may be
-    perfectly legal for this query, so it would otherwise be silently attended to.
+    ``slot_ok`` is load-bearing, not defensive, for two distinct reasons:
+
+    1. a ``-1`` slot clamps to block 0, whose tokens may be perfectly legal for this query, so it
+       would otherwise be silently attended to;
+    2. the FINAL block of the sequence is usually only partly filled — ``seq_len`` need not be a
+       multiple of ``B_k`` — and ``clamp_max`` pins its surplus slots onto ``seq_len - 1``. Those
+       aliases are invisible to every query except the one AT ``seq_len - 1``, for which
+       ``seq_len - 1`` is not a future key and so is not masked by the causal bias: that query then
+       attends to the last token ``128 - (seq_len % 128)`` times over. At ``seq_len = 5`` that is 124
+       of 128 slots, i.e. ~97% of the attention mass, and the position degenerates into echoing its
+       own last token. Training never noticed because the final position has no next-token target and
+       is dropped by the shifted loss mask (``workers/utils/losses.py:148``); it surfaced as a
+       train/serve parity failure, since vLLM's kernels page by sequence length and never clamp.
+
+    The range test MUST happen before the clamp — afterwards a phantom holding ``seq_len - 1`` is
+    indistinguishable from a genuine slot holding ``seq_len - 1``, which is exactly the information
+    the clamp destroys. Batch-agnostic: ``seq_len`` is the tensor width, so with
+    ``micro_batch_size_per_gpu > 1`` shorter rows are additionally protected by the padding mask that
+    the bias gather already applies.
     """
     bk = indexer.cfg.block_size
     b, h, tq, k = sel.shape
     off = torch.arange(bk, device=sel.device)
-    tok = (sel.clamp_min(0).unsqueeze(-1) * bk + off).reshape(b, h, tq, k * bk).clamp_max(seq_len - 1)
-    slot_ok = (sel >= 0).unsqueeze(-1).expand(b, h, tq, k, bk).reshape(b, h, tq, k * bk)
+    raw = sel.clamp_min(0).unsqueeze(-1) * bk + off  # [b, h, tq, k, bk], BEFORE clamping
+    tok = raw.reshape(b, h, tq, k * bk).clamp_max(seq_len - 1)
+    slot_ok = ((sel >= 0).unsqueeze(-1) & (raw < seq_len)).reshape(b, h, tq, k * bk)
     return tok, slot_ok
 
 

@@ -14,13 +14,21 @@
 """Phase-2 (sparse) exit criteria for Qwen3 + MSA. See docs/qwen3_4b_msa/phase2_plan.md §9 step 2-3.
 
 Covers:
-  D1 dense equivalence — with k >= n_blocks the sparse path reproduces dense-attention logits
+  D1 dense equivalence — with k >= n_blocks the sparse path reproduces dense-attention logits,
+     swept over BLOCK-ALIGNED and NON-ALIGNED lengths. The non-aligned cases are load-bearing: the
+     final block is then only partly filled, and its surplus slots used to alias onto the last token
+     (see tests/msa/test_selected_token_index.py). This test previously ran only at seq_len=512,
+     and 512 % 128 == 0 — the one case with zero surplus slots — so it could never fire.
   D2 teacher identity — the KL matches an INDEPENDENT reimplementation of steps D-E (which pins the
      teacher to the group-mean of the forward's own weights, Eq. 9)
   D3 the KL gradient survives per-tile checkpointing (the graph-less-side-effect trap, §1.1)
   D4 dL/dS = P_idx - P on the restricted support
   D5 gradient wiring: L_LM -> base only, L_KL -> index branch only
   D6 no NaN when the sequence is shorter than k*B_k, or with padding
+  D7 dense equivalence with micro_batch_size_per_gpu > 1: a PADDED batch of unequal-length rows must
+     match dense PER ROW. With mbs>1 the tensor width is the longest row, so shorter rows' surplus
+     slots land on padding (already masked by the bias gather) while only the longest row's land on
+     a real token -- meaning the mbs=1 setting the training runs use is the worst case for this.
 
 Run:
   cd <repo> && PYTHONPATH=$(pwd) python3 tests/msa/test_qwen3_msa_phase2.py
@@ -50,10 +58,22 @@ def check(name, cond, detail=""):
     print(f"  [{OK if cond else FAIL}] {name}" + (f"  ({detail})" if detail else ""))
 
 
+def dense_fwd(model, cfg, ids):
+    """Dense-attention logits for `ids`, by flipping the shared MSAConfig to the stock path."""
+    prev = cfg.mode
+    cfg.mode = "dense_warmup"
+    try:
+        return model(input_ids=ids).logits.clone()
+    finally:
+        cfg.mode = prev
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/cb/ml-eng/aarti/models/qwen3_0p6b")
-    ap.add_argument("--seq-len", type=int, default=512)
+    ap.add_argument("--seq-len", type=int, default=512, help="length used by D2-D6")
+    ap.add_argument("--d1-lens", type=int, nargs="+", default=[512, 500, 385, 300],
+                    help="D1 sweep; MUST include non-multiples of 128")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
 
@@ -65,7 +85,7 @@ def main():
     model = model.to(a.device).eval()
     cfg_hf = model.config
     T, bk = a.seq_len, 128
-    n_blocks = T // bk
+    n_blocks = -(-T // bk)  # ceil
     ids = torch.randint(0, cfg_hf.vocab_size, (1, T), device=a.device)
 
     with torch.no_grad():
@@ -78,11 +98,25 @@ def main():
     install_kl_accumulation(model)
 
     print("\n-- D1. dense equivalence: k >= n_blocks reproduces dense attention --")
+    for T1 in a.d1_lens:
+        nb1 = -(-T1 // bk)  # CEIL: `T // bk` under-counts a partial final block and would set k too low
+        ids1 = ids[:, :T1] if T1 <= T else torch.randint(0, cfg_hf.vocab_size, (1, T1), device=a.device)
+        cfg.top_k = nb1
+        with torch.no_grad():
+            ref1 = dense_fwd(model, cfg, ids1)
+            out1 = model(input_ids=ids1)
+        d = (out1.logits - ref1).abs().max().item()
+        rel = d / ref1.abs().max().item()
+        tag = "aligned" if T1 % bk == 0 else f"NON-aligned, {bk - T1 % bk} surplus slots"
+        check(f"T={T1} ({tag}): sparse == dense", rel < 1e-4, f"max|delta| = {d:.3e}, rel = {rel:.2e}")
+        # The final position is the ONLY one the partial-block aliasing ever reached, so assert it
+        # on its own -- a max over all positions can be dominated by unrelated noise elsewhere.
+        dl = (out1.logits[:, -1] - ref1[:, -1]).abs().max().item()
+        check(f"T={T1}: LAST position matches", dl / ref1[:, -1].abs().max().item() < 1e-4,
+              f"max|delta| = {dl:.3e}")
+    cfg.top_k = n_blocks
     with torch.no_grad():
         out = model(input_ids=ids)
-    d = (out.logits - dense_ref).abs().max().item()
-    check("sparse path == dense logits (fp32 accumulation noise)", d / dense_ref.abs().max().item() < 1e-4,
-          f"max|delta| = {d:.3e}, relative = {d / dense_ref.abs().max().item():.2e}")
     check("KL finite and positive", torch.isfinite(model._msa_indexer_kl) and model._msa_indexer_kl > 0,
           f"{model._msa_indexer_kl.item():.4f}")
     cfg.top_k = 1
@@ -91,6 +125,7 @@ def main():
     check("k=1 genuinely restricts (logits move a lot)",
           (out1.logits - dense_ref).abs().max().item() > 1.0,
           f"max|delta| = {(out1.logits - dense_ref).abs().max().item():.3e}")
+    cfg.top_k = n_blocks
 
     print("\n-- D2. the KL matches an independent reimplementation of steps D-E --")
     cfg.top_k = 2
@@ -189,6 +224,34 @@ def main():
     check("padded batch: logits and KL finite (all-masked-row guard)",
           torch.isfinite(op.logits).all() and torch.isfinite(model._msa_indexer_kl),
           f"kl = {model._msa_indexer_kl.item():.4f}")
+
+    print("\n-- D7. dense equivalence with a PADDED batch (micro_batch_size_per_gpu > 1) --")
+    cfg.kl_checkpoint = False
+    lens = [300, 411, 512]                       # unequal; 300 and 411 are NON-aligned
+    Tmax = max(lens)
+    cfg.top_k = -(-Tmax // bk)                   # k >= n_blocks -> must degenerate to dense
+    ids_b = torch.zeros(len(lens), Tmax, dtype=torch.long, device=a.device)
+    am_b = torch.zeros(len(lens), Tmax, dtype=torch.long, device=a.device)
+    for i, L in enumerate(lens):
+        ids_b[i, :L] = torch.randint(0, cfg_hf.vocab_size, (L,), device=a.device)
+        am_b[i, :L] = 1
+    pos_b = (am_b.cumsum(-1) - 1).clamp_min(0)
+    with torch.no_grad():
+        prev_mode = cfg.mode
+        cfg.mode = "dense_warmup"
+        ref_b = model(input_ids=ids_b, attention_mask=am_b, position_ids=pos_b).logits.clone()
+        cfg.mode = prev_mode
+        out_b = model(input_ids=ids_b, attention_mask=am_b, position_ids=pos_b).logits
+    check("batched logits finite", bool(torch.isfinite(out_b).all()))
+    for i, L in enumerate(lens):
+        # Only the REAL tokens of each row are meaningful; padded positions are not.
+        d = (out_b[i, :L] - ref_b[i, :L]).abs().max().item()
+        rel = d / ref_b[i, :L].abs().max().item()
+        check(f"row {i} (len {L}{', longest' if L == Tmax else ''}): sparse == dense", rel < 1e-4,
+              f"max|delta| = {d:.3e}, rel = {rel:.2e}")
+        dl = (out_b[i, L - 1] - ref_b[i, L - 1]).abs().max().item()
+        check(f"row {i}: its LAST real token matches", dl / ref_b[i, L - 1].abs().max().item() < 1e-4,
+              f"max|delta| = {dl:.3e}")
 
     print(f"\n{sum(_results)}/{len(_results)} checks passed")
     return 0 if all(_results) else 1
