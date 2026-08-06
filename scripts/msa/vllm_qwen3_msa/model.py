@@ -107,6 +107,26 @@ def _ensure_m3_rope_fields(config: PretrainedConfig) -> None:
         config.partial_rotary_factor = float(rope.get("partial_rotary_factor", 1.0))
 
 
+
+def _consumers_transpose_topk_buffer() -> bool:
+    """Does this vLLM transpose `topk_indices_buffer` itself before handing it to the kernels?
+
+    True  -> upstream is fixed; allocate token-major exactly as `nvidia/model.py` does.
+    False -> vLLM 0.26.0; we must supply the head-major view (see the call site).
+
+    Detected from the source rather than `vllm.__version__` so that an upgrade flips this
+    automatically instead of silently double-transposing.
+    """
+    import inspect
+
+    try:
+        from vllm.models.minimax_m3.common.indexer import MiniMaxM3IndexerTritonImpl
+
+        return "transpose(0, 1)" in inspect.getsource(MiniMaxM3IndexerTritonImpl.forward)
+    except Exception:  # noqa: BLE001 - unknown layout: assume unfixed, matching 0.26.0
+        return False
+
+
 def sparse_layer_ids(config: PretrainedConfig) -> set[int]:
     """Layer ids carrying an index branch, read the way vLLM reads it.
 
@@ -238,13 +258,31 @@ class Qwen3MSAModel(Qwen2Model):
             # (nvidia/model.py:795-806). Plain attribute, NOT a Parameter/buffer, so it never
             # enters state_dict or gets pickled onto hf_config (DSA model.py:152-154).
             max_toks = vllm_config.scheduler_config.max_num_batched_tokens
+            n_idx_heads = int(sac["sparse_num_index_heads"])
             buf = torch.empty(
                 (max_toks + 3) // 4 * 4,
-                int(sac["sparse_num_index_heads"]),
+                n_idx_heads,
                 int(sac["sparse_topk_blocks"]),
                 dtype=torch.int32,
                 device=current_platform.device_type,
             )
+            if not _consumers_transpose_topk_buffer():
+                # vLLM 0.26.0 BUG: `nvidia/model.py` allocates this buffer token-major
+                # [tokens, heads, topk], but BOTH consumers index it head-major --
+                # `indexer.py` writes `out=buf[:, nd:, :]` and `sparse_attention.py` reads
+                # `topk[:, :nd, :]`, where `nd` is a DECODE TOKEN COUNT. Neither transposes.
+                # Fixed after 0.26.0 by adding the transposes upstream; we hand them the
+                # already-transposed view, which is bit-identical (contiguous [T,H,K] has
+                # strides (H*K, K, 1); .transpose(0,1) gives [H,T,K] strides (K, H*K, 1) --
+                # exactly the tensor the fixed upstream builds).
+                #
+                # Symptom if wrong in EITHER direction: `CUDA error: an illegal memory access`
+                # once a decode batch exceeds num_index_heads (8 here) -- so it is invisible to
+                # single-request testing and only appears under real concurrency. Guarded by
+                # source inspection rather than a version string so an upgrade cannot silently
+                # double-transpose; see tests/msa/test_concurrency_regression.py.
+                buf = buf.transpose(0, 1)
+                assert buf.shape[0] == n_idx_heads, "pre-transpose left the wrong layout"
         self.topk_indices_buffer = buf
 
         def _layer(config, cache_config, quant_config, prefix):

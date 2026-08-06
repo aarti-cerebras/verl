@@ -46,7 +46,7 @@ import sys
 
 import torch
 
-MODEL = "/cb/ml-eng/aarti/msa/serving/k8_step1400"
+MODEL = os.environ.get("S3_MODEL", "/cb/ml-eng/aarti/msa/serving/k8_step1400")
 NOSHIFT = MODEL + "_noshift"
 TOKENS = "/tmp/p4/s3_tokens.json"
 VOUT = "/tmp/p4/s3_vllm.json"

@@ -40,7 +40,8 @@ CMD=("$PY" "$REPO/scripts/msa/serving/serve_msa_entry.py"
   --max-model-len "$MAX_LEN"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --dtype bfloat16
-  --enforce-eager)          # R2 (cudagraph capture) unresolved; revisit in P5
+  --enforce-eager           # R2 (cudagraph capture) unresolved; revisit in P5
+  ${EXTRA_ARGS:-})          # extra flags, e.g. --no-enable-prefix-caching
 
 {
   echo "=== SERVE-MSA MANIFEST ==="
