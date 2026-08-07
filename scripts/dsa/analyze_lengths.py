@@ -36,8 +36,10 @@ PCTLS = [10, 25, 50, 75, 90, 95, 99, 99.9]
 # histogram bin edges (open-ended top bin appended at runtime)
 HIST_EDGES_PROMPT = [0, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 HIST_EDGES_RESP = [0, 512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768]
-# Qwen3-Thinking chat wrapper around the prompt: <|im_start|>user \n … <|im_end|> \n <|im_start|>
-# assistant \n <think> \n  = 10 tokens (docs/qwen3_4b_msa/phase2_data_gen.md §5.1)
+# Fixed chat wrapper around the prompt, in tokens. Qwen3-Thinking: <|im_start|>user \n … <|im_end|> \n
+# <|im_start|> assistant \n <think> \n = 10 (docs/qwen3_4b_msa/phase2_data_gen.md §5.1). gpt-oss/harmony
+# prepends a whole system message instead and is **67** (docs/gpt_oss_20b_msa/phase2_data_gen.md §3), so
+# this is a default, not a constant -- override with --chat-wrapper-tokens.
 CHAT_WRAPPER_TOKENS = 10
 
 
@@ -86,6 +88,9 @@ def main():
     ap.add_argument("--window", type=int, default=32768,
                     help="training/generation window; the per-row generation budget is "
                          "window - prompt_tokens - wrapper (see phase2_data_gen.md §5.1)")
+    ap.add_argument("--chat-wrapper-tokens", type=int, default=CHAT_WRAPPER_TOKENS,
+                    help="fixed chat-template overhead around the prompt. 10 for Qwen3-Thinking (default), "
+                         "**67 for gpt-oss/harmony** — pass it or the generation-budget report is off by 57")
     ap.add_argument("--cap-percentile", type=float, default=99, help="percentile for recommended max_new_tokens")
     ap.add_argument("--cap-margin", type=float, default=1.15, help="multiply the percentile by this for the cap")
     args = ap.parse_args()
@@ -151,7 +156,7 @@ def main():
         elif r.get("prefix_tokens") is not None:
             r["_tt"] = int(r["prefix_tokens"]) + rt + 1
         else:
-            r["_tt"] = CHAT_WRAPPER_TOKENS + it + rt + 1
+            r["_tt"] = args.chat_wrapper_tokens + it + rt + 1
         by_dom.setdefault(r.get(args.group_by, "?"), []).append(r)
 
     report = {"window": args.window, "group_by": args.group_by, "prompts_only": prompts_only,
@@ -164,7 +169,7 @@ def main():
         s["input_hist"] = _hist("PROMPT tokens", it, HIST_EDGES_PROMPT, logger)
 
         # generation budget left inside the window for each prompt (§5.1)
-        budget = np.asarray([args.window - CHAT_WRAPPER_TOKENS - 1 - x for x in it])
+        budget = np.asarray([args.window - args.chat_wrapper_tokens - 1 - x for x in it])
         s["gen_budget"] = _stats("GEN_BUDGET", budget, logger)
         s["gen_budget_lt_8192_frac"] = round(float(np.mean(budget < 8192)), 5)
         s["prompt_exceeds_window_frac"] = round(float(np.mean(budget <= 0)), 5)

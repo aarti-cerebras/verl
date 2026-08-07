@@ -40,7 +40,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _dsa_log import setup_logging  # noqa: E402
-from _dsa_tok import chat_prefix_ids  # noqa: E402
+from _dsa_tok import chat_prefix_ids, pin_template_kwargs  # noqa: E402
 
 # Per-domain max_new_tokens: math/code (incl. ZH math) = 16K ("cap high, filter after"); all others = 4K.
 DEFAULT_CAPS = {
@@ -48,6 +48,24 @@ DEFAULT_CAPS = {
     "Chinese-general": 4096, "IF": 4096, "Knowledge": 4096, "Multi-lang-Knowledge": 4096,
 }
 DEFAULT_CAP_FALLBACK = 4096
+
+
+def _template_kwargs(args, logger):
+    """Extra ``apply_chat_template`` kwargs, with non-deterministic template state pinned.
+
+    Needed by harmony (gpt-oss): its system message carries ``Reasoning: {effort}`` and a
+    ``strftime_now`` current date, so without pinning, the served prefix silently depends on a default
+    and on the wall-clock day. See _dsa_tok.pin_template_kwargs.
+    """
+    extra = json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else {}
+    if args.reasoning_effort:
+        extra["reasoning_effort"] = args.reasoning_effort
+    tpl = pin_template_kwargs(extra, args.pin_date)
+    if tpl:
+        logger.info("chat-template kwargs: %s%s",
+                    {k: v for k, v in tpl.items() if k != "strftime_now"},
+                    f" (date pinned to {args.pin_date})" if args.pin_date else "")
+    return tpl
 
 
 def _pctl(xs, q):
@@ -108,6 +126,10 @@ def _row(p, resp_text, prompt_tokens, resp_tokens, finish, args, caps, *,
         row["resp_token_ids"] = list(resp_token_ids)
     if args.fit_window:
         row["window"] = args.fit_window
+    if args.reasoning_effort:
+        row["reasoning_effort"] = args.reasoning_effort
+    if args.pin_date:
+        row["pin_date"] = args.pin_date
     return row
 
 
@@ -142,6 +164,7 @@ def run_vllm(prompts, tok, args, caps, logger):
         logger.info("nothing to do — all prompts already generated")
         return results
 
+    tpl = _template_kwargs(args, logger)
     max_cap = max(list(caps.values()) + [DEFAULT_CAP_FALLBACK])
     max_model_len = args.max_model_len or (args.fit_window or (max_cap + 4096))
     logger.info("vLLM: tp=%d dtype=%s max_model_len=%d gpu_mem_util=%.2f chunk=%d fit_window=%s",
@@ -165,10 +188,11 @@ def run_vllm(prompts, tok, args, caps, logger):
                 # The prefix we record for training comes back from the engine itself as
                 # `o.prompt_token_ids` (what generation actually conditioned on), which is a stronger
                 # guarantee than tokenizing it ourselves. phase2_data_gen.md §6.
-                text = tok.apply_chat_template(p["messages"], add_generation_prompt=True, tokenize=False)
-                prefix_ids = chat_prefix_ids(tok, p["messages"])
+                text = tok.apply_chat_template(p["messages"], add_generation_prompt=True, tokenize=False, **tpl)
+                prefix_ids = chat_prefix_ids(tok, p["messages"], **tpl)
                 if args.fit_window:
-                    # generation window == training window: leave room for the closing <|im_end|>
+                    # generation window == training window: leave room for the closing turn-end token
+                    # (<|im_end|> on Qwen3, <|return|> on harmony).
                     cap = args.fit_window - len(prefix_ids) - 1
                     if cap <= 0:
                         n_skipped_nofit += 1
@@ -220,6 +244,7 @@ def run_hf(prompts, tok, args, caps, logger):
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
+    tpl = _template_kwargs(args, logger)
     by_dom = {}
     for i, p in enumerate(prompts):
         by_dom.setdefault(p["domain"], []).append(i)
@@ -228,8 +253,8 @@ def run_hf(prompts, tok, args, caps, logger):
         cap = caps.get(dom, DEFAULT_CAP_FALLBACK)
         for s in range(0, len(idxs), args.hf_batch_size):
             bi = idxs[s : s + args.hf_batch_size]
-            texts = [tok.apply_chat_template(prompts[i]["messages"], add_generation_prompt=True, tokenize=False)
-                     for i in bi]
+            texts = [tok.apply_chat_template(prompts[i]["messages"], add_generation_prompt=True,
+                                             tokenize=False, **tpl) for i in bi]
             enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
                       max_length=(args.max_model_len or cap + 4096)).to(model.device)
             with torch.no_grad():
@@ -274,6 +299,14 @@ def launch_dp(args, logger):
                "--tensor-parallel-size", str(tp), "--gpu-memory-utilization", str(args.gpu_memory_utilization),
                "--num-nodes", str(args.num_nodes), "--node-rank", str(args.node_rank),
                "--dp-rank", str(r), "--dp-world", str(dp)]
+        # Template state must reach the children verbatim: a replica that fell back to the default
+        # reasoning effort, or to a live date, would silently write prefixes unlike its 7 siblings'.
+        if args.reasoning_effort:
+            cmd += ["--reasoning-effort", args.reasoning_effort]
+        if args.pin_date:
+            cmd += ["--pin-date", args.pin_date]
+        if args.chat_template_kwargs:
+            cmd += ["--chat-template-kwargs", args.chat_template_kwargs]
         if args.max_new_tokens_json:
             cmd += ["--max-new-tokens-json", args.max_new_tokens_json]
         if args.max_model_len:
@@ -330,6 +363,16 @@ def main():
                     help="generation window == training window (e.g. 32768): per-row max_tokens = "
                          "window - len(prefix) - 1, so no sample can exceed the training length. "
                          "Overrides the per-domain caps. See docs/qwen3_4b_msa/phase2_data_gen.md §5.1")
+    ap.add_argument("--reasoning-effort", default=None, choices=["low", "medium", "high"],
+                    help="harmony (gpt-oss) template variable -> the 'Reasoning: X' line of the system "
+                         "message. Drives trace length, so it drives the whole decode-long yield. The "
+                         "template defaults to 'medium'; pass it explicitly so the run log is truthful")
+    ap.add_argument("--pin-date", default=None, metavar="YYYY-MM-DD",
+                    help="pin the harmony template's strftime_now() date. WITHOUT this, gpt-oss bakes the "
+                         "wall-clock day into every served prefix, so a resumed run disagrees with its "
+                         "first leg and training skews from serving the moment the date rolls over")
+    ap.add_argument("--chat-template-kwargs", default=None,
+                    help='extra apply_chat_template kwargs as JSON, e.g. \'{"reasoning_effort":"high"}\'')
     ap.add_argument("--n", type=int, default=1, help="samples per prompt; each becomes its own row (sample_idx)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--repetition-penalty", type=float, default=1.0)

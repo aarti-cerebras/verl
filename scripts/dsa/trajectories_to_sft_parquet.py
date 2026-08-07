@@ -33,7 +33,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _dsa_log import setup_logging  # noqa: E402
-from _dsa_tok import chat_prefix_ids  # noqa: E402
+from _dsa_tok import chat_prefix_ids, pin_template_kwargs  # noqa: E402
 
 KEEP = ["messages", "domain", "lang", "source_uid", "source_config", "prompt_sha256",
         "prompt_tokens", "resp_tokens", "total_tokens", "finish_reason"]
@@ -42,6 +42,45 @@ KEEP_IDS = ["input_ids", "loss_mask", "length", "bucket", "domain", "lang", "sou
 
 # Qwen3-Thinking marker token ids (verified against the checkpoint; see phase2_data_gen.md §5.1/§7)
 TOK_IM_START, TOK_IM_END, TOK_THINK_OPEN, TOK_THINK_CLOSE = 151644, 151645, 151667, 151668
+
+# Harmony (gpt-oss) marker tokens. IDs are RESOLVED FROM THE TOKENIZER at runtime rather than hardcoded --
+# these literals are only the expected values, asserted in _harmony_markers(). Verified against
+# openai/gpt-oss-20b (identical to gpt-oss-120b). See docs/gpt_oss_20b_msa/phase2_data_gen.md §6.
+HARMONY_EXPECTED = {"<|return|>": 200002, "<|constrain|>": 200003, "<|channel|>": 200005,
+                    "<|start|>": 200006, "<|end|>": 200007, "<|message|>": 200008, "<|call|>": 200012}
+
+
+def _harmony_markers(tok):
+    """Resolve harmony marker ids from `tok`, asserting they match the known gpt-oss values."""
+    m = {}
+    for name, expected in HARMONY_EXPECTED.items():
+        tid = tok.convert_tokens_to_ids(name)
+        assert tid is not None and tid != tok.unk_token_id, (
+            f"{name} is not a token of this tokenizer -- --chat-format harmony needs a gpt-oss tokenizer")
+        assert tid == expected, (
+            f"harmony marker {name} resolved to {tid}, expected {expected}. The tokenizer changed; "
+            f"re-verify the §6 splice contract before generating.")
+        m[name] = tid
+    return m
+
+
+def _harmony_channels(resp_ids, mk, tok):
+    """Channel headers in a harmony completion, as [(channel_name, message_start_index), ...].
+
+    The channel NAME is ordinary text between <|channel|> and <|message|>, not a special token, so it has
+    to be decoded. Only the 1-3 header tokens are decoded -- never the payload -- so this stays an
+    inspection, with no decode/re-encode round trip on anything that reaches input_ids.
+    """
+    out = []
+    for i, t in enumerate(resp_ids):
+        if t != mk["<|channel|>"]:
+            continue
+        try:
+            j = resp_ids.index(mk["<|message|>"], i + 1)
+        except ValueError:
+            continue  # header truncated mid-way; the caller's structural checks catch it
+        out.append((tok.decode(resp_ids[i + 1: j]).strip(), j + 1))
+    return out
 
 
 def _bucket(total):
@@ -64,6 +103,42 @@ def _repetition_frac(ids, ngram=32, min_repeats=8):
     if worst < min_repeats:
         return 0.0
     return min(1.0, worst * ngram / len(ids))
+
+
+def _malformed_harmony(resp_ids, args, mk, tok, counters):
+    """§7 structural health checks for a harmony (gpt-oss) completion.
+
+    The served prefix ends at ``<|start|>assistant``, so a well-formed completion is exactly:
+
+        <|channel|>analysis<|message|>{CoT}<|end|><|start|>assistant<|channel|>final<|message|>{answer}<|return|>
+
+    Note this legitimately contains an INTERNAL ``<|start|>assistant``, between the analysis and final
+    channels. The Qwen3 checks cannot be reused: their ``role_marker_leak`` rule (any <|im_start|> in the
+    response) would reject 100 % of gpt-oss rows.
+    """
+    if len(resp_ids) < 8:
+        return "stub"
+    if mk["<|call|>"] in resp_ids or mk["<|constrain|>"] in resp_ids:
+        return "tool_call_leak"  # we serve no tools, so a tool call is a template/prompt break
+    chans = _harmony_channels(resp_ids, mk, tok)
+    if not chans:
+        return "no_channel_header"
+    names = [c for c, _ in chans]
+    if "commentary" in names:
+        return "commentary_channel"  # preamble/tool-call scaffolding; not a clean user-facing answer
+    if names.count("final") == 0:
+        return "no_final_channel"  # reasoned, then stopped without ever opening the answer channel
+    if names.count("final") > 1:
+        return "multiple_final"  # the template's channel split would mis-parse -> train/serve divergence
+    if names[0] != "analysis":
+        counters["no_analysis_first"] = counters.get("no_analysis_first", 0) + 1  # legal but worth watching
+    start = [i for c, i in chans if c == "final"][0]
+    tail = [t for t in resp_ids[start:] if t not in (mk["<|return|>"], mk["<|end|>"], mk["<|start|>"])]
+    if not tail or not tok.decode(tail).strip():
+        return "empty_answer"
+    if _repetition_frac(resp_ids) > args.max_repetition_frac:
+        return "repetition_loop"
+    return None
 
 
 def _malformed(resp_ids, args):
@@ -89,8 +164,8 @@ def _malformed(resp_ids, args):
     return None
 
 
-def _prefix_ids(tok, messages):
-    return chat_prefix_ids(tok, [m for m in messages if m.get("role") != "assistant"])
+def _prefix_ids(tok, messages, tpl):
+    return chat_prefix_ids(tok, [m for m in messages if m.get("role") != "assistant"], **tpl)
 
 
 def to_input_ids_rows(rows, args, logger):
@@ -99,6 +174,22 @@ def to_input_ids_rows(rows, args, logger):
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     out, counters = [], {}
+
+    harmony = args.chat_format == "harmony"
+    mk = _harmony_markers(tok) if harmony else None
+    # The turn-terminator appended when the sample did not end on one. On harmony this is <|return|>, not
+    # <|end|>: the template itself renders a FINAL assistant turn with <|return|> (chat_template.jinja
+    # "<|return|> indicates the end of generation, but <|end|> does not"), it is the config eos, and it is
+    # what the model actually sampled -- so it is both the spec-correct and the on-policy choice.
+    terminal = mk["<|return|>"] if harmony else TOK_IM_END
+    # Prefix rebuild must use the SAME template state the generator served under, or every row trips the
+    # prefix_rebuild_differs counter and the cross-check becomes noise.
+    tpl = pin_template_kwargs(
+        json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else {}, args.pin_date)
+    if args.reasoning_effort:
+        tpl["reasoning_effort"] = args.reasoning_effort
+    logger.info("chat_format=%s terminal_token=%d template_kwargs=%s", args.chat_format, terminal,
+                {k: v for k, v in tpl.items() if k != "strftime_now"})
 
     def bump(k):
         counters[k] = counters.get(k, 0) + 1
@@ -115,7 +206,8 @@ def to_input_ids_rows(rows, args, logger):
                 continue
             bump("truncated_kept")
         else:
-            cls = _malformed(resp_ids, args)
+            cls = (_malformed_harmony(resp_ids, args, mk, tok, counters) if harmony
+                   else _malformed(resp_ids, args))
             if cls:
                 bump(cls)
                 continue
@@ -123,7 +215,7 @@ def to_input_ids_rows(rows, args, logger):
         # `messages` is the fallback + cross-check. Using the served ids makes the mask exact regardless of
         # tokenizer/template version drift between generation and conversion.
         served = r.get("prefix_token_ids")
-        rebuilt = _prefix_ids(tok, r["messages"])
+        rebuilt = _prefix_ids(tok, r["messages"], tpl)
         if served:
             pre = [int(t) for t in served]
             if list(pre) != list(rebuilt):
@@ -138,8 +230,8 @@ def to_input_ids_rows(rows, args, logger):
                              r.get("prompt_sha256"), len(pre), rec)
                 continue
         ids = pre + resp_ids
-        if ids[-1] != TOK_IM_END:
-            ids = ids + [TOK_IM_END]
+        if ids[-1] != terminal:
+            ids = ids + [terminal]
         if len(ids) > args.max_length:
             bump("over_window")
             logger.error("row exceeds --max-length %d (len=%d) — check --fit-window at generation time",
@@ -176,6 +268,15 @@ def main():
                          "for Qwen3-Thinking: per-message chat templating DELETES <think> traces "
                          "(docs/qwen3_4b_msa/phase2_data_gen.md §6)")
     ap.add_argument("--tokenizer", default=None, help="model dir (required with --emit-input-ids)")
+    ap.add_argument("--chat-format", default="qwen3-think", choices=["qwen3-think", "harmony"],
+                    help="response grammar used by the §7 health filters and the terminal token. "
+                         "'harmony' = gpt-oss channels (analysis/final); the qwen3-think checks reject "
+                         "100%% of harmony rows, so this is not optional for gpt-oss")
+    ap.add_argument("--reasoning-effort", default=None, choices=["low", "medium", "high"])
+    ap.add_argument("--pin-date", default=None, metavar="YYYY-MM-DD",
+                    help="must match the value used at generation time, or the rebuilt prefix cross-check "
+                         "disagrees with the served prefix on every row")
+    ap.add_argument("--chat-template-kwargs", default=None, help="extra apply_chat_template kwargs as JSON")
     ap.add_argument("--max-length", type=int, default=32768, help="training window; rows longer than this fail loudly")
     ap.add_argument("--max-repetition-frac", type=float, default=0.30,
                     help="drop if a 32-token n-gram repeating >=8x covers more than this fraction of the trace")

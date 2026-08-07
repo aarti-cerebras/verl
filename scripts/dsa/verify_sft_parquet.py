@@ -11,10 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify a spliced Qwen3-Thinking BC parquet (``--emit-input-ids`` output of trajectories_to_sft_parquet).
+"""Verify a spliced BC parquet (``--emit-input-ids`` output of trajectories_to_sft_parquet).
 
 Checks the invariants that make the data trainable, on token IDs. Exits non-zero if ANY row fails, because
-every one of these failures is silent at training time:
+every one of these failures is silent at training time. This is deliberately an INDEPENDENT re-derivation
+of the converter's §7 filters, not a call into them -- a bug in the converter that lets a bad row through
+should not also disable the check that catches it.
+
+``--chat-format qwen3-think`` (default):
 
   1. ``loss_mask == 0`` over exactly the prefix, ``== 1`` over the whole target
   2. the prefix ends with ``<think>\\n`` (151667, 198) -- i.e. the served generation prompt
@@ -23,6 +27,12 @@ every one of these failures is silent at training time:
   5. the row ends with ``<|im_end|>`` (151645) and contains no ``<|im_start|>`` in the target
   6. a non-empty answer after ``</think>``
   7. ``len(input_ids) == len(loss_mask) == length <= --max-length``
+
+``--chat-format harmony`` (gpt-oss; requires ``--tokenizer``) checks 1 and 7 identically, and replaces
+2-6 with the channel grammar: the prefix ends at ``<|start|>assistant``, the target holds exactly one
+``final`` channel, terminates on ``<|return|>``, carries no tool-call markers, and has a non-empty answer.
+Running the qwen3-think checks over a harmony parquet fails **every row** (its prefix does not end in
+``<think>`` and it has no ``</think>`` at all), so this flag is not optional for gpt-oss.
 
 The headline number it prints is the **trained-token fraction**: for a thinking model this should be very
 high (~98%), because the reasoning trace is nearly all of the sequence. A low value means the trace was
@@ -41,6 +51,54 @@ from _dsa_log import setup_logging  # noqa: E402
 
 TOK_IM_START, TOK_IM_END, TOK_THINK_OPEN, TOK_THINK_CLOSE = 151644, 151645, 151667, 151668
 WHITESPACE_IDS = {198, 271}  # "\n", "\n\n"
+
+# Harmony (gpt-oss) markers -- see docs/gpt_oss_20b_msa/phase2_data_gen.md §5.
+H_RETURN, H_CONSTRAIN, H_CHANNEL, H_START, H_END, H_MESSAGE, H_CALL = (
+    200002, 200003, 200005, 200006, 200007, 200008, 200012)
+
+
+def check_row_harmony(ids, mask, npre, max_length, tok, counters):
+    """Return a list of failed invariant names for one harmony row."""
+    bad = []
+    if not (len(ids) == len(mask) <= max_length):
+        bad.append("length")
+    if sum(mask[:npre]) != 0:
+        bad.append("mask_nonzero_over_prefix")
+    if not all(x == 1 for x in mask[npre:]):
+        bad.append("mask_not_one_over_target")
+    # The served generation prompt ends exactly here; anything else means the splice used a prefix the
+    # engine was not given.
+    if not tok.decode(ids[max(0, npre - 2): npre]).endswith("<|start|>assistant"):
+        bad.append("prefix_not_ending_in_start_assistant")
+    tgt = ids[npre:]
+    if H_CALL in tgt or H_CONSTRAIN in tgt:
+        bad.append("tool_call_marker_in_target")
+    chans = []
+    for i, t in enumerate(tgt):
+        if t != H_CHANNEL:
+            continue
+        try:
+            j = tgt.index(H_MESSAGE, i + 1)
+        except ValueError:
+            continue
+        chans.append((tok.decode(tgt[i + 1: j]).strip(), j + 1))
+    names = [c for c, _ in chans]
+    if not chans:
+        bad.append("no_channel_header")
+    if names.count("final") != 1:
+        bad.append(f"final_channel_count_{names.count('final')}")
+    if "commentary" in names:
+        bad.append("commentary_channel_in_target")
+    if names and names[0] != "analysis":
+        counters["no_analysis_first"] = counters.get("no_analysis_first", 0) + 1
+    if ids[-1] != H_RETURN:
+        bad.append("no_terminal_return")
+    if names.count("final") == 1:
+        start = [i for c, i in chans if c == "final"][0]
+        answer = [t for t in tgt[start:] if t not in (H_RETURN, H_END, H_START)]
+        if not answer or not tok.decode(answer).strip():
+            bad.append("empty_answer")
+    return bad
 
 
 def check_row(ids, mask, npre, max_length):
@@ -79,20 +137,36 @@ def main():
     ap.add_argument("--max-length", type=int, default=32768)
     ap.add_argument("--log-dir", default=None)
     ap.add_argument("--max-report", type=int, default=20, help="how many failing rows to list")
+    ap.add_argument("--chat-format", default="qwen3-think", choices=["qwen3-think", "harmony"],
+                    help="response grammar. The qwen3-think checks fail EVERY harmony row")
+    ap.add_argument("--tokenizer", default=None, help="model dir (required with --chat-format harmony)")
     args = ap.parse_args()
+    assert not (args.chat_format == "harmony" and not args.tokenizer), \
+        "--chat-format harmony requires --tokenizer (channel names are text, not special tokens)"
 
     log_dir = args.log_dir or os.path.join(os.path.dirname(os.path.abspath(args.parquet)), "logs")
     logger, _ = setup_logging("verify_sft_parquet", log_dir)
     logger.info("config: %s", vars(args))
 
+    tok = None
+    if args.chat_format == "harmony":
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+        for name, tid in (("<|return|>", H_RETURN), ("<|channel|>", H_CHANNEL), ("<|start|>", H_START),
+                          ("<|message|>", H_MESSAGE), ("<|end|>", H_END), ("<|call|>", H_CALL)):
+            assert tok.convert_tokens_to_ids(name) == tid, \
+                f"{name} is {tok.convert_tokens_to_ids(name)}, expected {tid} -- not a gpt-oss tokenizer?"
+
     df = pd.read_parquet(args.parquet)
     logger.info("loaded %d rows from %s", len(df), args.parquet)
 
-    failures, per_check = [], {}
+    failures, per_check, counters = [], {}, {}
     trained = total = 0
     for i, r in enumerate(df.itertuples()):
         ids, mask, npre = list(r.input_ids), list(r.loss_mask), int(r.prefix_tokens)
-        bad = check_row(ids, mask, npre, args.max_length)
+        bad = (check_row_harmony(ids, mask, npre, args.max_length, tok, counters) if tok
+               else check_row(ids, mask, npre, args.max_length))
         for b in bad:
             per_check[b] = per_check.get(b, 0) + 1
         if bad:
@@ -101,6 +175,8 @@ def main():
         total += len(ids)
 
     logger.info("trained tokens: %d / %d (%.1f%% — prompt masked)", trained, total, 100.0 * trained / max(total, 1))
+    if counters:
+        logger.info("non-fatal counters: %s", counters)
     for col in ("domain", "bucket", "finish_reason"):
         if col in df.columns:
             logger.info("by %s: %s", col, df[col].value_counts().to_dict())

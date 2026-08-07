@@ -26,9 +26,28 @@ land one token past the training window. Always go through ``chat_prefix_ids``.
 """
 
 
-def chat_prefix_ids(tok, messages, add_generation_prompt=True):
+def pin_template_kwargs(kwargs=None, pin_date=None):
+    """Normalise the extra ``apply_chat_template`` kwargs, pinning any non-deterministic template state.
+
+    gpt-oss / harmony templates build their system message with ``strftime_now("%Y-%m-%d")``, so the
+    **generation date is baked into every prefix**. Left alone that means (a) a resumed or re-run
+    generation produces different prefixes than the first leg, and (b) training and serving skew by one
+    line as soon as the date rolls over. Jinja context variables shadow globals, so passing
+    ``strftime_now`` as a kwarg pins it (verified against gpt-oss-20b, transformers 4.57).
+
+    ``reasoning_effort`` is likewise a real template variable on harmony (default "medium"); pass it
+    explicitly so the run log records what was actually served rather than a default that can move.
+    """
+    out = dict(kwargs or {})
+    if pin_date:
+        out["strftime_now"] = lambda fmt, _d=pin_date: _d if fmt == "%Y-%m-%d" else _d
+    return out
+
+
+def chat_prefix_ids(tok, messages, add_generation_prompt=True, **tpl_kwargs):
     """Token ids of the templated prefix, as a flat ``list[int]``, on transformers 4.x and 5.x alike."""
-    out = tok.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, tokenize=True)
+    out = tok.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, tokenize=True,
+                                  **tpl_kwargs)
     if hasattr(out, "keys"):  # transformers 5.x BatchEncoding (or return_dict=True)
         assert "input_ids" in out, f"chat template output has no input_ids: {list(out.keys())}"
         out = out["input_ids"]
