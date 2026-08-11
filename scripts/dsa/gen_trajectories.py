@@ -33,7 +33,9 @@ Output JSONL row: {source_uid, source_dataset, source_config, domain, lang, prom
 
 import argparse
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -86,6 +88,59 @@ def _log_dist(logger, rows):
             round(100 * sum(x >= 512 for x in rl) / len(rl)),
             round(100 * sum(x >= 1024 for x in rl) / len(rl)),
         )
+
+
+class _PreemptionSentinel(logging.Handler):
+    """Catch vLLM's own preemption reporting by listening to its logger.
+
+    At a 131,072 window KV is 18.0 GiB per sequence (~6 per H200). If the scheduler admits more than
+    KV holds, vLLM preempts and RECOMPUTES — and recomputing a 100K-token prefill turns a slow run
+    into a stalled one. It surfaces as bad throughput, never as an error, so it has to be looked for.
+    ``phase2_long_context_gen.md`` §5.4 makes a nonzero count a pilot-gate failure.
+
+    Listening to the log rather than reading an engine attribute is deliberate: the v1 counter
+    (``LoggingStatLogger.num_preemptions``) is **reset every logging interval**, so sampling it at the
+    end reports only the last few seconds. vLLM appends ``"Preemptions: N"`` to its periodic
+    throughput line *only when N > 0*, so accumulating those is both cumulative and version-tolerant.
+
+    Absence of the string is only meaningful if the throughput line was emitted at all — a run shorter
+    than one logging interval proves nothing, and is reported as UNVERIFIED rather than as zero.
+    """
+
+    _PREEMPT_RE = re.compile(r"Preemptions:\s*(\d+)")
+
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.total = 0
+        self.saw_throughput_line = False
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:  # a broken format string must never take down generation
+            return
+        if "Avg prompt throughput" in msg:
+            self.saw_throughput_line = True
+        m = self._PREEMPT_RE.search(msg)
+        if m:
+            self.total += int(m.group(1))
+
+    def install(self):
+        logging.getLogger("vllm").addHandler(self)
+        return self
+
+    def report(self, logger):
+        if self.total:
+            logger.warning("PREEMPTION DETECTED: %d preempted request(s). The scheduler oversubscribed "
+                           "KV and is RECOMPUTING long prefills — lower --max-num-seqs. "
+                           "phase2_long_context_gen.md §5.4 treats this as a gate FAILURE.", self.total)
+        elif self.saw_throughput_line:
+            logger.info("preemption check: 0 (vLLM emitted throughput lines and never reported a "
+                        "preemption) — §5.4 gate PASSED")
+        else:
+            logger.warning("preemption check UNVERIFIED: the run finished before vLLM emitted a single "
+                           "throughput line, so there is nothing to read. This is NOT a count of zero.")
+        return self.total
 
 
 def _row(p, resp_text, prompt_tokens, resp_tokens, finish, args, caps, *,
@@ -170,12 +225,22 @@ def run_vllm(prompts, tok, args, caps, logger):
     logger.info("vLLM: tp=%d dtype=%s max_model_len=%d gpu_mem_util=%.2f chunk=%d fit_window=%s",
                 args.tensor_parallel_size, args.dtype, max_model_len, args.gpu_memory_utilization,
                 args.chunk_size, args.fit_window or "off (per-domain caps)")
+    preempt = _PreemptionSentinel().install()
+    # vLLM's offline LLM() forces disable_log_stats=True (entrypoints/llm.py), which suppresses the
+    # periodic throughput line -- and "Preemptions: N" rides on that line. Left at the default the
+    # §5.4 gate can NEVER be evaluated: the sentinel correctly reported UNVERIFIED on all 8 replicas
+    # of the first pilot, which is how this was found. Turn stats back on; the cost is one log line
+    # every few seconds.
+    _llm_kw = {"disable_log_stats": False}
+    if args.max_num_seqs:
+        _llm_kw["max_num_seqs"] = args.max_num_seqs
     llm = LLM(model=args.model, trust_remote_code=True, tensor_parallel_size=args.tensor_parallel_size,
               dtype=args.dtype, gpu_memory_utilization=args.gpu_memory_utilization,
-              max_model_len=max_model_len, seed=args.seed)
+              max_model_len=max_model_len, seed=args.seed, **_llm_kw)
 
     written = 0
     n_skipped_nofit = 0
+    skipped_rows = []
     n_prefix_warned = False
     with open(args.out, "a") as fout:  # append -> survives crash/kill; relaunch resumes from here
         for s in range(0, len(todo), args.chunk_size):
@@ -194,8 +259,12 @@ def run_vllm(prompts, tok, args, caps, logger):
                     # generation window == training window: leave room for the closing turn-end token
                     # (<|im_end|> on Qwen3, <|return|> on harmony).
                     cap = args.fit_window - len(prefix_ids) - 1
-                    if cap <= 0:
+                    if cap <= 0 or cap < args.min_gen_budget:
                         n_skipped_nofit += 1
+                        skipped_rows.append({"prompt_sha256": p.get("prompt_sha256"),
+                                             "domain": p.get("domain"),
+                                             "prefix_tokens": len(prefix_ids),
+                                             "gen_budget": cap, "window": args.fit_window})
                         continue
                 else:
                     cap = caps.get(p["domain"], DEFAULT_CAP_FALLBACK)
@@ -229,7 +298,13 @@ def run_vllm(prompts, tok, args, caps, logger):
             logger.info("chunk done: %d/%d written (%.0f%%) -> %s",
                         written, len(todo), 100.0 * written / len(todo), args.out)
     if n_skipped_nofit:
-        logger.warning("skipped %d prompts: no room left in --fit-window=%d", n_skipped_nofit, args.fit_window)
+        sidecar = args.out + ".skipped_nofit.jsonl"
+        with open(sidecar, "a") as fh:
+            for r in skipped_rows:
+                fh.write(json.dumps(r) + "\n")
+        logger.warning("skipped %d prompts: budget below --min-gen-budget=%d in --fit-window=%d -> %s",
+                       n_skipped_nofit, args.min_gen_budget, args.fit_window, sidecar)
+    preempt.report(logger)
     return results
 
 
@@ -294,6 +369,7 @@ def launch_dp(args, logger):
                "--temperature", str(args.temperature), "--top-p", str(args.top_p),
                "--top-k", str(args.top_k), "--min-p", str(args.min_p),
                "--presence-penalty", str(args.presence_penalty), "--fit-window", str(args.fit_window),
+               "--min-gen-budget", str(args.min_gen_budget), "--max-num-seqs", str(args.max_num_seqs),
                "--n", str(args.n), "--seed", str(args.seed),
                "--repetition-penalty", str(args.repetition_penalty), "--chunk-size", str(args.chunk_size),
                "--tensor-parallel-size", str(tp), "--gpu-memory-utilization", str(args.gpu_memory_utilization),
@@ -363,6 +439,16 @@ def main():
                     help="generation window == training window (e.g. 32768): per-row max_tokens = "
                          "window - len(prefix) - 1, so no sample can exceed the training length. "
                          "Overrides the per-domain caps. See docs/qwen3_4b_msa/phase2_data_gen.md §5.1")
+    ap.add_argument("--min-gen-budget", type=int, default=0,
+                    help="with --fit-window: skip prompts leaving fewer than this many tokens to "
+                         "answer in, recording them in <out>.skipped_nofit.jsonl. The bare cap<=0 "
+                         "guard admits a 130K prompt with a 900-token budget, which is a "
+                         "truncated-trace factory. docs/qwen3_4b_msa/phase2_long_context_gen.md §5.2")
+    ap.add_argument("--max-num-seqs", type=int, default=0,
+                    help="vLLM scheduler cap (0 = engine default). At a 131,072 window KV is 18.0 GiB "
+                         "per sequence, so ~6 fit on an H200; leaving this unset lets the scheduler "
+                         "oversubscribe and preempt-with-recompute, which at 100K+ context is "
+                         "catastrophic. Runbook §5.4")
     ap.add_argument("--reasoning-effort", default=None, choices=["low", "medium", "high"],
                     help="harmony (gpt-oss) template variable -> the 'Reasoning: X' line of the system "
                          "message. Drives trace length, so it drives the whole decode-long yield. The "

@@ -54,6 +54,16 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-domain", type=int, default=25)
     ap.add_argument("--domains", nargs="+", default=None, help="restrict to these domains (default: all)")
+    # Length-band stratification. Domain alone is not enough for the long-context pilot: the numbers it
+    # exists to measure -- decode length and truncation rate -- both vary with PREFILL length, and a
+    # source like LongCite spans 16K to 138K. Sampling it flat would put almost everything in the
+    # 16-32K band and leave the 64K+ band, where the window actually bites, unmeasured.
+    # docs/qwen3_4b_msa/phase2_long_context_gen.md §10.
+    ap.add_argument("--bands", default=None,
+                    help="comma-separated prefill-token upper bounds, e.g. '32768,65536,131072,1e9'. "
+                         "With --per-band, sample N from each (domain, band) cell")
+    ap.add_argument("--per-band", type=int, default=0,
+                    help="rows per (domain, band) cell; overrides --per-domain when --bands is set")
     ap.add_argument("--exclude-sha", nargs="*", default=[],
                     help="file(s) of prompt_sha256 to skip (e.g. the frozen val split)")
     ap.add_argument("--seed", type=int, default=1234)
@@ -93,13 +103,31 @@ def main():
 
     rng = random.Random(a.seed)
     picked = []
-    for d in want:
-        pool = by[d]
-        take = rng.sample(pool, min(a.per_domain, len(pool)))
-        if len(take) < a.per_domain:
-            log.warning("  %-9s only %d available (< --per-domain %d)", d, len(take), a.per_domain)
-        log.info("  %-9s %6d available -> sampled %d", d, len(pool), len(take))
-        picked.extend(take)
+    if a.bands and a.per_band:
+        bounds = [int(float(x)) for x in a.bands.split(",")]
+        for d in want:
+            lo = 0
+            for hi in bounds:
+                cell = [r for r in by[d] if lo <= (r.get("prompt_tokens") or 0) < hi]
+                take = rng.sample(cell, min(a.per_band, len(cell)))
+                langs = collections.Counter(r.get("lang") for r in take)
+                # An empty cell is information, not an error: it says this source does not reach that
+                # band. Log it rather than silently producing a short pilot.
+                log.info("  %-11s %7s-%-7s %6d available -> sampled %-3d  lang=%s",
+                         d, lo, hi if hi < 10**8 else "max", len(cell), len(take), dict(langs))
+                if len(take) < a.per_band:
+                    log.warning("  %-11s band %s-%s SHORT: %d < --per-band %d",
+                                d, lo, hi, len(take), a.per_band)
+                picked.extend(take)
+                lo = hi
+    else:
+        for d in want:
+            pool = by[d]
+            take = rng.sample(pool, min(a.per_domain, len(pool)))
+            if len(take) < a.per_domain:
+                log.warning("  %-9s only %d available (< --per-domain %d)", d, len(take), a.per_domain)
+            log.info("  %-9s %6d available -> sampled %d", d, len(pool), len(take))
+            picked.extend(take)
 
     with open(a.out, "w") as f:
         for r in picked:

@@ -42,6 +42,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import longctx_sources  # noqa: E402
 from _dsa_log import setup_logging  # noqa: E402
 
 REPO = "openbmb/UltraData-SFT-2605"
@@ -301,6 +302,16 @@ def _load_tokenizer(path, logger):
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
 
+def _prompt_tokens_batch(tok, texts):
+    """Batched token counts. ``tokenizers.Tokenizer.encode_batch`` releases the GIL and fans out over
+    Rust threads: measured 7.4 MB/s vs 1.9 MB/s for one-at-a-time ``encode`` on real long-context
+    documents, with identical counts. That is the difference between a 2-hour and a 32-minute ChatQA2
+    extraction."""
+    if hasattr(tok, "encode_batch"):  # tokenizers.Tokenizer
+        return [len(e.ids) for e in tok.encode_batch(texts, add_special_tokens=False)]
+    return [len(x) for x in tok(texts, add_special_tokens=False)["input_ids"]]
+
+
 def _prompt_tokens(tok, text):
     """Token count of the prompt TEXT only (the chat wrapper is accounted for separately: 10 tokens for
     Qwen3-Thinking, see docs/qwen3_4b_msa/phase2_data_gen.md §5.1)."""
@@ -313,9 +324,41 @@ def main():
     ap = argparse.ArgumentParser(description="Select prompts from UltraData-SFT-2605/no_think for self-gen.")
     ap.add_argument("--out", required=True, help="output JSONL path")
     ap.add_argument("--log-dir", default=None, help="dir for the run log (default: <out dir>/logs)")
-    ap.add_argument("--source", default="ultradata", choices=["ultradata", "dolci-rl"],
+    ap.add_argument("--source", default="ultradata", choices=["ultradata", "dolci-rl", "longctx"],
                     help="prompt-source backend: 'ultradata' = openbmb/UltraData-SFT-2605 (MiniCPM3 path), "
-                         "'dolci-rl' = allenai/Dolci-Think-RL-32B (Qwen3-4B Phase-2b path)")
+                         "'dolci-rl' = allenai/Dolci-Think-RL-32B (Qwen3-4B Phase-2b path), "
+                         "'longctx' = the long-context banks of "
+                         "docs/qwen3_4b_msa/phase2_long_context_gen.md §4")
+    # --- longctx backend (docs/qwen3_4b_msa/phase2_long_context_gen.md) -----------------------------
+    lc = ap.add_argument_group("longctx backend")
+    lc.add_argument("--sources", nargs="*", default=None,
+                    help=f"subset of {sorted(longctx_sources.SOURCES)}; default = every source in "
+                         "--licence-tier")
+    lc.add_argument("--licence-tier", default="A", choices=["A", "B"],
+                    help="A = permissive/undeclared; B = ChatQA2 (CC-BY-NC-2.0). Tiers are generated "
+                         "into separate artifact dirs so the NC rows can be dropped at training-mix "
+                         "time without regenerating")
+    lc.add_argument("--window", type=int, default=131072,
+                    help="TOTAL sequence window: prompt + trace + terminator (runbook §5.1)")
+    lc.add_argument("--wrapper-tokens", type=int, default=10,
+                    help="Qwen3-Thinking chat-prefix wrapper cost; asserted live at generation time")
+    lc.add_argument("--min-gen-budget", type=int, default=8192,
+                    help="drop prompts leaving less than this many tokens to answer in (runbook §5.2); "
+                         "they go to skipped_nofit.jsonl, not silently away")
+    lc.add_argument("--min-prefill-tokens", type=int, default=16384,
+                    help="the survey's >=16K bar; every row count in the runbook assumes it. Set 0 to "
+                         "keep short rows too")
+    lc.add_argument("--max-per-document", type=int, default=0,
+                    help="cap prompts sharing one source document (0=off). NarrativeQA asks many "
+                         "questions per book, and prefill dominates cost, so each repeat re-pays for "
+                         "~130K tokens of the same text")
+    lc.add_argument("--limit-per-source", type=int, default=0,
+                    help="cap per source (0=all). SMOKE TESTS ONLY — reads sequentially from row 0, "
+                         "which is a biased sample (runbook §0 trap 3)")
+    lc.add_argument("--batch-rows", type=int, default=32, help="parquet row-group streaming batch size")
+    lc.add_argument("--tokenize-batch", type=int, default=64,
+                    help="texts per encode_batch call; ~4x faster than one-at-a-time on long documents. "
+                         "Memory is bounded by batch x doc size (64 x ~550 KB worst case)")
     ap.add_argument("--tokenizer", default=None,
                     help="model dir; when given, each row records prompt_tokens (needed to fit the 32K "
                          "generation window per row — see docs/qwen3_4b_msa/phase2_data_gen.md 5.1)")
@@ -350,11 +393,49 @@ def main():
     logger.info("config: %s", vars(args))
 
     rng = random.Random(args.seed)
-    specs = resolve_specs(args, logger)
     exclude_shas = load_exclude_shas(args.exclude_sha, logger)
 
     total_kept = 0
     lang_counts = {}
+
+    if args.source == "longctx":
+        # The shared default (100K chars) predates this backend and would drop almost every row:
+        # ChatQA2 documents reach 552K chars, LongAlign 261K. The real bound is the token window,
+        # enforced by --min-gen-budget; char bounds are only a hygiene tripwire here.
+        if args.max_prompt_chars == 100_000:
+            args.max_prompt_chars = 2_000_000
+            logger.info("longctx: raising --max-prompt-chars to %d (token window is the real bound)",
+                        args.max_prompt_chars)
+        tok = _load_tokenizer(args.tokenizer, logger) if args.tokenizer else None
+        count_batch = (lambda ts: _prompt_tokens_batch(tok, ts)) if tok is not None else None
+        tier_counts = {}
+        # Rows are written as they are accepted, not buffered: the Tier A run reached 8.9 GB RSS
+        # holding six pools in memory, and a crash before the last source would have discarded ~50
+        # minutes of tokenization. fsync per source so an interrupted run leaves a readable prefix.
+        with open(args.out, "w") as fout:
+            def emit(r):
+                nonlocal total_kept
+                fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+                total_kept += 1
+                lang_counts[r["lang"]] = lang_counts.get(r["lang"], 0) + 1
+                tier_counts[r["licence_tier"]] = tier_counts.get(r["licence_tier"], 0) + 1
+                if total_kept % 2000 == 0:
+                    fout.flush()
+
+            pools, skipped = longctx_sources.collect_longctx(
+                args, rng, logger, exclude_shas=exclude_shas, count_tokens_batch=count_batch,
+                emit=emit)
+            fout.flush()
+            os.fsync(fout.fileno())
+        skip_path = os.path.join(out_dir, "skipped_nofit.jsonl")
+        with open(skip_path, "w") as fh:
+            for r in skipped:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logger.info("DONE: wrote %d prompts (lang %s, tier %s) -> %s  [%d skipped -> %s]",
+                    total_kept, lang_counts, tier_counts, args.out, len(skipped), skip_path)
+        return
+
+    specs = resolve_specs(args, logger)
 
     if args.source == "dolci-rl":
         pools = collect_dolci_rl(args, rng, logger, exclude_shas=exclude_shas)
