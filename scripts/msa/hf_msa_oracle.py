@@ -54,8 +54,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 INDEX_RE = re.compile(r"^(.*\.self_attn)\.(index_(?:q|k)_(?:proj|norm)\.weight)$")
 
 
-def build_model(model_dir: str, device: str, dtype: torch.dtype, sparse: bool):
-    """Stock Qwen3 + the MSA monkey-patch + indexers, weights from `model_dir`."""
+def build_model(model_dir: str, device: str, dtype: torch.dtype, sparse: bool, attn_impl: str = "eager"):
+    """Stock Qwen3 + the MSA monkey-patch + indexers, weights from `model_dir`.
+
+    `attn_impl` selects the kernel for the DENSE-PREFIX layers only -- sparse layers return early
+    from their own path and never reach `attention_interface`. Default "eager" keeps the P4 oracle
+    maximally literal; pass "sdpa" for long inputs, where eager materialises a [1, H_q, T, T] score
+    matrix (63 GiB at 32K -- an immediate OOM).
+    """
     from safetensors.torch import load_file
     from transformers import AutoConfig
     from transformers.models.qwen3 import modeling_qwen3
@@ -75,7 +81,7 @@ def build_model(model_dir: str, device: str, dtype: torch.dtype, sparse: bool):
         "this export has the w-1 shift applied; the training forward uses standard RMSNorm and "
         "would compute x*(w-1). Pass the --no-norm-shift export."
     )
-    cfg._attn_implementation = "eager"
+    cfg._attn_implementation = attn_impl
 
     # Patch BEFORE constructing, so every layer gets the MSA forward.
     modeling_qwen3.Qwen3Attention.forward = qwen3_msa_attn_forward

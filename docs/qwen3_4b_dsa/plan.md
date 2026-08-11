@@ -401,7 +401,8 @@ Only if 2a's sparsity cost is unacceptable. Then:
 | base LR | **5e-6 – 1e-5** | Low; drift is the enemy. |
 | indexer LR | 1e-3 → decay to ~1e-4 | Continues from Phase 1. |
 | length mixture | 40% short (<4K) / 30% decode-long / 30% prefill-long — see [data_plan.md](data_plan.md) §5 | All-short reproduces the Phase-2-at-4096 mistake (indexer never sees 6% selection ratios); all-long regresses the short-context scorecard. |
-| code share | upweighted from the start | Code is both the most BC-fragile and the most sparsity-sensitive domain. The `--exclude-sha` net-new selection machinery already exists. |
+| code share | upweighted from the start | Code is both the most 
+-fragile and the most sparsity-sensitive domain. The `--exclude-sha` net-new selection machinery already exists. |
 | `top_k` curriculum (optional) | anneal 8192 → 2048 over the first ~30% | Sparse-from-scratch at 6% is the harder optimization problem, and the budget knob is free. |
 
 **Thinking traces are a Phase-2 asset**, not just a cost: self-generated CoT at 8–32K is naturally

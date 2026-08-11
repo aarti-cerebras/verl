@@ -266,8 +266,16 @@ training data of the form "long context + instruction + answer".
 3. **Cheapest available mitigations, if the gate fails**, in ascending cost:
    - **S1-opt** (§4): consume the Nebius agentic transcripts as raw long documents. No harness, no
      question synthesis, adds heterogeneous code-flavored long context.
-   - Any *existing* long-context instruction dataset (no synthesis on our side) — LongAlign,
-     LongAlpaca and similar; not yet surveyed.
+   - Any *existing* long-context instruction dataset (no synthesis on our side) — **surveyed and
+     measured 2026-08-10: [`../qwen3_4b_msa/phase2_long_context_data.md`](../qwen3_4b_msa/phase2_long_context_data.md).**
+     Headline: ~34.5K rows / ~1.4B prefill tokens ≥16K available under permissive licenses, 68% of it
+     `LongCite-45k`. LongAlpaca tops out at 27K tokens (0% ≥32K); the best pure-length source
+     (`nvidia/ChatQA2`, 100% ≥32K) is CC-BY-NC. None of them is code-flavoured.
+   - **`LoongRL` KeyChain data (arXiv 2510.19363) is the one source that is *retrieval*-shaped** —
+     7,500 rows at 100% ≥16K, real prose whose answer requires exact multi-hop long-range lookups. It
+     addresses the train/eval mismatch described above rather than widening it, so the "no synthetic
+     haystacks" rule in §4 **does not** apply to it (that rule targets random-token documents with no
+     attention structure; KeyChain's injected UUID chains are the task). Capped at ~20K tokens.
    - Reconsider Route B.
 
 Record whichever path is taken in the run log so the scorecard's provenance is unambiguous.

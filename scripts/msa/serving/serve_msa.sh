@@ -40,8 +40,12 @@ CMD=("$PY" "$REPO/scripts/msa/serving/serve_msa_entry.py"
   --max-model-len "$MAX_LEN"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --dtype bfloat16
-  --enforce-eager           # R2 (cudagraph capture) unresolved; revisit in P5
-  ${EXTRA_ARGS:-})          # extra flags, e.g. --no-enable-prefix-caching
+  --seed "${SEED:-1234}"    # baseline parity: every baseline manifest recorded --seed 1234
+  --no-enable-prefix-caching  # baseline parity: all baseline manifests show prefix_cache: 0
+  --enforce-eager           # DEVIATION from baseline: R2 (cudagraph safety on the M3 sparse
+                            # backend) is unresolved and would fail as wrong numbers, not a
+                            # crash. Costs throughput, not correctness. Record in the scorecard.
+  ${EXTRA_ARGS:-})
 
 {
   echo "=== SERVE-MSA MANIFEST ==="
