@@ -31,11 +31,38 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _dsa_log import setup_logging  # noqa: E402
 
-BUCKETS = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+# Cumulative ">= N" thresholds. The ladder is EXTENDED PAST 32K and clipped to the run's --window:
+# these constants were written for the 32,768 Dolci run, and at a 131,072 window every sequence above
+# 32K collapsed into one number (0.45), erasing all resolution in exactly the band sparse attention is
+# trained for. 1.5x midpoints are included above 32K because power-of-two steps alone are too coarse
+# there. docs/qwen3_4b_msa/phase2_long_context_gen.md §6.1.
+_BUCKETS_BASE = [512, 1024, 2048, 4096, 8192, 16384, 32768,
+                 49152, 65536, 98304, 131072, 163840, 196608, 262144]
+
+
+def buckets_for(window):
+    b = [x for x in _BUCKETS_BASE if x <= window]
+    return b or [_BUCKETS_BASE[0]]
+
+
+BUCKETS = buckets_for(32768)  # back-compat default; main() recomputes from --window
 PCTLS = [10, 25, 50, 75, 90, 95, 99, 99.9]
 # histogram bin edges (open-ended top bin appended at runtime)
-HIST_EDGES_PROMPT = [0, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-HIST_EDGES_RESP = [0, 512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768]
+_HIST_PROMPT_BASE = [0, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+                     49152, 65536, 98304, 131072, 163840, 262144]
+_HIST_RESP_BASE = [0, 512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768,
+                   49152, 65536, 98304, 131072, 163840, 262144]
+
+
+def hist_edges_for(window):
+    """Histogram edges clipped to the window, always keeping the window itself as the last edge so the
+    top bin is closed rather than an open-ended catch-all."""
+    p = [x for x in _HIST_PROMPT_BASE if x < window] + [window]
+    r = [x for x in _HIST_RESP_BASE if x < window] + [window]
+    return p, r
+
+
+HIST_EDGES_PROMPT, HIST_EDGES_RESP = hist_edges_for(32768)
 # Fixed chat wrapper around the prompt, in tokens. Qwen3-Thinking: <|im_start|>user \n … <|im_end|> \n
 # <|im_start|> assistant \n <think> \n = 10 (docs/qwen3_4b_msa/phase2_data_gen.md §5.1). gpt-oss/harmony
 # prepends a whole system message instead and is **67** (docs/gpt_oss_20b_msa/phase2_data_gen.md §3), so
@@ -159,6 +186,13 @@ def main():
             r["_tt"] = args.chat_wrapper_tokens + it + rt + 1
         by_dom.setdefault(r.get(args.group_by, "?"), []).append(r)
 
+    # Rebind the ladders to THIS run's window. Without this the module-level defaults (built for the
+    # 32,768 Dolci run) apply, and every sequence above 32K lands in one open-ended top bin.
+    global BUCKETS, HIST_EDGES_PROMPT, HIST_EDGES_RESP
+    BUCKETS = buckets_for(args.window)
+    HIST_EDGES_PROMPT, HIST_EDGES_RESP = hist_edges_for(args.window)
+    logger.info("length ladders for window=%d: buckets=%s", args.window, BUCKETS)
+
     report = {"window": args.window, "group_by": args.group_by, "prompts_only": prompts_only,
               "overall": {}, "by_domain": {}}
 
@@ -195,10 +229,17 @@ def main():
         logger.info("  truncated(@window)=%.1f%%  recommended max_new_tokens(p%.0f*%.2f)=%d",
                     100 * trunc, args.cap_percentile, args.cap_margin, rec)
         # realized mixture buckets (phase2_data_gen.md §9.1)
+        # NOTE: the old "decode_long_8k_32k" key was computed as `tt_a >= 8192` with NO upper bound,
+        # so the name said 8k-32k while the number meant ">=8k" -- it read 1.0 on long-context data and
+        # told you nothing. These bands are disjoint and each one is what its name says.
+        def _band(lo, hi):
+            m = (tt_a >= lo) if hi is None else ((tt_a >= lo) & (tt_a < hi))
+            return round(float(np.mean(m)), 4)
+
         s["bucket_frac"] = {
-            "short_lt_4k": round(float(np.mean(tt_a < 4096)), 4),
-            "mid_4k_8k": round(float(np.mean((tt_a >= 4096) & (tt_a < 8192))), 4),
-            "decode_long_8k_32k": round(float(np.mean(tt_a >= 8192)), 4),
+            "lt_4k": _band(0, 4096), "4k_8k": _band(4096, 8192), "8k_16k": _band(8192, 16384),
+            "16k_32k": _band(16384, 32768), "32k_64k": _band(32768, 65536),
+            "64k_128k": _band(65536, 131072), "ge_128k": _band(131072, None),
         }
         logger.info("  mixture buckets: %s", s["bucket_frac"])
         return s
