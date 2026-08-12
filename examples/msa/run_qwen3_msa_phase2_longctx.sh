@@ -12,7 +12,7 @@
 # WHAT DIFFERS FROM THE SOURCE RUN
 #   p2_qwen3-4b-thinking-2507_ph2b_split_v1_L32k_bs8_k16_B128_dp3_lam1.0_lr5e-6_ilr1e-4_t16w2048_st11214_v2
 #
-# 1. MODEL_PATH -> the MERGED step-10700 checkpoint. Fresh run (step 0, new optimizer/schedule) that
+# 1. MODEL_PATH -> $CKPT (merged step-10700 HF weights, inside the source checkpoint dir). Fresh run (step 0, new optimizer/schedule) that
 #    INITIALISES from those weights; NOT a resume.
 #
 # 2. WARMSTART -> the step-10700 CONSOLIDATED INDEXER. Load-bearing; never clear it.
@@ -52,8 +52,13 @@ export RUNS_BASE=${RUNS_BASE:-${BASE}/msa/sparse}
 
 SPLIT=${SPLIT:-${BASE}/msa/data/qwen3-4b-thinking-2507__longctx_tierA__L131072_20260811_022925/split_16k_45k_v1}
 
-export MODEL_PATH=${MODEL_PATH:-${BASE}/models/qwen3_4b_msa_p2b_k16_step10700}
-export WARMSTART=${WARMSTART:-${BASE}/msa/indexer_warmup/msa_p2b_k16_step10700_indexer_full.pt}
+# EVERY derived artifact for this checkpoint lives in ONE named folder inside the source
+# checkpoint dir. They were previously split across ~/models/ (merged HF) and
+# ~/msa/indexer_warmup/ (indexer .pt) -- each following its own type convention, which scattered
+# one checkpoint across three directories. See $CKPT/DERIVED.json.
+CKPT=${CKPT:-${BASE}/msa/sparse/p2_qwen3-4b-thinking-2507_ph2b_split_v1_L32k_bs8_k16_B128_dp3_lam1.0_lr5e-6_ilr1e-4_t16w2048_st11214_v2/global_step_10700/qwen3_4b_msa_p2b_k16_step10700}
+export MODEL_PATH=${MODEL_PATH:-$CKPT}
+export WARMSTART=${WARMSTART:-$CKPT/msa_p2b_k16_step10700_indexer_full.pt}
 export TRAIN_FILES=${TRAIN_FILES:-${SPLIT}/train-00000.parquet}
 export VAL_FILES=${VAL_FILES:-${SPLIT}/val-00000.parquet}
 
