@@ -587,7 +587,10 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     # side-channel loss shape (it does NOT flow through the decoder layer's output), so `MSAIndexer`
     # must get the same treatment. Keying on the class NAME is what made this miss-able — a new indexer
     # class silently falls back to the broken path with a nonzero-but-fake grad_norm.
-    _indexer_cls_names = ("LightningIndexer", "MSAIndexer")
+    # `Qwen3DSAIndexer` (Qwen3 GQA + DSA, verl/models/transformers/qwen3_dsa_indexer.py) is the same shape
+    # again: token-granular DSA on a GQA backbone, Phase-1 KL as a side channel. Gated by `dsa_enabled`
+    # below, which it shares with the MiniCPM3 path (the two are disjoint by `model_type`).
+    _indexer_cls_names = ("LightningIndexer", "MSAIndexer", "Qwen3DSAIndexer")
     indexer_units = []
     _cfg = getattr(model, "config", None)
     if getattr(_cfg, "dsa_enabled", False) or getattr(_cfg, "msa_enabled", False):

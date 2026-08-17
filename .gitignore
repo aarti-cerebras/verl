@@ -134,3 +134,7 @@ outputs
 # DSA training runs (logs, wandb, checkpoints)
 dsa_runs/
 .devlibs/
+# scheduler stdout dropped in the repo root by sbatch
+slurm-*.out
+# per-machine Claude Code settings
+.claude/settings.local.json

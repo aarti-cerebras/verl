@@ -1,6 +1,10 @@
-# Qwen3-4B → DSA (GQA, no MLA) — **SUPERSEDED**
+# Qwen3-4B → DSA (GQA, no MLA)
 
-> **Superseded by [`docs/qwen3_4b_msa/`](../qwen3_4b_msa/) (2026-07-28).** We moved from
+> **ACTIVE PLAN: [`plan_v2.md`](plan_v2.md) (2026-08-14).** Token-granular DSA on GQA, revisited with
+> MSA's measured result in hand (k16 still loses RULER 32K by 6.36) and its plumbing available for reuse.
+> `plan_v2.md` supersedes `plan.md` below; read v2, not v1.
+
+> **v1 was superseded by [`docs/qwen3_4b_msa/`](../qwen3_4b_msa/) (2026-07-28).** We moved from
 > token-granular DSA-on-GQA to **MiniMax Sparse Attention (MSA)**, which is designed for GQA and
 > already has a merged vLLM implementation with a Triton path that runs on H100. Rationale:
 > [`qwen3_4b_msa/plan.md`](../qwen3_4b_msa/plan.md) §2.

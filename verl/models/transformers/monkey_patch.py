@@ -516,6 +516,64 @@ def apply_monkey_patch(
             print("DSA dense_warmup: froze base, only *.indexer.* params trainable")
         print("Monkey patch MiniCPMFlashAttention2.forward for DSA indexer")
         return
+    elif model.config.model_type == "qwen3" and getattr(model.config, "dsa_enabled", False):
+        # DeepSeek Sparse Attention (DSA) on Qwen3's GQA: token-granular top-k selection, no MLA anywhere.
+        # See docs/qwen3_4b_dsa/plan_v2.md.
+        #
+        # Gated on `config.dsa_enabled`, shared with the MiniCPM3 DSA branch above — the two are disjoint by
+        # `model_type`, and sharing the flag is deliberate: `fsdp_utils`, the FSDP engine,
+        # `workers/utils/losses.py` and the SFT trainer all key on `dsa_enabled` and the `_dsa_*` attribute
+        # names, so none of them need changes. Placed BEFORE the MSA branch so a config with both flags set
+        # fails loudly here instead of silently taking the MSA path.
+        #
+        # Must run HERE — after `from_pretrained`, before FSDP wrapping (see
+        # workers/engine/fsdp/transformer_impl.py: apply_monkey_patch, then apply_fsdp2):
+        #   * attach_indexers adds NEW parameters, which must exist before FSDP flattens/shards them and
+        #     before the optimizer param groups are built;
+        #   * freeze_base_train_indexer must set requires_grad before the wrap;
+        #   * fsdp_utils.apply_fsdp2 then finds the attached `Qwen3DSAIndexer` modules by class NAME and
+        #     gives each its own unit with reshard_after_forward=False (Option B2), without which this
+        #     side-channel KL yields a nonzero-but-fake grad_norm and a flat loss at world_size > 1
+        #     (docs/dsa_fsdp_sharding_notes.md §3b/§4);
+        #   * a warm-start state dict loads on the UNWRAPPED model, so it is GPU-count-agnostic.
+        from transformers.models.qwen3 import modeling_qwen3
+
+        from verl.models.transformers.qwen3_dsa import (
+            attach_indexers,
+            build_dsa_config,
+            dsa_overrides_from_config,
+            freeze_base_train_indexer,
+            install_kl_accumulation,
+            qwen3_dsa_attn_forward,
+        )
+
+        assert not getattr(model.config, "msa_enabled", False), (
+            "both dsa_enabled and msa_enabled are set on the same Qwen3 config; they patch the same "
+            "Qwen3Attention.forward and cannot coexist — pick one"
+        )
+        # Ulysses shards the sequence across ranks, but the indexer scores every query against the FULL key
+        # sequence and the teacher is a softmax over the full causal support — a sharded sequence would
+        # silently normalise both over a fragment. Fail loudly instead.
+        assert ulysses_sp_size == 1, (
+            f"Qwen3 DSA does not support ulysses sequence parallelism (ulysses_sp_size={ulysses_sp_size}): "
+            "the indexer KL needs the full key sequence on each rank"
+        )
+        dsa_cfg = build_dsa_config(model.config, **dsa_overrides_from_config(model.config))
+        attach_indexers(model, dsa_cfg)
+        # Class-level patch: the forward branches on `getattr(self, "dsa", None)`, so any Qwen3 instance
+        # without an attached indexer still runs the stock path unchanged.
+        modeling_qwen3.Qwen3Attention.forward = qwen3_dsa_attn_forward
+        install_kl_accumulation(model)
+        # Phase 1 (dense warm-up): freeze the base, train only the indexer. Phase 2 (sparse) trains both.
+        if dsa_cfg.mode == "dense_warmup":
+            freeze_base_train_indexer(model)
+            print("Qwen3 DSA dense_warmup: froze base, only *.indexer.* params trainable")
+        print(
+            f"Monkey patch Qwen3Attention.forward for DSA (mode={dsa_cfg.mode}, "
+            f"{dsa_cfg.n_heads}x{dsa_cfg.head_dim}, top_k={dsa_cfg.top_k}, "
+            f"kl_reduction={dsa_cfg.kl_reduction})"
+        )
+        return
     elif model.config.model_type == "qwen3" and getattr(model.config, "msa_enabled", False):
         # MiniMax Sparse Attention (MSA) index branch grafted onto Qwen3's GQA (arXiv 2606.13392).
         # Gated on `config.msa_enabled` so ordinary Qwen3 runs fall through to the generic patches below.

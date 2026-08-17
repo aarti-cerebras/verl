@@ -94,7 +94,7 @@ def main():
                          "(base stays stock). Pass '' to consolidate the FULL model => Phase-2 branch/restart "
                          "(base+indexer). Either output loads via dsa_warmstart_path (strict=False).")
     ap.add_argument("--no-verify", action="store_true", help="skip the post-write verification pass")
-    ap.add_argument("--arch", choices=("auto", "dsa", "msa"), default="auto",
+    ap.add_argument("--arch", choices=("auto", "dsa", "msa", "qwen3_dsa"), default="auto",
                     help="which indexer the checkpoint holds, for the key-match check. 'auto' (default) "
                          "infers it by matching the first sparse layer's key set against both "
                          "LightningIndexer (DSA) and MSAIndexer (MSA).")
@@ -182,16 +182,23 @@ def _verify(args, logger, out, rank_sds, keys):
     logger.info("verify: reconstruction spot-check %d/%d keys match raw shards ✓", len(sample), len(sample))
 
     if args.key_substr == ".indexer.":
-        # Reference key sets for both architectures. Only NAMES are compared here, and those do not depend
-        # on the geometry, so default configs are sufficient for the DSA side's tunable dims.
+        # Reference key sets for each known architecture. Only NAMES are compared here, and those do not
+        # depend on the geometry, so default configs are sufficient for the tunable dims.
         from verl.models.transformers.dsa_indexer import DSAConfig, LightningIndexer
         from verl.models.transformers.msa_indexer import MSAConfig, MSAIndexer
+        from verl.models.transformers.qwen3_dsa_indexer import Qwen3DSAConfig, Qwen3DSAIndexer
 
         refs = {
             "dsa": set(LightningIndexer(DSAConfig(
                 enabled=True, n_heads=args.n_heads, head_dim=args.head_dim, rope_head_dim=args.rope_head_dim,
                 q_lora_rank=args.q_lora_rank, hidden_size=args.hidden_size, top_k=512)).state_dict()),
             "msa": set(MSAIndexer(MSAConfig(enabled=True)).state_dict()),
+            # Qwen3 GQA DSA is a THIRD layout: no `wq_b` (there is no MLA query latent to consume, so `wq`
+            # projects straight from hidden states) and it adds `q_norm` (the normalization MLA's
+            # `q_a_layernorm` used to provide upstream). Without this entry `--arch auto` asserts AFTER
+            # writing a perfectly good file, which pushes every Phase-1 -> Phase-2 handoff onto --no-verify
+            # and thereby silences the content checks that actually matter.
+            "qwen3_dsa": set(Qwen3DSAIndexer(Qwen3DSAConfig(enabled=True)).state_dict()),
         }
 
         # MSA keeps layers [0, dense_prefix) dense, so layer 0 need not have an indexer. Use the LOWEST
