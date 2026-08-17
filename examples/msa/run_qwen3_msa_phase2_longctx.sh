@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Qwen3-4B MSA Phase-2b on the LONG-CONTEXT band (16K-45K), initialised from the 32K run's step 10700.
+# Qwen3-4B MSA Phase-2b on a LONG-CONTEXT band, initialised from the 32K run's step 10700.
 #
-#   ./examples/msa/run_qwen3_msa_phase2_longctx.sh
+#   BAND=16k32k ./examples/msa/run_qwen3_msa_phase2_longctx.sh   # 8xH100 80GB  (the only band that fits)
+#   BAND=16k45k ./examples/msa/run_qwen3_msa_phase2_longctx.sh   # needs >=143 GB/GPU -- see WHICH BAND
 #
 # This is a THIN WRAPPER over examples/msa/run_qwen3_msa_phase2.sh -- it only sets env overrides and
 # execs it. Deliberately not a copy: the canonical script owns the run identity (CONFIG_TAG keyed
@@ -30,57 +31,120 @@
 #    this warmstart together give a complete step-10700 initialisation.
 #    Built by: scripts/dsa/consolidate_indexer_ckpt.py --arch msa  (132 params, 97.33M elements).
 #
-# 3. SEQ_LEN 32768 -> 46080. The band's measured max. MSASFTDataset TRUNCATES longer rows rather than
-#    dropping them, so 32768 here would silently discard ~40% of the band's tokens.
+# 3. SEQ_LEN -> the band's measured MAX (46080 or 32768). MSASFTDataset TRUNCATES longer rows rather
+#    than dropping them, so a SEQ_LEN below the band max silently discards tokens instead of failing.
 #
-# 4. LENGTH_TIERS 16 -> 23 (TIER_WIDTH unchanged at 2048). Tier index is
+# 4. LENGTH_TIERS -> ceil(SEQ_LEN / TIER_WIDTH), TIER_WIDTH unchanged at 2048. Tier index is
 #    `min(length // width, n_tiers - 1)`. The 32K run's 16 x 2048 = 32,768 covered its whole window,
-#    i.e. one tier per 2,048 tokens. Preserving that DENSITY at 46,080 needs ceil(46080/2048) = 23.
-#    At 16, everything >= 30,720 (about a third of this band; p90 = 40,227) collapses into one clamped
-#    tier. DATALOADER-ONLY: does not touch the model, sparsity or FLOPs. NOT msa_top_k.
+#    i.e. one tier per 2,048 tokens; each band preserves that DENSITY. Leaving tiers at 16 for the 45K
+#    band would collapse everything >= 30,720 (about a third of it) into one clamped tier.
+#    DATALOADER-ONLY: does not touch the model, sparsity or FLOPs. NOT msa_top_k.
 #
-# 5. STEPS 11214 -> 4083 (32,666 train rows / BATCH 8 = one epoch).
+# 5. STEPS -> train_rows / BATCH = one epoch.
 #
 # UNCHANGED, deliberately: TOPK=16, BLOCK_SIZE=128, DENSE_PREFIX=3, KL_LAMBDA=1.0, LR=5e-6,
 # INDEXER_LR=1e-4, cosine + 3% warmup, MIN_LR_RATIO=0.1, CLIP_GRAD=1.0, BATCH=8, fsdp2, bf16,
-# ACT_OFFLOAD, TILED_MLP x4.
+# ACT_OFFLOAD.
+#
+# ---------------------------------------------------------------------------------------------------
+# WHICH BAND: 16k45k DOES NOT FIT ON 8xH100 80GB. Measured 2026-08-12 on ml-eng-gpu-21.
+#
+# GPU memory -- not host RAM -- is the binding constraint, and it scales linearly off the 32K run:
+#
+#            L=32768 (proven)          L=46080 (extrapolated, x1.406)     80 GB card
+#   alloc    34.6 GB                   ~49 GB                             ok
+#   reserved 48.4 GB                   ~68 GB  (nvidia-smi showed 72)     ~85-90% -> DEAD
+#
+# At that occupancy the caching allocator stops finding blocks and churns cudaMalloc under the NVIDIA
+# driver lock. The signature is NOT an OOM traceback -- it is 0% SM utilisation, ranks in D state on
+# `os_acquire_rwlock_read`, and forward progress that never reaches step 1. Two max-tier smokes (299
+# rows of 45.5K-46.08K) confirmed it: 33 min and 14 min, ZERO steps posted, at 66-73 GB.
+#
+# Host RAM was never the problem: it plateaued at ~1760 GB of 1999, essentially the 32K run's own
+# 1736 GB, so TILED_MLP_SHARDS=8 does absorb the 1.4x sequence growth as intended.
+#
+# The two standard escapes are closed BY DESIGN, so do not go looking for them:
+#   * Ulysses SP     -- monkey_patch.py asserts ulysses_sp_size == 1 for MSA: the index branch scores
+#                       every query against the FULL key sequence and the Eq.-9 teacher is a softmax
+#                       over the full causal support, so a sharded sequence normalises both over a
+#                       fragment.
+#   * fused linear+CE -- would drop the 14 GB logits tensor (46080 x 151936 x bf16), but the MSA branch
+#                       `return`s before patch_forward_with_backends, so use_fused_kernels is silently
+#                       ignored. This recipe also runs use_remove_padding=False + pad_mode=no_padding,
+#                       which the engine's fused branches are not wired for. Real work + parity test.
+# FSDP2 does not help: it shards params/grads/optimizer (~8-10 GB/rank), not the ~60 GB of activations.
+# Neither did the free levers (KL_BLOCK 512->128, TILED_MLP_SHARDS 8->16, garbage_collection_threshold
+# 0.8): they held 100% SM for ~8 min, then hit the same ceiling. Do not re-run that experiment.
+#
+# Worth knowing but NOT sufficient: all 8 ranks open a CUDA primary context on all 8 GPUs (the launch
+# leaves CUDA_VISIBLE_DEVICES unset), costing 7 x ~524 MiB = ~3.7 GB per card. Reclaiming it needs
+# ~15 GB more to matter.
+#
+# So: run 16k32k here. The 32768-46080 tail (9,467 rows, ~365M tokens) stays in split_16k_45k_v1 and
+# needs either a >=143 GB/GPU host -- where the 16k45k numbers above were originally measured -- or
+# fused CE on the MSA path.
+# ---------------------------------------------------------------------------------------------------
 set -euo pipefail
 
-BASE=/home/aarti_cerebras
-export REPO_ROOT=${REPO_ROOT:-${BASE}/dsa/verl_msa}
-export RUNS_BASE=${RUNS_BASE:-${BASE}/msa/sparse}
+# Two independent roots, deliberately. An earlier revision had a single BASE=/home/aarti_cerebras holding
+# BOTH the repo and the artifacts; on the ml-eng-gpu-* hosts those are different filesystems (repo on the
+# home NFS, artifacts on the /cb/ml-eng FSx share), so one variable cannot name both.
+export REPO_ROOT=${REPO_ROOT:-/cb/home/aarti/ws/code/ws_repos/dsa/verl}   # same default as run_qwen3_msa_phase2.sh
+MSA_BASE=${MSA_BASE:-/cb/ml-eng/aarti}                                    # data + checkpoints
+export RUNS_BASE=${RUNS_BASE:-${MSA_BASE}/msa/sparse}
 
-SPLIT=${SPLIT:-${BASE}/msa/data/qwen3-4b-thinking-2507__longctx_tierA__L131072_20260811_022925/split_16k_45k_v1}
+# --- BAND: the four values below (split, seq_len, tiers, steps) are ONE decision, not four ----------
+# They must move together -- SEQ_LEN below the split's max silently truncates, and LENGTH_TIERS is
+# ceil(SEQ_LEN/TIER_WIDTH) by construction -- so they are set here as a unit rather than left as four
+# independent env vars a caller can desynchronise. STEPS is train_rows / BATCH(8) = one epoch.
+# Default is 16k32k: 16k45k does not run on 80 GB cards (see WHICH BAND above).
+BAND=${BAND:-16k32k}
+LONGCTX_ARTIFACT=${LONGCTX_ARTIFACT:-${MSA_BASE}/msa/data/qwen3-4b-thinking-2507__longctx_tierA__L131072_20260811_022925}
+case "${BAND}" in
+  16k32k)  # 23,199 rows / 0.567B tokens; val 739. Runs at the PROVEN 32K profile (34.6 GB alloc).
+    _SPLIT_DIR=split_16k_32k_v1; _SEQ_LEN=32768; _TIERS=16; _STEPS=2899 ;;
+  16k45k)  # 32,666 rows / 0.932B tokens; val 1,023. REQUIRES >=143 GB/GPU.
+    _SPLIT_DIR=split_16k_45k_v1; _SEQ_LEN=46080; _TIERS=23; _STEPS=4083 ;;
+  *) echo "ERROR: unknown BAND='${BAND}' (expected 16k32k or 16k45k)"; exit 1 ;;
+esac
+SPLIT=${SPLIT:-${LONGCTX_ARTIFACT}/${_SPLIT_DIR}}
 
 # EVERY derived artifact for this checkpoint lives in ONE named folder inside the source
 # checkpoint dir. They were previously split across ~/models/ (merged HF) and
 # ~/msa/indexer_warmup/ (indexer .pt) -- each following its own type convention, which scattered
 # one checkpoint across three directories. See $CKPT/DERIVED.json.
-CKPT=${CKPT:-${BASE}/msa/sparse/p2_qwen3-4b-thinking-2507_ph2b_split_v1_L32k_bs8_k16_B128_dp3_lam1.0_lr5e-6_ilr1e-4_t16w2048_st11214_v2/global_step_10700/qwen3_4b_msa_p2b_k16_step10700}
+# NOTE the `_ckpt/` segment: run_qwen3_msa_phase2.sh puts every run under ${RUNS_BASE}/_ckpt/${CONFIG_TAG}
+# (line 206), so the source run's directory -- and therefore this derived folder -- is one level deeper
+# than the sparse root. Omitting it makes the preflight fail on a missing config.json.
+# Anchored on MSA_BASE, NOT RUNS_BASE: RUNS_BASE is an OUTPUT knob (a smoke run redirects it), and the
+# input checkpoint must not move when it does.
+CKPT=${CKPT:-${MSA_BASE}/msa/sparse/_ckpt/p2_qwen3-4b-thinking-2507_ph2b_split_v1_L32k_bs8_k16_B128_dp3_lam1.0_lr5e-6_ilr1e-4_t16w2048_st11214_v2/global_step_10700/qwen3_4b_msa_p2b_k16_step10700}
 export MODEL_PATH=${MODEL_PATH:-$CKPT}
 export WARMSTART=${WARMSTART:-$CKPT/msa_p2b_k16_step10700_indexer_full.pt}
 export TRAIN_FILES=${TRAIN_FILES:-${SPLIT}/train-00000.parquet}
 export VAL_FILES=${VAL_FILES:-${SPLIT}/val-00000.parquet}
 
-export SEQ_LEN=${SEQ_LEN:-46080}
-export STEPS=${STEPS:-4083}
+export SEQ_LEN=${SEQ_LEN:-${_SEQ_LEN}}
+export STEPS=${STEPS:-${_STEPS}}
 export BATCH=${BATCH:-8}
-export LENGTH_TIERS=${LENGTH_TIERS:-23}
+export LENGTH_TIERS=${LENGTH_TIERS:-${_TIERS}}
 export TIER_WIDTH=${TIER_WIDTH:-2048}
 export TOPK=${TOPK:-16}
 # 4 -> 8. The MLP forward/backward is chunked along the sequence dim (torch.chunk(x, shards, dim=-2)),
 # so only 1/N of the FFN intermediates are live at once. This is the SANCTIONED substitute for gradient
 # checkpointing, which is forbidden here: HF's version runs the first pass under no_grad, so the
 # `_msa_kl` side effect would be stashed WITHOUT a graph and contribute ZERO indexer gradient, silently.
-# Raised because the previous attempt died at step 6 with host RAM at 1,416 GB of 1,771 (80%) from
+# Raised because an early 46K attempt died at step 6 with host RAM at 1,416 GB of 1,771 (80%) from
 # activation offload, while each GPU sat at only 29.7 GB of 143. Halves peak MLP activation memory.
+# Kept at 8 for 16k32k too, even though the source 32K run used 4: pure memory/compute tradeoff with no
+# numerics change, and it keeps host RAM under the 1,736 GB of 1,999 (87%) that run sat at.
 # (ACT_GPU_LIMIT would be the better dial, but run_qwen3_msa_phase2.sh never passes it to the trainer,
 #  and verl only reads it on the veomni engine -- not the FSDP path we use. Unplumbed = no effect.)
 export TILED_MLP_SHARDS=${TILED_MLP_SHARDS:-8}
-# -1 = use the ENTIRE val split (1,023 rows). The source run capped this at 256, but MSASFTDataset
-# applies the cap by taking the FIRST N entries of the already-tiered order -- not a stratified draw --
-# so small sources could be absent entirely (docqarl has only 8 rows in val). Full val costs ~128 eval
-# steps instead of 32, every TEST_FREQ steps, and makes per-source val loss meaningful.
+# -1 = use the ENTIRE val split. The source run capped this at 256, but MSASFTDataset applies the cap by
+# taking the FIRST N entries of the already-tiered order -- not a stratified draw -- so small sources
+# could be absent entirely (docqarl has only 4-8 rows in val). Full val costs more eval steps every
+# TEST_FREQ, and makes per-source val loss meaningful.
 export VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:--1}
 export TEST_FREQ=${TEST_FREQ:-150}
 export SAVE_FREQ=${SAVE_FREQ:-100}
@@ -89,7 +153,8 @@ export MAX_CKPT=${MAX_CKPT:-5}
 # Pinned rather than auto-derived: DATA_TAG would otherwise come out as "train-00000", which says
 # nothing about which dataset this is. CONFIG_TAG keys the checkpoint dir, so it must be stable and
 # descriptive -- and must change if any experiment-defining knob changes.
-export CONFIG_TAG=${CONFIG_TAG:-p2b_qwen3-4b-thinking-2507_longctx16k45k_L45k_bs${BATCH}_k${TOPK}_B128_dp3_lam1.0_lr5e-6_ilr1e-4_t${LENGTH_TIERS}w${TIER_WIDTH}_st${STEPS}_from10700}
+_LEN_TAG=$(awk -v l="${SEQ_LEN}" 'BEGIN{printf "L%dk", int(l/1024)}')
+export CONFIG_TAG=${CONFIG_TAG:-p2b_qwen3-4b-thinking-2507_longctx${BAND}_${_LEN_TAG}_bs${BATCH}_k${TOPK}_B128_dp3_lam1.0_lr5e-6_ilr1e-4_t${LENGTH_TIERS}w${TIER_WIDTH}_st${STEPS}_from10700}
 
 # --- preflight: the two failures that look like a healthy run --------------------------------------
 [[ -f "$MODEL_PATH/config.json" ]] || { echo "ERROR: merged model missing at $MODEL_PATH"; exit 1; }
