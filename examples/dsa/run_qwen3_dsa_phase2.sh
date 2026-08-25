@@ -50,6 +50,38 @@ SEQ_LEN=${SEQ_LEN:-32768}
 BATCH=${BATCH:-8}
 STEPS=${STEPS:-10000}
 
+# --- length tiering: the difference between a 2.4-day run and a 7.4-day one -------------------------
+# A step is BATCH rows, one per rank, and the collective ends when the SLOWEST rank finishes -- so
+# wall-clock is paid on the LONGEST row in the step while the other ranks idle. (No padding to blame:
+# with micro_batch_size_per_gpu=1 the engine pads each micro-batch to its own single row.) THIS data is
+# the same artifact MSA Phase-2b ran on, and MSA measured it: 8 rows drawn at random span ~1.3K..32.7K,
+# which is 32.1% efficient; grouping each step into one TIER_WIDTH band lifts it to ~100%:
+#     random order  32.1% -> 7.4 days      16 tiers  ~100% -> 2.4 days
+# Phase 1 did NOT need this (longmino rows are all exactly SEQ_LEN); Phase-2 BC rows are variable
+# length (p50 ~7K), so it applies here and only here.
+#
+# LENGTH_TIERS and TIER_WIDTH are ONE decision with SEQ_LEN, not three: the rule is
+# LENGTH_TIERS = ceil(SEQ_LEN / TIER_WIDTH), which is 16 at 32768/2048. Change SEQ_LEN and this must move.
+# LENGTH_TIERS=0 disables tiering (parquet row order, sampler shuffles as usual) and reproduces the
+# pre-tiering CONFIG_TAG exactly.
+LENGTH_TIERS=${LENGTH_TIERS:-16}
+TIER_WIDTH=${TIER_WIDTH:-2048}
+# SAMPLER_SHUFFLE is DERIVED, never set by hand: MSASFTDataset's tiered row order only survives if the
+# sampler does not re-permute it (msa_sft_dataset.py:63-65), and the trainer defaults shuffle to TRUE
+# (sft_trainer.py:278). Passing length_tiers WITHOUT this is a silent no-op -- the single easiest way to
+# think you enabled tiering and still pay 7.4 days.
+if (( LENGTH_TIERS > 0 )); then SAMPLER_SHUFFLE=False; else SAMPLER_SHUFFLE=True; fi
+DATA_SEED=${DATA_SEED:-1234}           # seeds the within-tier shuffle AND the tier order. RESUME-CRITICAL:
+                                       # the row order is recomputed from it on every launch, and the
+                                       # dataloader state is a bare batch counter with no dataset identity,
+                                       # so a different seed silently resumes onto DIFFERENT rows
+                                       # (checkpoint_handler.py:116-124). It is deliberately NOT in the
+                                       # CONFIG_TAG (matching MSA), so nothing stops you -- see the echoed
+                                       # resume-hazard block below.
+NUM_WORKERS=${NUM_WORKERS:-8}          # dataloader workers. ALSO resume-relevant: StatefulDataLoader's
+                                       # multiprocess snapshot is keyed by worker id, so changing this
+                                       # invalidates a saved iterator state.
+
 # --- indexer architecture: MUST match the Phase-1 checkpoint being warm-started, or the state dict will
 #     load into differently-shaped modules. The warm-start asserts on unexpected keys but cannot catch a
 #     silent shape-compatible mismatch (e.g. a different rope width), so keep these in sync by hand.
@@ -143,10 +175,40 @@ VAL_FILES=${VAL_FILES:-}
 TEST_FREQ=${TEST_FREQ:-50}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:--1}
 VAL_PREFIX=${VAL_PREFIX:-val}
+VAL_ONLY=${VAL_ONLY:-0}                # 1 = evaluate RESUME_PATH on VAL_FILES and exit, no training. The
+                                       # only way to score a Phase-2 checkpoint through this script; Phase 1
+                                       # has had it since the start.
 RESUME_PATH=${RESUME_PATH:-}
+# --local-addr: the address workers are told to use as MASTER_ADDR. Without it torch derives it from
+# `local_addr or socket.getfqdn()` (elastic/rendezvous/api.py:90), and on a host whose own FQDN does not
+# resolve (ml-eng-gpu-22: /etc/hosts has only localhost, no DNS record) every rank spends 300 s failing to
+# connect and the run dies before step 1 with a c10d timeout and NO Python traceback. `--standalone` is
+# single-node by construction (it hardcodes rdzv_endpoint=localhost:0), so loopback is always correct here
+# and needs no per-host lookup. MSA carries this as a separate script variant; there is no reason for the
+# split -- the value is host-independent.
+LOCAL_ADDR=${LOCAL_ADDR:-127.0.0.1}
+
+# --- run identity overrides. Honoured by _qwen3_dsa_common.sh::dsa_setup_run_identity via ${VAR:-...},
+#     declared here so they appear in the manifest: a run started with an override used to record nothing
+#     about it, which defeats the manifest's purpose. Leave them empty for the derived values.
+CONFIG_TAG=${CONFIG_TAG:-}
+CKPT_DIR=${CKPT_DIR:-}
+RUN_NAME=${RUN_NAME:-}
+RUN_DIR=${RUN_DIR:-}
+LOG_FILE=${LOG_FILE:-}
+MODEL_TAG=${MODEL_TAG:-}
+DATA_TAG=${DATA_TAG:-}
 
 # --- preflight ----------------------------------------------------------------------------------------
 [[ -d "${MODEL_PATH}" ]] || { echo "[dsa-phase2] ERROR: MODEL_PATH does not exist: ${MODEL_PATH}"; exit 1; }
+# Resolved BEFORE the WARMSTART check below: in eval mode the indexer comes from RESUME_PATH, so demanding
+# a consolidated Phase-1 warm-start as well would reject every legitimate VAL_ONLY invocation.
+if [[ "${VAL_ONLY}" == "1" ]]; then
+    [[ -n "${VAL_FILES}"   ]] || { echo "[dsa-phase2] ERROR: VAL_ONLY=1 requires VAL_FILES"; exit 1; }
+    [[ -n "${RESUME_PATH}" ]] || { echo "[dsa-phase2] ERROR: VAL_ONLY=1 requires RESUME_PATH"; exit 1; }
+    TRAIN_FILES="${VAL_FILES}"; SAVE_FREQ=-1; WARMSTART=${WARMSTART:-0}
+    [[ -n "${WARMSTART}" ]] || WARMSTART=0
+fi
 if [[ -z "${WARMSTART}" ]]; then
     echo "[dsa-phase2] ERROR: WARMSTART is required — sparse training from a random indexer routes attention"
     echo "                    to noise. Consolidate a Phase-1 checkpoint first:"
@@ -172,6 +234,12 @@ if [[ -n "${SPARSE_LAYERS}" ]]; then
 elif (( DENSE_PREFIX > 0 )); then
     TAG_EXTRA+="_dp${DENSE_PREFIX}"
 fi
+# Tiering changes which rows land in a step together, so it defines the experiment, not just its speed --
+# MSA carries `_t<tiers>w<width>` in its tag for the same reason. Appended only when enabled, so
+# LENGTH_TIERS=0 reproduces the pre-tiering CONFIG_TAG byte-for-byte.
+if (( LENGTH_TIERS > 0 )); then
+    TAG_EXTRA+="_t${LENGTH_TIERS}w${TIER_WIDTH}"
+fi
 dsa_setup_run_identity
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[dsa-phase2] run_dir=${RUN_DIR}"
@@ -182,15 +250,23 @@ echo "[dsa-phase2] train_shards=$(tr -cd , <<<"${TRAIN_LIST}" | wc -c | awk '{pr
 echo "[dsa-phase2] cwd=$(pwd)"
 echo "[dsa-phase2] cmdline: $(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)"
 echo "[dsa-phase2] argv: $0 $*"
+# These four decide the ROW ORDER, and a resume restores only a batch counter -- no dataset identity. So a
+# change to any of them silently resumes onto different rows instead of failing. LENGTH_TIERS/TIER_WIDTH are
+# tag-protected (a change forks the checkpoint dir); DATA_SEED and NUM_WORKERS are NOT, so read them here.
+echo "[dsa-phase2] row order: LENGTH_TIERS=${LENGTH_TIERS} TIER_WIDTH=${TIER_WIDTH} DATA_SEED=${DATA_SEED} NUM_WORKERS=${NUM_WORKERS} sampler_shuffle=${SAMPLER_SHUFFLE}"
+echo "[dsa-phase2]   ^ DATA_SEED/NUM_WORKERS are NOT in the config tag: changing either across a resume"
+echo "[dsa-phase2]     silently continues on a different row order / invalidates the iterator snapshot."
 
 MANIFEST_KNOBS=(MODEL_PATH DATA_DIR TRAIN_FILES VAL_FILES NPROC SEQ_LEN STEPS BATCH
+                LENGTH_TIERS TIER_WIDTH SAMPLER_SHUFFLE DATA_SEED NUM_WORKERS
                 N_HEADS HEAD_DIM ROPE_HEAD_DIM TOPK DENSE_PREFIX SPARSE_LAYERS FP8 FP8_UE8M0
                 KL_BLOCK KL_CKPT KL_REDUCTION KL_LAMBDA FULL_SUPPORT_PROB COMPILE_TEACHER
                 TILED_MLP TILED_MLP_SHARDS
                 DIAG_INTERVAL LOG_PER_LAYER GRAD_CKPT MODEL_DTYPE ACT_OFFLOAD
                 LR INDEXER_LR LR_SCHED WARMUP_RATIO MIN_LR_RATIO CLIP_GRAD WEIGHT_DECAY
-                SAVE_FREQ MAX_CKPT TEST_FREQ VAL_MAX_SAMPLES VAL_PREFIX
-                WARMSTART RESUME_PATH STAGE PROJECT EXP_NAME RUNS_BASE
+                SAVE_FREQ MAX_CKPT TEST_FREQ VAL_MAX_SAMPLES VAL_PREFIX VAL_ONLY
+                WARMSTART RESUME_PATH STAGE PROJECT EXP_NAME RUNS_BASE LOCAL_ADDR
+                CONFIG_TAG CKPT_DIR RUN_NAME RUN_DIR LOG_FILE MODEL_TAG DATA_TAG
                 CUDA_VISIBLE_DEVICES PYTHONPATH PYTORCH_CUDA_ALLOC_CONF WANDB_BASE_URL WANDB_ENTITY)
 dsa_write_manifest
 
@@ -217,8 +293,16 @@ RESUME_ARGS=()
 [[ -n "${RESUME_PATH}" ]] && RESUME_ARGS=(trainer.resume_mode=resume_path
                                           trainer.resume_from_path="${RESUME_PATH}")
 
+# VAL_ONLY only has to add the flag: RESUME_ARGS above already points the loader at RESUME_PATH, which the
+# preflight made mandatory in this mode.
+EVAL_ARGS=()
+if [[ "${VAL_ONLY}" == "1" ]]; then
+    EVAL_ARGS=(+trainer.val_only=true)
+    echo "[dsa-phase2] VAL_ONLY: eval ${RESUME_PATH} on ${VAL_FILES} -> wandb section '${VAL_PREFIX}'"
+fi
+
 LAUNCH=(
-    torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}"
+    torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" --local-addr "${LOCAL_ADDR}"
     -m verl.trainer.sft_trainer
     hydra.run.dir="${RUN_DIR}/hydra/${RUN_TS}"
     trainer.default_local_dir="${CKPT_DIR}"
@@ -234,6 +318,13 @@ LAUNCH=(
     data.micro_batch_size_per_gpu=1
     data.train_batch_size="${BATCH}"
     data.use_dynamic_bsz=False
+    # Row order. `+` because these are new keys on the dataset config, not overrides of existing ones.
+    # sampler_shuffle is DERIVED from LENGTH_TIERS -- tiering without it is a silent no-op.
+    +data.length_tiers="${LENGTH_TIERS}"
+    +data.tier_width="${TIER_WIDTH}"
+    +data.seed="${DATA_SEED}"
+    +data.sampler_shuffle="${SAMPLER_SHUFFLE}"
+    data.num_workers="${NUM_WORKERS}"
     model.path="${MODEL_PATH}"
     model.trust_remote_code=False
     model.use_remove_padding=False
@@ -262,6 +353,7 @@ LAUNCH=(
     ${MAX_CKPT:+trainer.max_ckpt_to_keep="${MAX_CKPT}"}
     "${VAL_ARGS[@]}"
     ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}
+    ${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}
     trainer.n_gpus_per_node="${NPROC}"
     "$@"
 )
