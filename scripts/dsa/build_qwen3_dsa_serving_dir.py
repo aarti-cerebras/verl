@@ -88,19 +88,66 @@ def load_full_state(step_dir: str, logger) -> dict[str, torch.Tensor]:
     return full
 
 
-def check_indexer_complete(state: dict[str, torch.Tensor], n_layers: int, logger) -> None:
-    """Every layer must carry every indexer tensor. A partial branch is the silent-dense failure."""
+def resolve_sparse_layers(dsa: dict, n_layers: int, logger) -> list[int]:
+    """The sparse-layer set, resolved by the SAME predicate training used.
+
+    Imports `Qwen3DSAConfig` rather than reimplementing `dense_prefix`/`sparse_layers` here: a second copy
+    of that predicate is precisely how a model ends up served dense where it was trained sparse.
+    """
+    from verl.models.transformers.qwen3_dsa_indexer import Qwen3DSAConfig
+
+    cfg = Qwen3DSAConfig(
+        enabled=True,
+        dense_prefix=int(dsa.get("dsa_dense_prefix") or 0),
+        sparse_layers=dsa.get("dsa_sparse_layers") or None,
+        serving_compat=False,  # geometry is validated elsewhere; this instance exists only for the predicate
+    )
+    ids = cfg.sparse_layer_ids(n_layers)
+    assert ids, (
+        f"no sparse layers: dense_prefix={cfg.dense_prefix} sparse_layers={cfg.sparse_layers!r} leaves "
+        f"all {n_layers} layers dense, which is just the stock model"
+    )
+    dense = [i for i in range(n_layers) if i not in set(ids)]
+    logger.info(
+        "sparse layers: %d of %d (dense_prefix=%d, sparse_layers=%r); dense: %s",
+        len(ids), n_layers, cfg.dense_prefix, cfg.sparse_layers, dense or "none",
+    )
+    return ids
+
+
+def check_indexer_complete(
+    state: dict[str, torch.Tensor], n_layers: int, sparse_ids: list[int], logger
+) -> None:
+    """Every SPARSE layer must carry every indexer tensor, and no dense layer may carry any.
+
+    Both directions are load-bearing. A missing tensor on a sparse layer is the silent-dense failure. An
+    unexpected tensor on a dense layer means the checkpoint was trained with a different `dense_prefix`
+    than the config claims — served, that layer would run dense with a trained indexer ignored, and the
+    only symptom is a quality regression.
+    """
+    sparse = set(sparse_ids)
     missing = [
         f"model.layers.{i}.self_attn.indexer.{leaf}"
-        for i in range(n_layers)
+        for i in sparse_ids
         for leaf in INDEXER_LEAVES
         if f"model.layers.{i}.self_attn.indexer.{leaf}" not in state
     ]
     assert not missing, (
         f"{len(missing)} indexer tensors missing from the checkpoint, e.g. {missing[:3]}. "
-        "This is not a DSA Phase-2 checkpoint, or the copy is incomplete."
+        "This is not a DSA Phase-2 checkpoint, the copy is incomplete, or dense_prefix disagrees with "
+        "how the checkpoint was trained."
     )
-    logger.info("indexer branch complete: %d layers x %d tensors", n_layers, len(INDEXER_LEAVES))
+    unexpected = sorted(
+        k for k in state
+        if ".self_attn.indexer." in k
+        and int(k.split("model.layers.", 1)[1].split(".", 1)[0]) not in sparse
+    )
+    assert not unexpected, (
+        f"{len(unexpected)} indexer tensors on layers the config says are DENSE, e.g. {unexpected[:3]}. "
+        f"dense_prefix/sparse_layers disagrees with the checkpoint — serving this would silently ignore "
+        f"a trained indexer on those layers."
+    )
+    logger.info("indexer branch complete: %d sparse layers x %d tensors", len(sparse_ids), len(INDEXER_LEAVES))
 
 
 def main() -> int:
@@ -172,9 +219,12 @@ def main() -> int:
         "dense_warmup checkpoint computes the stock dense function and would score like the baseline."
     )
 
+    # ---- which layers are sparse --------------------------------------------------------------
+    sparse_ids = resolve_sparse_layers(dsa, n_layers, logger)
+
     # ---- weights ------------------------------------------------------------------------------
     state = load_full_state(step_dir, logger)
-    check_indexer_complete(state, n_layers, logger)
+    check_indexer_complete(state, n_layers, sparse_ids, logger)
     if cfg.get("tie_word_embeddings") and "lm_head.weight" in state:
         logger.info("dropping lm_head.weight (tied embeddings)")
         state.pop("lm_head.weight")
@@ -187,6 +237,12 @@ def main() -> int:
     cfg.update(dsa)
     # THE GATE. Mirrors dsa_top_k; the plugin asserts both presence and agreement.
     cfg["index_topk"] = int(dsa["dsa_top_k"])
+    # Normalize the layer set into config.json EXPLICITLY, as a resolved id list, rather than leaving the
+    # plugin to re-derive it from dense_prefix. `cfg.update(dsa)` above already carried dsa_dense_prefix /
+    # dsa_sparse_layers through; this is the resolved form the plugin actually reads, so training and
+    # serving cannot disagree even if the predicate later changes.
+    cfg["dsa_dense_prefix"] = int(dsa.get("dsa_dense_prefix") or 0)
+    cfg["dsa_sparse_layer_ids"] = sparse_ids
     # Self-describing: tf5 keeps rope settings only under rope_parameters, so the flat key is
     # informational here (the plugin reads either).
     rope = cfg.get("rope_parameters") or {}
@@ -212,6 +268,9 @@ def main() -> int:
         "arch": args.arch,
         "dsa": dsa,
         "index_topk": cfg["index_topk"],
+        "sparse_layer_ids": sparse_ids,
+        "n_sparse_layers": len(sparse_ids),
+        "n_layers": n_layers,
         "geometry_source": "checkpoint" if os.path.exists(train_cfg_path) else "cli",
         "n_tensors": len(state),
         "n_params": n_params,

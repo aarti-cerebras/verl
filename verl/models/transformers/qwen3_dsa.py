@@ -70,6 +70,8 @@ _OVERRIDE_FIELDS = (
     "head_dim",
     "rope_head_dim",
     "top_k",
+    "dense_prefix",
+    "sparse_layers",
     "mode",
     "sigma_target",
     "kl_block_size",
@@ -146,7 +148,12 @@ def build_dsa_config(model_config, **overrides) -> Qwen3DSAConfig:
 
 
 def attach_indexers(model, dsa_cfg: Qwen3DSAConfig) -> None:
-    """Attach a `Qwen3DSAIndexer` (+ the shared config) to every decoder layer's `self_attn`.
+    """Attach the shared config to every decoder layer's `self_attn`, and a `Qwen3DSAIndexer` to the
+    SPARSE ones (`dsa_cfg.layer_is_sparse(i)`).
+
+    Layers in `[0, dense_prefix)` get the config but no indexer and no KL term. The patched forward
+    branches on `hasattr(self, "indexer")`, so those layers run the stock dense path untouched — which is
+    also why `dsa_layer_idx` must be the TRUE layer index and not a count of indexers attached so far.
 
     **The per-layer `hidden_rms` is the whole point of this function.** Each indexer is initialised against
     `rms(layer.input_layernorm.weight)`, which is (approximately) the RMS of the hidden states that layer's
@@ -158,11 +165,14 @@ def attach_indexers(model, dsa_cfg: Qwen3DSAConfig) -> None:
     few late layers. See plan_v2.md §2.4; verified in tests/dsa/test_qwen3_dsa_indexer.py.
     """
     n = 0
+    n_layers = len(model.model.layers)
     rms_lo, rms_hi = float("inf"), 0.0
-    for layer in model.model.layers:
+    for i, layer in enumerate(model.model.layers):
         attn = layer.self_attn
         attn.dsa = dsa_cfg
-        attn.dsa_layer_idx = n
+        attn.dsa_layer_idx = i
+        if not dsa_cfg.layer_is_sparse(i):
+            continue
         with torch.no_grad():
             hidden_rms = layer.input_layernorm.weight.float().pow(2).mean().sqrt().item()
         rms_lo, rms_hi = min(rms_lo, hidden_rms), max(rms_hi, hidden_rms)
@@ -170,8 +180,14 @@ def attach_indexers(model, dsa_cfg: Qwen3DSAConfig) -> None:
         ref = next(attn.parameters())
         attn.indexer = idx.to(device=ref.device, dtype=ref.dtype)
         n += 1
+    assert n > 0, (
+        f"DSA: no sparse layers — dense_prefix={dsa_cfg.dense_prefix} covers all {n_layers} layers "
+        f"(sparse_layers={dsa_cfg.sparse_layers!r})"
+    )
     print(
         f"DSA: attached {n} indexers ({dsa_cfg.n_heads}x{dsa_cfg.head_dim}, top_k={dsa_cfg.top_k}); "
+        f"{n_layers - n} layer(s) stay dense (dense_prefix={dsa_cfg.dense_prefix}, "
+        f"sparse_layers={dsa_cfg.sparse_layers!r}); "
         f"input_layernorm rms spans {rms_lo:.3f}..{rms_hi:.3f} ({rms_hi / max(rms_lo, 1e-9):.0f}x) and the "
         f"weights_proj init absorbs it"
     )
@@ -309,6 +325,8 @@ def install_kl_accumulation(model) -> None:
             "indexer/kl_layer_mean": kl_det.mean().item(),
             "indexer/kl_layer_min": kl_det.min().item(),
             "indexer/kl_layer_max": kl_det.max().item(),
+            # SPARSE layers, i.e. those that actually have an indexer -- 32, not 36, at dense_prefix=4.
+            # Watch it on step 1: it is the cheapest confirmation that dense_prefix took effect.
             "indexer/n_layers": float(len(kl_items)),
         }
         # Peak of the previous step's forward+backward (see the pre-hook). Emitted every step because "does
@@ -834,6 +852,10 @@ def qwen3_dsa_attn_forward(
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     cfg = getattr(self, "dsa", None)
+    # The `indexer is not None` test is what makes `dense_prefix` work, in BOTH modes: `attach_indexers`
+    # gives every layer the shared config but only the sparse ones an indexer, so a dense-prefix layer
+    # falls through to the stock attention below and contributes no KL — including in `sparse` mode,
+    # where it must keep running full attention. Do not weaken this to `cfg.enabled` alone.
     if cfg is not None and cfg.enabled and getattr(self, "indexer", None) is not None:
         if cfg.mode == "dense_warmup":
             # Phase 1: attention stays dense (below); the indexer only produces a KL term, and it has no

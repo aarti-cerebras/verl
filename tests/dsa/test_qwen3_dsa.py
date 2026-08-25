@@ -59,15 +59,18 @@ def restore_qwen3_forward():
     modeling_qwen3.Qwen3Attention.forward = original
 
 
-def _build(**dsa_kw):
+def _build(n_layers=LAYERS, **dsa_kw):
     """A tiny random Qwen3 + DSA. Returns (model, cfg, batch, stock_logits) with stock computed BEFORE the
-    patch is applied, so the dense-equivalence comparison is against the genuine stock forward."""
+    patch is applied, so the dense-equivalence comparison is against the genuine stock forward.
+
+    `n_layers` is a parameter (not just the LAYERS constant) because the dense_prefix tests need enough
+    layers to have both a dense and a sparse one."""
     from transformers.models.qwen3 import modeling_qwen3
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
     torch.manual_seed(0)
     hf = Qwen3Config(
-        vocab_size=256, hidden_size=HID, intermediate_size=128, num_hidden_layers=LAYERS,
+        vocab_size=256, hidden_size=HID, intermediate_size=128, num_hidden_layers=n_layers,
         num_attention_heads=N_Q, num_key_value_heads=N_KV, head_dim=D_H,
         max_position_embeddings=512, rope_theta=10000.0, attn_implementation="eager",
     )
@@ -348,3 +351,89 @@ def test_padding_is_excluded_from_the_loss(restore_qwen3_forward):
           position_ids=batch["position_ids"][:, :keep])
     trimmed_kl = model._dsa_indexer_kl.item()
     assert padded_kl == pytest.approx(trimmed_kl, rel=1e-4)
+
+
+# ---------------------------------------------------------------------------------------------------
+# dense_prefix — a few layers keep full attention (plan_v2.md; mirrors MSA's msa_indexer.dense_prefix)
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_dense_prefix_attaches_indexers_only_to_sparse_layers(restore_qwen3_forward):
+    """`dense_prefix=2` on 4 layers: layers 0-1 get the shared config but NO indexer, 2-3 get both.
+
+    Every layer must still carry `.dsa` — the KL hooks read `layer.self_attn.dsa` unconditionally, so
+    dropping it on dense layers would raise AttributeError in the pre-hook.
+    """
+    model, cfg, batch, stock = _build(n_layers=4, mode="dense_warmup", dense_prefix=2, log_per_layer=True)
+    attns = [lyr.self_attn for lyr in model.model.layers]
+    assert [getattr(a, "indexer", None) is not None for a in attns] == [False, False, True, True]
+    assert all(a.dsa is cfg for a in attns), "every layer needs the shared config, dense or not"
+    # dsa_layer_idx must be the TRUE layer index, not a count of indexers attached so far
+    assert [a.dsa_layer_idx for a in attns] == [0, 1, 2, 3]
+
+    out = model(**batch)
+    assert torch.equal(out.logits, stock), "dense_warmup must stay bit-identical with a dense prefix"
+    assert model._dsa_metrics["indexer/n_layers"] == 2.0
+    assert set(k for k in model._dsa_metrics if k.startswith("kl_by_layer/")) == {
+        "kl_by_layer/L02", "kl_by_layer/L03"
+    }, "per-layer keys must be labelled by true layer index, so L00/L01 are simply absent"
+
+
+def test_dense_prefix_layers_run_full_attention_in_sparse_mode(restore_qwen3_forward):
+    """The one that actually matters: in `sparse` mode the dense-prefix layers must keep running FULL
+    attention, not sparse. Same model, same weights, compared against the stock forward layer by layer —
+    layers 0-1 must be bit-identical, and 2-3 must differ (else the sparsity is not biting and the test
+    would pass for the wrong reason)."""
+    from transformers.models.qwen3 import modeling_qwen3
+
+    stock_forward = modeling_qwen3.Qwen3Attention.forward  # captured BEFORE _build patches the class
+    model, cfg, batch, _ = _build(n_layers=4, mode="sparse", top_k=4, dense_prefix=2)
+
+    def _attn_outputs():
+        caught, handles = {}, []
+        for i, lyr in enumerate(model.model.layers):
+            handles.append(
+                lyr.self_attn.register_forward_hook(
+                    lambda m, a, out, i=i: caught.__setitem__(i, out[0].detach().clone())
+                )
+            )
+        try:
+            model(**batch)
+        finally:
+            for h in handles:
+                h.remove()
+        return caught
+
+    got = _attn_outputs()
+    modeling_qwen3.Qwen3Attention.forward = stock_forward  # the fixture restores this again at teardown
+    want = _attn_outputs()
+
+    for i in (0, 1):
+        assert torch.equal(got[i], want[i]), f"dense-prefix layer {i} did not run full attention"
+    for i in (2, 3):
+        assert not torch.equal(got[i], want[i]), f"sparse layer {i} matched dense — top_k={cfg.top_k} not biting"
+
+
+def test_dense_prefix_covering_every_layer_is_rejected(restore_qwen3_forward):
+    """A prefix that swallows all layers is the stock model with extra machinery — fail loudly."""
+    with pytest.raises(AssertionError, match="no sparse layers"):
+        _build(n_layers=4, mode="dense_warmup", dense_prefix=4)
+
+
+def test_dense_prefix_default_is_all_sparse(restore_qwen3_forward):
+    """The default must stay 0. The in-flight Phase-1 checkpoints hold an indexer on every layer, and
+    `resume_mode=auto` would load them into a model with fewer if this ever changed."""
+    model, cfg, _, _ = _build(n_layers=4, mode="dense_warmup")
+    assert cfg.dense_prefix == 0
+    assert all(getattr(lyr.self_attn, "indexer", None) is not None for lyr in model.model.layers)
+
+
+def test_only_sparse_layers_have_trainable_indexer_params(restore_qwen3_forward):
+    """Phase-1 freeze is name-based (`.indexer.`), so the dense prefix must simply have no such params —
+    not have them frozen. A dense layer holding dead trainable weights would inflate the optimizer state
+    and, worse, get consolidated into the serving dir."""
+    model, _, _, _ = _build(n_layers=4, mode="dense_warmup", dense_prefix=2)
+    freeze_base_train_indexer(model)
+    layers = {int(n.split("model.layers.")[1].split(".")[0])
+              for n, p in model.named_parameters() if ".indexer." in n and p.requires_grad}
+    assert layers == {2, 3}

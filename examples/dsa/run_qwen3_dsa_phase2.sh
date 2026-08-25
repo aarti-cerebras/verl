@@ -60,6 +60,14 @@ TOPK=${TOPK:-2048}                     # selected TOKENS per query. NOW LOAD-BEA
                                        # for diagnostics). 2048 matches MSA k16 for an apples-to-apples
                                        # comparison -- but see the review: MSA's own conclusion was that the
                                        # binding constraint was BUDGET, so run 4096 as a primary arm too.
+DENSE_PREFIX=${DENSE_PREFIX:-4}        # layers [0, DENSE_PREFIX) stay DENSE (no indexer, no KL, and in
+                                       # THIS phase they keep running full attention while the rest go
+                                       # sparse). MUST equal the Phase-1 value: the warm-start loads
+                                       # `*.indexer.*` by name with strict=False, so a mismatch is not a
+                                       # shape error -- a larger prefix here silently drops trained
+                                       # indexers, a smaller one leaves fresh ones untrained. See the
+                                       # DENSE_PREFIX comment in run_qwen3_dsa_phase1.sh for why 4.
+SPARSE_LAYERS=${SPARSE_LAYERS:-}       # explicit layer ids instead of a prefix; overrides DENSE_PREFIX
 FP8=${FP8:-True}
 FP8_UE8M0=${FP8_UE8M0:-True}
 
@@ -150,10 +158,20 @@ fi
 [[ "${WARMSTART}" == "0" ]] || [[ -f "${WARMSTART}" ]] || {
     echo "[dsa-phase2] ERROR: WARMSTART file not found: ${WARMSTART}"; exit 1; }
 (( 128 % N_HEADS == 0 )) || { echo "[dsa-phase2] ERROR: N_HEADS=${N_HEADS} must divide 128 (serving)"; exit 1; }
+if [[ -n "${SPARSE_LAYERS}" && "${DENSE_PREFIX}" != "0" ]]; then
+    echo "[dsa-phase2] ERROR: set either DENSE_PREFIX (${DENSE_PREFIX}) or SPARSE_LAYERS (${SPARSE_LAYERS}), not both"
+    exit 1
+fi
 TRAIN_LIST=$(dsa_expand_files "${TRAIN_FILES}" train) || {
     echo "[dsa-phase2] ERROR: no train parquet matched: ${TRAIN_FILES}"; exit 1; }
 
 TAG_EXTRA="_k${TOPK}_${N_HEADS}x${HEAD_DIM}_lam${KL_LAMBDA}_ilr${INDEXER_LR}"
+# Appended only when nonzero, so DENSE_PREFIX=0 reproduces the pre-dense_prefix CONFIG_TAG exactly.
+if [[ -n "${SPARSE_LAYERS}" ]]; then
+    TAG_EXTRA+="_ls$(printf '%s' "${SPARSE_LAYERS}" | md5sum | cut -c1-6)"
+elif (( DENSE_PREFIX > 0 )); then
+    TAG_EXTRA+="_dp${DENSE_PREFIX}"
+fi
 dsa_setup_run_identity
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[dsa-phase2] run_dir=${RUN_DIR}"
@@ -166,7 +184,7 @@ echo "[dsa-phase2] cmdline: $(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)"
 echo "[dsa-phase2] argv: $0 $*"
 
 MANIFEST_KNOBS=(MODEL_PATH DATA_DIR TRAIN_FILES VAL_FILES NPROC SEQ_LEN STEPS BATCH
-                N_HEADS HEAD_DIM ROPE_HEAD_DIM TOPK FP8 FP8_UE8M0
+                N_HEADS HEAD_DIM ROPE_HEAD_DIM TOPK DENSE_PREFIX SPARSE_LAYERS FP8 FP8_UE8M0
                 KL_BLOCK KL_CKPT KL_REDUCTION KL_LAMBDA FULL_SUPPORT_PROB COMPILE_TEACHER
                 TILED_MLP TILED_MLP_SHARDS
                 DIAG_INTERVAL LOG_PER_LAYER GRAD_CKPT MODEL_DTYPE ACT_OFFLOAD
@@ -179,6 +197,8 @@ dsa_write_manifest
 DSA_OV="dsa_enabled: true, dsa_mode: sparse"
 DSA_OV+=", dsa_n_heads: ${N_HEADS}, dsa_head_dim: ${HEAD_DIM}, dsa_rope_head_dim: ${ROPE_HEAD_DIM}"
 DSA_OV+=", dsa_top_k: ${TOPK}, dsa_fp8: ${FP8}, dsa_fp8_ue8m0: ${FP8_UE8M0}"
+DSA_OV+=", dsa_dense_prefix: ${DENSE_PREFIX}"
+[[ -n "${SPARSE_LAYERS}" ]] && DSA_OV+=", dsa_sparse_layers: '${SPARSE_LAYERS}'"
 DSA_OV+=", dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_kl_reduction: ${KL_REDUCTION}"
 DSA_OV+=", dsa_full_support_kl_prob: ${FULL_SUPPORT_PROB}, dsa_compile_teacher: ${COMPILE_TEACHER}"
 DSA_OV+=", dsa_diag_interval: ${DIAG_INTERVAL}, dsa_log_per_layer: ${LOG_PER_LAYER}"

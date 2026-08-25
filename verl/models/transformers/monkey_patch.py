@@ -571,7 +571,7 @@ def apply_monkey_patch(
         print(
             f"Monkey patch Qwen3Attention.forward for DSA (mode={dsa_cfg.mode}, "
             f"{dsa_cfg.n_heads}x{dsa_cfg.head_dim}, top_k={dsa_cfg.top_k}, "
-            f"kl_reduction={dsa_cfg.kl_reduction})"
+            f"dense_prefix={dsa_cfg.dense_prefix}, kl_reduction={dsa_cfg.kl_reduction})"
         )
         return
     elif model.config.model_type == "qwen3" and getattr(model.config, "msa_enabled", False):

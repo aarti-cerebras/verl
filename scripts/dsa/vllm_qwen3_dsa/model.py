@@ -17,8 +17,14 @@
 (the proven in-repo pattern); the sparse machinery is ``vllm_qwen3_dsa/{indexer,sparse_attention}.py``.
 
 Per layer the replaced region is exactly: hidden states in -> attention output. Embeddings, MLP,
-layernorms, ``lm_head`` and sampling are stock Qwen3. Unlike MSA there is **no dense prefix** —
-``attach_indexers`` gives every one of the 36 layers an indexer, so every layer is sparse.
+layernorms, ``lm_head`` and sampling are stock Qwen3.
+
+**Which layers are sparse is read from the config, not assumed.** Like MSA, DSA supports a dense
+prefix: layers in ``[0, dsa_dense_prefix)`` keep stock full attention and carry no indexer. The
+serving dir's ``config.json`` holds the resolved list in ``dsa_sparse_layer_ids``, written by
+``build_qwen3_dsa_serving_dir.py`` from the training config, and ``sparse_layer_ids()`` below only
+looks it up. Re-deriving it here would let training and serving disagree, which presents as a quality
+regression and nothing else. Older serving dirs have no such key and are all-sparse.
 
 Three details that are load-bearing:
 
@@ -79,6 +85,31 @@ from .sparse_attention import DSA_KERNEL_BLOCK_SIZE, Qwen3DSASparseBackend
 def _sparse_enabled() -> bool:
     """``DSA_SPARSE=0`` -> dense bring-up mode (no indexer built anywhere)."""
     return os.environ.get("DSA_SPARSE", "1") not in ("0", "", "false", "False")
+
+
+def sparse_layer_ids(config: PretrainedConfig) -> set[int]:
+    """The layers that carry an indexer, read from the serving dir's ``config.json``.
+
+    The builder writes the RESOLVED id list (``dsa_sparse_layer_ids``), so this is a lookup, not a
+    reimplementation of training's ``dense_prefix`` predicate -- the two agreeing is the whole contract.
+    A config without the key predates ``dense_prefix`` and means every layer is sparse, which is what
+    those checkpoints actually are.
+    """
+    n_layers = int(config.num_hidden_layers)
+    ids = getattr(config, "dsa_sparse_layer_ids", None)
+    if ids is None:
+        prefix = int(getattr(config, "dsa_dense_prefix", 0) or 0)
+        assert prefix == 0, (
+            f"config.dsa_dense_prefix={prefix} but dsa_sparse_layer_ids is missing. Rebuild the serving "
+            "dir with build_qwen3_dsa_serving_dir.py -- guessing the layer set here is how a model gets "
+            "served dense where it was trained sparse."
+        )
+        return set(range(n_layers))
+    out = {int(i) for i in ids}
+    assert out and max(out) < n_layers and min(out) >= 0, (
+        f"config.dsa_sparse_layer_ids={sorted(out)[:8]}... out of range for {n_layers} layers"
+    )
+    return out
 
 
 def _random_indexer() -> bool:
@@ -338,6 +369,9 @@ class Qwen3DSAModel(Qwen2Model):
         if sparse:
             assert_servable_sparse(config)
         self.dsa_sparse = sparse
+        # Per-layer: `dense_prefix` layers keep stock full attention. Empty in DSA_SPARSE=0 bring-up mode,
+        # where nothing is sparse.
+        self.dsa_sparse_layers = sparse_layer_ids(config) if sparse else set()
 
         buf = None
         if sparse:
@@ -354,17 +388,27 @@ class Qwen3DSAModel(Qwen2Model):
             )
         self.topk_indices_buffer = buf
 
+        sparse_ids = self.dsa_sparse_layers
+
         def _layer(config, cache_config, quant_config, prefix):
+            # extract_layer_index is vLLM's own prefix parser ("model.layers.7" -> 7), the same one
+            # Qwen3DSADecoderLayer uses for self.layer_id, so the ids line up with config.json's.
             return Qwen3DSADecoderLayer(
                 config,
                 cache_config,
                 quant_config,
                 prefix,
-                sparse=sparse,
+                sparse=extract_layer_index(prefix) in sparse_ids,
                 topk_indices_buffer=buf,
             )
 
         super().__init__(vllm_config=vllm_config, prefix=prefix, decoder_layer_type=_layer)
+        if sparse:
+            n_sparse = sum(1 for lyr in self.layers if getattr(lyr, "is_sparse", False))
+            print(
+                f"[Qwen3DSA] {n_sparse}/{config.num_hidden_layers} layers sparse "
+                f"(dense: {sorted(set(range(config.num_hidden_layers)) - sparse_ids) or 'none'})"
+            )
 
 
 class Qwen3DSAForCausalLM(nn.Module, SupportsPP):
@@ -453,9 +497,12 @@ class Qwen3DSAForCausalLM(nn.Module, SupportsPP):
                         w = (torch.randn(w.shape, generator=g, dtype=torch.float32) * std).to(w.dtype)
                         n += 1
                     yield name, w
-                assert n == 3 * self.config.num_hidden_layers, (
-                    f"DSA_RANDOM_INDEXER randomized {n} tensors, expected "
-                    f"{3 * self.config.num_hidden_layers}"
+                # Sparse layers, not all layers: at dense_prefix=4 on a 36-layer model the
+                # checkpoint carries 32 indexers, and asserting 36 would fail the control run.
+                n_expected = 3 * len(self.model.dsa_sparse_layers)
+                assert n == n_expected, (
+                    f"DSA_RANDOM_INDEXER randomized {n} tensors, expected {n_expected} "
+                    f"({len(self.model.dsa_sparse_layers)} sparse layers x 3)"
                 )
 
             print(

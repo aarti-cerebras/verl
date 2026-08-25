@@ -56,6 +56,28 @@ TOPK=${TOPK:-2048}                     # selected TOKENS per query. Phase 1 is d
                                        # recall is comparable. NOTE the review's open question: MSA's own
                                        # result suggested the binding constraint was BUDGET, not
                                        # granularity, so 4096 belongs in the sweep too.
+DENSE_PREFIX=${DENSE_PREFIX:-4}        # layers [0, DENSE_PREFIX) stay DENSE: no indexer, no KL, stock
+                                       # attention. 4 comes from this project's own per-layer topk_recall:
+                                       # at step ~4150 of the lr1e-4 run L00-L03 were 0.79/0.79/0.82/0.88,
+                                       # while every layer from L07 up was >= 0.92 and the top third hit
+                                       # 0.95-0.97. Early layers attend broadly and are the hardest to
+                                       # sparsify, which is why MSA/M3 ship a dense prefix too
+                                       # (msa_indexer.dense_prefix=3; M3's shipped sparse_attention_freq =
+                                       # [0]*3 + [1]*57). 32/36 layers stay sparse, so this costs ~11% of
+                                       # the attention savings and buys back the four worst layers.
+                                       #
+                                       # THIS IS ARCHITECTURE, not a training preference: it must match at
+                                       # serve time or the model runs dense where it was trained sparse. So
+                                       # it is in the CONFIG_TAG (resume_mode=auto must not cross a
+                                       # 36-indexer checkpoint with a 32-indexer model) and it is written
+                                       # into the serving dir's config.json.
+                                       #
+                                       # DENSE_PREFIX=0 => every layer sparse: the DeepSeek-V3.2 recipe and
+                                       # what the existing p1_*_lr3e-4 / _lr1e-4 checkpoints hold. It also
+                                       # reproduces the old CONFIG_TAG exactly (no _dp suffix), which is
+                                       # what you need to resume either of those runs.
+SPARSE_LAYERS=${SPARSE_LAYERS:-}       # explicit comma-separated layer ids instead of a prefix, e.g.
+                                       # "4,8,12". Overrides DENSE_PREFIX; setting both is an error.
 SIGMA_TARGET=${SIGMA_TARGET:-0.3}      # init score scale (plan §2.4). weights_proj is scaled PER LAYER by
                                        # 1/rms(input_layernorm.weight) to hit this, which absorbs the
                                        # measured 186x gain spread across the 36 layers. Watch the per-layer
@@ -137,6 +159,10 @@ fi
 [[ -d "${MODEL_PATH}" ]] || { echo "[dsa-phase1] ERROR: MODEL_PATH does not exist: ${MODEL_PATH}"; exit 1; }
 (( 128 % N_HEADS == 0 )) || { echo "[dsa-phase1] ERROR: N_HEADS=${N_HEADS} must divide 128 (serving)"; exit 1; }
 case "${HEAD_DIM}" in 32|64|128) ;; *) echo "[dsa-phase1] ERROR: HEAD_DIM must be 32|64|128"; exit 1;; esac
+if [[ -n "${SPARSE_LAYERS}" && "${DENSE_PREFIX}" != "0" ]]; then
+    echo "[dsa-phase1] ERROR: set either DENSE_PREFIX (${DENSE_PREFIX}) or SPARSE_LAYERS (${SPARSE_LAYERS}), not both"
+    exit 1
+fi
 TRAIN_LIST=$(dsa_expand_files "${TRAIN_FILES}" train) || {
     echo "[dsa-phase1] ERROR: no train parquet matched: ${TRAIN_FILES}"
     echo "[dsa-phase1] build it with:"
@@ -145,6 +171,15 @@ TRAIN_LIST=$(dsa_expand_files "${TRAIN_FILES}" train) || {
     exit 1; }
 
 TAG_EXTRA="_k${TOPK}_${N_HEADS}x${HEAD_DIM}_r${ROPE_HEAD_DIM}"
+# Only appended when nonzero: DENSE_PREFIX=0 must reproduce the pre-dense_prefix CONFIG_TAG byte-for-byte,
+# or `resume_mode=auto` stops finding the p1_*_lr3e-4 / _lr1e-4 checkpoints. Written with `if` rather than
+# `(( )) &&` because a false (( )) returns 1 and `set -e` would kill the script here.
+if [[ -n "${SPARSE_LAYERS}" ]]; then
+    # Hash, not a count: two different layer SETS of the same size must not share a checkpoint dir.
+    TAG_EXTRA+="_ls$(printf '%s' "${SPARSE_LAYERS}" | md5sum | cut -c1-6)"
+elif (( DENSE_PREFIX > 0 )); then
+    TAG_EXTRA+="_dp${DENSE_PREFIX}"
+fi
 dsa_setup_run_identity
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "[dsa-phase1] run_dir=${RUN_DIR}"
@@ -157,7 +192,7 @@ echo "[dsa-phase1] cmdline: $(tr '\0' ' ' < /proc/$$/cmdline 2>/dev/null)"
 echo "[dsa-phase1] argv: $0 $*"
 
 MANIFEST_KNOBS=(MODEL_PATH DATA_DIR TRAIN_FILES VAL_FILES NPROC SEQ_LEN STEPS BATCH
-                N_HEADS HEAD_DIM ROPE_HEAD_DIM TOPK SIGMA_TARGET FP8 FP8_UE8M0
+                N_HEADS HEAD_DIM ROPE_HEAD_DIM TOPK DENSE_PREFIX SPARSE_LAYERS SIGMA_TARGET FP8 FP8_UE8M0
                 KL_BLOCK KL_CKPT KL_REDUCTION COMPILE_TEACHER DIAG_INTERVAL LOG_PER_LAYER
                 GRAD_CKPT MODEL_DTYPE ACT_OFFLOAD
                 LR LR_SCHED WARMUP_RATIO MIN_LR_RATIO CLIP_GRAD WEIGHT_DECAY
@@ -171,6 +206,8 @@ dsa_write_manifest
 DSA_OV="dsa_enabled: true, dsa_mode: dense_warmup"
 DSA_OV+=", dsa_n_heads: ${N_HEADS}, dsa_head_dim: ${HEAD_DIM}, dsa_rope_head_dim: ${ROPE_HEAD_DIM}"
 DSA_OV+=", dsa_top_k: ${TOPK}, dsa_sigma_target: ${SIGMA_TARGET}"
+DSA_OV+=", dsa_dense_prefix: ${DENSE_PREFIX}"
+[[ -n "${SPARSE_LAYERS}" ]] && DSA_OV+=", dsa_sparse_layers: '${SPARSE_LAYERS}'"
 DSA_OV+=", dsa_fp8: ${FP8}, dsa_fp8_ue8m0: ${FP8_UE8M0}"
 DSA_OV+=", dsa_kl_block_size: ${KL_BLOCK}, dsa_kl_checkpoint: ${KL_CKPT}, dsa_kl_reduction: ${KL_REDUCTION}"
 DSA_OV+=", dsa_compile_teacher: ${COMPILE_TEACHER}"

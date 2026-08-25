@@ -115,6 +115,22 @@ class Qwen3DSAConfig:
     # --- selection -----------------------------------------------------------------------------------
     top_k: int = 2048  # selected TOKENS per query
 
+    # --- which layers get an indexer at all ---------------------------------------------------------
+    # Layers [0, dense_prefix) stay DENSE: no indexer, no KL term, stock attention forward. The default
+    # is 0 (every layer sparse) and must STAY 0 -- DeepSeek-V3.2 sparsifies all layers, and the two
+    # in-flight Phase-1 checkpoints hold 36 indexers, so a nonzero default would make `resume_mode=auto`
+    # load them into a model with fewer. 4 is the value the launch scripts pass, motivated by the
+    # PER-LAYER topk_recall of the lr1e-4 run at step ~4150: L00-L03 = 0.79/0.79/0.82/0.88 while every
+    # layer from L07 up is >= 0.92 and the top third reaches 0.95-0.97. That is the same shape MSA/M3
+    # found (msa_indexer.dense_prefix=3, M3's shipped `sparse_attention_freq = [0]*3 + [1]*57`).
+    #
+    # This is an ARCHITECTURE field, not a training preference: it must be identical at train and serve
+    # time or the served model runs dense where it was trained sparse. It is therefore written into the
+    # serving dir's config.json (build_qwen3_dsa_serving_dir.py) and read back by the vLLM plugin.
+    dense_prefix: int = 0
+    sparse_layers: Optional[str] = None  # explicit comma-separated layer ids that get an indexer, e.g.
+    # "4,5,6,...". Overrides `dense_prefix` entirely when set (an arbitrary set, not just a prefix).
+
     # --- FP8 numerics (must match serve time exactly) -----------------------------------------------
     fp8: bool = True  # run the score matmul in fake-quantized E4M3, as the reference does
     fp8_ue8m0: bool = True  # power-of-2 (UE8M0) per-row scale, matching the serving kernels. Default True
@@ -160,6 +176,15 @@ class Qwen3DSAConfig:
             raise ValueError(f"mode must be 'dense_warmup' or 'sparse', got {self.mode!r}")
         if self.kl_reduction not in ("sum", "mean"):
             raise ValueError(f"kl_reduction must be 'sum' or 'mean', got {self.kl_reduction!r}")
+        if self.dense_prefix < 0:
+            raise ValueError(f"dense_prefix ({self.dense_prefix}) must be >= 0")
+        if self.sparse_layers and self.dense_prefix:
+            # Both set is always a mistake: sparse_layers silently wins and the dense_prefix in the run
+            # name / config.json then describes a model that was never built.
+            raise ValueError(
+                f"set either dense_prefix ({self.dense_prefix}) or sparse_layers "
+                f"({self.sparse_layers!r}), not both — sparse_layers overrides dense_prefix"
+            )
         if self.rope_head_dim > self.head_dim:
             raise ValueError(f"rope_head_dim ({self.rope_head_dim}) must be <= head_dim ({self.head_dim})")
         if self.rope_head_dim % 2 != 0:
@@ -191,6 +216,19 @@ class Qwen3DSAConfig:
     def group_size(self) -> int:
         """G = H_q / H_kv — query heads sharing one KV head in the base attention."""
         return self.num_heads // self.num_kv_heads
+
+    def layer_is_sparse(self, layer_idx: int) -> bool:
+        """Whether this layer gets an indexer (and therefore a KL term). Same contract as MSA's."""
+        if self.sparse_layers:
+            ids = {int(s) for s in str(self.sparse_layers).replace(" ", "").split(",") if s != ""}
+            return layer_idx in ids
+        return layer_idx >= self.dense_prefix
+
+    def sparse_layer_ids(self, n_layers: int) -> list[int]:
+        """The resolved sparse-layer set. The single source of truth shared by training, the serving-dir
+        builder and the vLLM plugin — a second reimplementation of this predicate is exactly how a model
+        gets served dense where it was trained sparse."""
+        return [i for i in range(n_layers) if self.layer_is_sparse(i)]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
