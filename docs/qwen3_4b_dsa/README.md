@@ -22,10 +22,14 @@ model's long-context and reasoning capability.
 | [plan.md](plan.md) | Target-model choice, architecture deltas vs. the MiniCPM3 MLA port, indexer sizing, Phase 0 / 1 / 2a / 2b, reuse map, compute budget, risks |
 | [data_plan.md](data_plan.md) | Prompts-only/on-policy rule (from the Qwen3-235B draft-head survey), difficulty-not-length selection criterion, dataset evaluation, the three data streams, mixture, filtering, **§11 known gap: no instruction-shaped prefill-long data** |
 | [eval_plan.md](eval_plan.md) | Long-context benchmark selection, the de-confounding ladder, length × top_k grid, intrinsic indexer probes, thinking-mode eval protocol, acceptance gates |
+| [serving_bringup_results.md](serving_bringup_results.md) | **P0-P4 execution log (2026-08-20): what was built, the token-exact ladder, throughput (1.60x at 21K/4096/conc16), and the five silent failure modes found on the way** |
+| [serving_eval_plan.md](serving_eval_plan.md) | **vLLM serving + how the evaluation actually gets run (2026-08-20).** Executes plan_v2 §5: the reuse ledger (every kernel reused, ~350 lines of non-MLA plumbing written), the two still-free training-side geometry decisions, phases P0–P6 with gates, and the DSA-vs-MSA equal-KV-budget comparison |
 
 **Prior art in this repo** (MiniCPM3-4B, MLA + DSA): `docs/dsa_minicpm3_plan.md`,
 `docs/dsa_phase2_plan.md`, `docs/dsa_eval_report.md`, `docs/dsa_vllm_serving.md`.
 Read `docs/dsa_eval_report.md` first — its §2 (sparsity verification) and §3 (drift-vs-sparsity
 ladder) are the methodology this plan generalizes.
 
-**Status:** planning only. Nothing implemented as of 2026-07-27.
+**Status (2026-08-20):** training code landed (commit `211c1813`) but **no Qwen3 DSA run has started**.
+Serving/eval is planned in [serving_eval_plan.md](serving_eval_plan.md); ~6 days of it (P0–P2) needs no
+checkpoint, and P0 (the FA3 page-size-1 GQA spike) gates the whole approach.
