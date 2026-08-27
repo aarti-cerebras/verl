@@ -16,11 +16,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-
 EXACT_ARCH = "Qwen3DSAForCausalLM"
 APPROX_ARCH = "Qwen3DSAApproxForCausalLM"
 SELECTORS = ("topk", "exact_ge", "radix_floor", "radix_midpoint", "radix_ceil")
-TELEMETRY = ("off", "summary", "verify_exact", "graph_safety")
+TELEMETRY = ("off", "summary", "verify_exact", "graph_safety", "graph_verify_exact")
 
 
 def _round_up(value: int, alignment: int) -> int:

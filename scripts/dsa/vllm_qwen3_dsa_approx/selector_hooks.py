@@ -11,7 +11,6 @@ import torch
 from .radix_selector_reference import select_prefix_reference
 from .selector_runtime import RUNTIME
 
-
 PINNED_VLLM_VERSION = "0.26.0"
 
 
@@ -74,7 +73,7 @@ def _selection(
         config.selector,
     )
     reference = None
-    if config.telemetry == "verify_exact":
+    if config.telemetry in ("verify_exact", "graph_verify_exact"):
         reference = torch.full_like(output, -1)
         if output.shape[1] == config.rule_k:
             # This is the literal stock vLLM exact set and therefore preserves
@@ -90,10 +89,12 @@ def _selection(
             reference[:, :width].copy_(
                 torch.where(keep, result.exact_indices[:, :width].to(torch.int32), -1)
             )
-    # Host-folded telemetry runs only in eager mode. In Stage-A CUDA-graph support telemetry is
-    # required to be off, leaving this path tensor-only so the selector and mandatory safety checks
-    # are captured and replayed. Do not record a capture-time call that would never repeat on replay.
-    if config.telemetry not in ("off", "graph_safety"):
+    # Host-folded telemetry runs only in eager mode. graph_verify_exact keeps that path for eager
+    # prefill but records decode into persistent device storage. Do not count a decode capture-time
+    # Python call that would never repeat on replay.
+    if config.telemetry not in ("off", "graph_safety") and not (
+        config.telemetry == "graph_verify_exact" and phase == "decode"
+    ):
         RUNTIME.note_call(phase)
     RUNTIME.validate_and_record(
         phase=phase,
@@ -103,7 +104,10 @@ def _selection(
         stock_reference=reference,
         key_count=logits.shape[1],
         layer_name=(
-            _captured_indexer_layer() if config.telemetry == "graph_safety" else None
+            _captured_indexer_layer()
+            if config.telemetry in ("graph_safety", "graph_verify_exact")
+            and (config.telemetry == "graph_safety" or phase == "decode")
+            else None
         ),
     )
     return None

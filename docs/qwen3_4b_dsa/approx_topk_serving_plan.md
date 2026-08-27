@@ -1,10 +1,10 @@
 # Approximate Top-k for Qwen3 DSA Serving
 
 **Status (2026-08-26):** the isolated `dsa-csx` PyTorch reference selector, hooks, variable-capacity
-FA3 handoff, telemetry, and eager GPU validation are implemented locally. CUDA-graph support is in
-Stage A: active selectors are capture-safe only with `dsa_telemetry=off`; persistent device-side
-telemetry for graph replay is still pending. A native partial-radix Triton/CUDA kernel remains
-explicitly deferred.
+FA3 handoff, telemetry, and eager/CUDA-graph validation are implemented locally. Stage B persistent
+graph-safety counters passed their GPU gate. Stage C `graph_verify_exact` quality accumulators also
+passed CUDA capture and compiled-no-graph versus compiled-graph parity. A native partial-radix
+Triton/CUDA kernel remains explicitly deferred.
 
 **Stage-A GPU gate (2026-08-26): PASS.** At 9,168/9,164 prompt tokens with `dsa_top_k=2048`, the
 `radix_ceil` reference selector produced token-identical eager and `FULL_DECODE_ONLY` CUDA-graph
@@ -14,17 +14,30 @@ telemetry rows with zero hard safety violations, capacity saturation, or rescue.
 zero telemetry rows are intentional under the Stage-A `dsa_telemetry=off` contract. Artifacts:
 `.agents/dsa_approx_gpu_validation/cg_stage_a_20260826_222937/`.
 
-**Stage B implementation in progress:** `dsa_telemetry=graph_safety` allocates persistent
+**Stage B implementation complete:** `dsa_telemetry=graph_safety` allocates persistent
 fixed-address counters before CUDA capture and records rows, calls, core selector safety failures,
 capacity saturation, and rescue per phase and sparse layer on every replay. The existing post-warmup
-RPC reset zeros those counters in place, preserving captured addresses. Full selected-count,
-overlap, and position histograms remain host-folded and are not yet graph-supported.
+RPC reset zeros those counters in place, preserving captured addresses.
 
 **Stage-B graph-safety gate (2026-08-26): PASS.** Eager and CUDA-graph ceil both recorded exactly
 662,184 post-warmup rows with zero safety violations, saturation, or rescue. Persistent replay
 counters attributed all 36 sparse layers in both phases: prefill recorded 659,952 rows / 72 calls and
 decode recorded 2,232 rows / 1,152 calls. All Stage-A token-parity gates remained exact. Artifacts:
 `.agents/dsa_approx_gpu_validation/cg_stage_b_20260826_224854/`.
+
+**Stage C implementation complete:** `dsa_telemetry=graph_verify_exact` keeps the complete eager
+prefill telemetry path under `FULL_DECODE_ONLY` and records fixed-address decode moments and
+histograms for selected count, effective k, delta k, capacity utilization, exact-set overlap,
+added/dropped keys, exact recall, precision, Jaccard, and rank-band recall. It uses the literal
+vLLM stock top-k output as its reference, retains graph-safety counters, resets all storage in place,
+and exports graph decode summaries through the normal `decode` and `position_histograms` schema.
+Distance telemetry remains intentionally disabled.
+
+**Stage-C graph-quality gate (2026-08-26): PASS.** CUDA capture completed without invalidation,
+token IDs were exact, and compiled-no-graph versus compiled-graph telemetry matched for global,
+per-layer, position-band, and safety metrics. Prefill intentionally remained eager under
+`FULL_DECODE_ONLY`. Artifacts:
+`.agents/dsa_approx_gpu_validation/cg_stage_c_20260826_235814/`.
 
 **Scope:** Qwen3 DSA evaluation and vLLM serving only. This plan does not change
 training, checkpoint weights, sampling `top_k`, or distillation top-k.

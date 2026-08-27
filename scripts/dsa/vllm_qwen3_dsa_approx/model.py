@@ -55,7 +55,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -173,7 +172,7 @@ def assert_servable_sparse(config: PretrainedConfig) -> None:
         "checkpoint computes the stock dense LM function -- serving it would produce baseline "
         "scores that read as success."
     )
-    top_k = int(getattr(config, "dsa_top_k"))
+    top_k = int(config.dsa_top_k)
     index_topk = getattr(config, "index_topk", None)
     assert index_topk is not None, (
         "config.index_topk missing. Add it in the serving dir (build_qwen3_dsa_serving_dir.py "
@@ -419,7 +418,10 @@ class Qwen3DSAModel(Qwen2Model):
 
         super().__init__(vllm_config=vllm_config, prefix=prefix, decoder_layer_type=_layer)
         if sparse:
-            if RUNTIME.config is not None and RUNTIME.config.telemetry == "graph_safety":
+            if RUNTIME.config is not None and RUNTIME.config.telemetry in (
+                "graph_safety",
+                "graph_verify_exact",
+            ):
                 layer_names = [
                     layer.self_attn.indexer.layer_name
                     for layer in self.layers
@@ -427,10 +429,16 @@ class Qwen3DSAModel(Qwen2Model):
                 ]
                 if layer_names:
                     assert self.topk_indices_buffer is not None
-                    RUNTIME.initialize_graph_safety(
-                        layer_names,
-                        device=self.topk_indices_buffer.device,
-                    )
+                    if RUNTIME.config.telemetry == "graph_verify_exact":
+                        RUNTIME.initialize_graph_quality(
+                            layer_names,
+                            device=self.topk_indices_buffer.device,
+                        )
+                    else:
+                        RUNTIME.initialize_graph_safety(
+                            layer_names,
+                            device=self.topk_indices_buffer.device,
+                        )
             n_sparse = sum(1 for lyr in self.layers if getattr(lyr, "is_sparse", False))
             print(
                 f"[Qwen3DSA-approx] {n_sparse}/{config.num_hidden_layers} layers sparse; "

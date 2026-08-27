@@ -3,6 +3,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
+from scripts.dsa.vllm_qwen3_dsa_approx import selector_hooks as hooks_module
 from scripts.dsa.vllm_qwen3_dsa_approx.radix_selector_reference import (
     select_prefix_reference,
 )
@@ -20,6 +21,20 @@ from scripts.dsa.vllm_qwen3_dsa_approx.selector_runtime import (
 @pytest.fixture(autouse=True)
 def configured_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(RUNTIME, "_config", None)
+    monkeypatch.setattr(RUNTIME, "_graph_safety", None)
+    monkeypatch.setattr(RUNTIME, "_graph_layer_slots", {})
+    monkeypatch.setattr(RUNTIME, "_graph_quality_stats", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_histograms", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_band_stats", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_band_histograms", None)
+    monkeypatch.setattr(RUNTIME, "_graph_position_edges", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_lows", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_widths", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_bin_max", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_offset_tensor", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_field_ids", None)
+    monkeypatch.setattr(RUNTIME, "_graph_quality_specs", {})
+    monkeypatch.setattr(RUNTIME, "_graph_quality_hist_offsets", {})
     RUNTIME.reset()
     RUNTIME.configure(
         SelectorConfig(
@@ -168,3 +183,42 @@ def test_telemetry_off_keeps_selection_and_safety_but_skips_host_counters(
     assert not bool(((output[:, :-1] < 0) & (output[:, 1:] >= 0)).any())
     assert RUNTIME.artifact()["safety"]["rows"] == 0
     assert "decode" not in RUNTIME.artifact()
+
+
+def test_graph_verify_exact_decode_records_device_quality_without_host_fold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        RUNTIME,
+        "_config",
+        SelectorConfig(
+            selector="radix_ceil",
+            backend="dsa_csx_reference",
+            rule_k=4,
+            capacity=4,
+            omit_bits=4,
+            telemetry="graph_verify_exact",
+        ),
+    )
+    RUNTIME.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    monkeypatch.setattr(hooks_module, "_captured_indexer_layer", lambda: "layer.0")
+
+    def host_counter_must_not_run(phase: str) -> None:
+        raise AssertionError(f"host telemetry ran during graph decode: {phase}")
+
+    monkeypatch.setattr(RUNTIME, "note_call", host_counter_must_not_run)
+    logits = torch.randn(2, 8)
+    seq_lens = torch.tensor([[8], [6]], dtype=torch.int32)
+    output = torch.empty(2, 4, dtype=torch.int32)
+    stock_calls = 0
+
+    def stock(logits, next_n, seq_lens, target, *unused) -> None:
+        nonlocal stock_calls
+        stock_calls += 1
+        _stock_prefix(logits, seq_lens.reshape(-1) - 1)(target)
+
+    _decode_hook({"decode": stock}, logits, 1, seq_lens, output, 2, 8, 1, 4)
+    artifact = RUNTIME.artifact()
+    assert stock_calls == 1
+    assert artifact["decode"]["global"]["exact_recall"]["n"] == 2
+    assert artifact["graph_replay_safety"]["global"]["calls"] == 1

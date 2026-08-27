@@ -69,13 +69,14 @@ if [[ "$EAGER" != "0" ]]; then
   # comment that used to sit here was copied from that script and claimed cudagraphs were on; it
   # was wrong for this one.
   #
-  # Active approximate selectors support CUDA graphs with dsa_telemetry=off or graph_safety.
-  # graph_safety uses fixed-address device counters that replay with the graph; summary/verify_exact
-  # remain host-folded and model construction rejects them in graph mode rather than writing an
-  # incomplete artifact. Eager remains the default while graph_safety completes its GPU gate.
+  # Active approximate selectors support CUDA graphs with dsa_telemetry=off, graph_safety, or
+  # graph_verify_exact. graph_safety records lightweight fixed-address safety counters;
+  # graph_verify_exact retains host-folded eager prefill telemetry and records persistent decode
+  # quality moments/histograms. summary/verify_exact remain entirely host-folded and are rejected
+  # in graph mode rather than writing an incomplete artifact.
   #
   # Set EAGER=0 for a `topk` serving dir, or a radix serving dir built with --telemetry off or
-  # --telemetry graph_safety.
+  # --telemetry graph_safety, or a radix serving dir built with --telemetry graph_verify_exact.
   CMD+=(--enforce-eager)
 fi
 

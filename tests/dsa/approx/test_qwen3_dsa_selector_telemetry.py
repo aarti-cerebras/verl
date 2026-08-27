@@ -33,13 +33,14 @@ def _selector_config(*, selector: str = "radix_ceil", telemetry: str = "off") ->
 
 @pytest.mark.parametrize("telemetry", ["summary", "verify_exact"])
 def test_cuda_graph_rejects_host_folded_telemetry(telemetry: str) -> None:
-    with pytest.raises(ValueError, match="require dsa_telemetry='off' or 'graph_safety'"):
+    with pytest.raises(ValueError, match="summary/verify_exact are host-folded"):
         _selector_config(telemetry=telemetry).validate_execution(cudagraph_enabled=True)
 
 
 def test_cuda_graph_accepts_telemetry_off_and_topk_control() -> None:
     _selector_config(telemetry="off").validate_execution(cudagraph_enabled=True)
     _selector_config(telemetry="graph_safety").validate_execution(cudagraph_enabled=True)
+    _selector_config(telemetry="graph_verify_exact").validate_execution(cudagraph_enabled=True)
     _selector_config(selector="topk", telemetry="verify_exact").validate_execution(
         cudagraph_enabled=True
     )
@@ -81,6 +82,139 @@ def test_graph_safety_counters_are_persistent_attributed_and_reset_in_place() ->
     reset_artifact = runtime.artifact()
     assert reset_artifact["safety"]["rows"] == 0
     assert reset_artifact["graph_replay_safety"]["global"]["calls"] == 0
+
+
+def test_graph_verify_exact_matches_host_folded_decode_and_resets_in_place() -> None:
+    torch.manual_seed(43)
+    logits = torch.randn(3, 12)
+    qpos = torch.tensor([7, 9, 11])
+    approximate = torch.empty(3, 4, dtype=torch.int32)
+    exact = torch.empty_like(approximate)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
+    select_prefix_reference(logits, qpos, 4, exact, "topk")
+
+    eager = SelectorRuntime()
+    eager.configure(_selector_config(telemetry="verify_exact"))
+    with eager.layer("layer.0"):
+        eager.note_call("decode")
+        eager.validate_and_record(
+            phase="decode",
+            output=approximate,
+            query_positions=qpos,
+            result=result,
+            stock_reference=exact,
+            key_count=logits.shape[1],
+        )
+
+    graph = SelectorRuntime()
+    graph.configure(_selector_config(telemetry="graph_verify_exact"))
+    graph.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    assert graph._graph_quality_stats is not None
+    assert graph._graph_quality_histograms is not None
+    stats_address = graph._graph_quality_stats.data_ptr()
+    histogram_address = graph._graph_quality_histograms.data_ptr()
+    graph.validate_and_record(
+        phase="decode",
+        layer_name="layer.0",
+        output=approximate,
+        query_positions=qpos,
+        result=result,
+        stock_reference=exact,
+        key_count=logits.shape[1],
+    )
+
+    eager_global = eager.artifact()["decode"]["global"]
+    artifact = graph.artifact()
+    graph_global = artifact["decode"]["global"]
+    for field in set(runtime_module.GRAPH_QUALITY_FIELDS) & set(eager_global):
+        for statistic in ("n", "mean", "std", "min", "max"):
+            assert graph_global[field][statistic] == pytest.approx(
+                eager_global[field][statistic]
+            )
+        assert graph_global[field]["percentiles"] == eager_global[field]["percentiles"]
+    for field in set(runtime_module.GRAPH_QUALITY_FIELDS) - set(eager_global):
+        assert graph_global[field] == {"n": 0}
+    replay = artifact["graph_replay_quality"]
+    assert replay["mode"] == "persistent_device_histograms"
+    assert replay["reference"] == "literal_vllm_stock_topk"
+    assert artifact["decode"]["calls"]["layer.0"] == 1
+    assert artifact["position_histograms"]["decode"][0]["rows"] == 3
+
+    graph.reset()
+    assert graph._graph_quality_stats.data_ptr() == stats_address
+    assert graph._graph_quality_histograms.data_ptr() == histogram_address
+    reset = graph.artifact()
+    assert "decode" not in reset
+    assert reset["graph_replay_safety"]["global"]["rows"] == 0
+
+
+def test_graph_verify_exact_keeps_prefill_host_folded() -> None:
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(telemetry="graph_verify_exact"))
+    runtime.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    logits = torch.randn(2, 8)
+    qpos = torch.tensor([5, 7])
+    approximate = torch.empty(2, 4, dtype=torch.int32)
+    exact = torch.empty_like(approximate)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
+    select_prefix_reference(logits, qpos, 4, exact, "topk")
+    with runtime.layer("layer.0"):
+        runtime.note_call("prefill")
+        runtime.validate_and_record(
+            phase="prefill",
+            output=approximate,
+            query_positions=qpos,
+            result=result,
+            stock_reference=exact,
+            key_count=logits.shape[1],
+        )
+    artifact = runtime.artifact()
+    assert artifact["prefill"]["global"]["exact_recall"]["n"] == 2
+    assert artifact["graph_replay_safety"]["phases"]["prefill"]["global"]["rows"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+def test_graph_verify_exact_device_accumulators_replay_under_cuda_graph() -> None:
+    device = torch.device("cuda")
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(telemetry="graph_verify_exact"))
+    runtime.initialize_graph_quality(["layer.0"], device=device)
+    logits = torch.randn(3, 12, device=device)
+    qpos = torch.tensor([7, 9, 11], device=device)
+    approximate = torch.empty(3, 4, dtype=torch.int32, device=device)
+    exact = torch.empty_like(approximate)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
+    select_prefix_reference(logits, qpos, 4, exact, "topk")
+
+    def record() -> None:
+        runtime.validate_and_record(
+            phase="decode",
+            layer_name="layer.0",
+            output=approximate,
+            query_positions=qpos,
+            result=result,
+            stock_reference=exact,
+            key_count=logits.shape[1],
+        )
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        record()
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+    runtime.reset()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        record()
+    runtime.reset()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    artifact = runtime.artifact()
+    assert artifact["decode"]["global"]["exact_recall"]["n"] == 3
+    assert artifact["graph_replay_safety"]["global"]["calls"] == 1
 
 
 def test_distribution_contract_contains_tail_percentiles() -> None:
