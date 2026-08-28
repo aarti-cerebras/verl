@@ -75,7 +75,7 @@ def test_prefill_hook_replaces_exact_selection() -> None:
 def test_generic_decode_hook() -> None:
     torch.manual_seed(31)
     logits = torch.randn(2, 8)
-    seq_lens = torch.tensor([[8], [6]], dtype=torch.int32)
+    seq_lens = torch.tensor([[8], [0]], dtype=torch.int32)
     output = torch.empty(2, 4, dtype=torch.int32)
 
     def stock(logits, next_n, seq_lens, target, *unused) -> None:
@@ -85,6 +85,7 @@ def test_generic_decode_hook() -> None:
         {"decode": stock}, logits, 1, seq_lens, output, 2, 8, 1, 4
     )
     assert bool((output <= (seq_lens.reshape(-1) - 1)[:, None]).all())
+    assert bool((output[1] == -1).all())
 
 
 @pytest.mark.parametrize("name", ["cooperative_topk", "persistent_topk"])
@@ -173,7 +174,7 @@ def test_telemetry_off_keeps_selection_and_safety_but_skips_host_counters(
 
     monkeypatch.setattr(RUNTIME, "note_call", host_counter_must_not_run)
     logits = torch.randn(2, 8)
-    seq_lens = torch.tensor([[8], [6]], dtype=torch.int32)
+    seq_lens = torch.tensor([[8], [0]], dtype=torch.int32)
     output = torch.empty(2, 4, dtype=torch.int32)
 
     def stock(logits, next_n, seq_lens, target, *unused) -> None:
@@ -181,6 +182,7 @@ def test_telemetry_off_keeps_selection_and_safety_but_skips_host_counters(
 
     _decode_hook({"decode": stock}, logits, 1, seq_lens, output, 2, 8, 1, 4)
     assert not bool(((output[:, :-1] < 0) & (output[:, 1:] >= 0)).any())
+    assert bool((output[1] == -1).all())
     assert RUNTIME.artifact()["safety"]["rows"] == 0
     assert "decode" not in RUNTIME.artifact()
 
@@ -207,9 +209,9 @@ def test_graph_verify_exact_decode_records_device_quality_without_host_fold(
         raise AssertionError(f"host telemetry ran during graph decode: {phase}")
 
     monkeypatch.setattr(RUNTIME, "note_call", host_counter_must_not_run)
-    logits = torch.randn(2, 8)
-    seq_lens = torch.tensor([[8], [6]], dtype=torch.int32)
-    output = torch.empty(2, 4, dtype=torch.int32)
+    logits = torch.randn(3, 8)
+    seq_lens = torch.tensor([[8], [6], [0]], dtype=torch.int32)
+    output = torch.empty(3, 4, dtype=torch.int32)
     stock_calls = 0
 
     def stock(logits, next_n, seq_lens, target, *unused) -> None:
@@ -217,8 +219,9 @@ def test_graph_verify_exact_decode_records_device_quality_without_host_fold(
         stock_calls += 1
         _stock_prefix(logits, seq_lens.reshape(-1) - 1)(target)
 
-    _decode_hook({"decode": stock}, logits, 1, seq_lens, output, 2, 8, 1, 4)
+    _decode_hook({"decode": stock}, logits, 1, seq_lens, output, 3, 8, 1, 4)
     artifact = RUNTIME.artifact()
     assert stock_calls == 1
     assert artifact["decode"]["global"]["exact_recall"]["n"] == 2
+    assert artifact["graph_replay_safety"]["global"]["rows"] == 2
     assert artifact["graph_replay_safety"]["global"]["calls"] == 1

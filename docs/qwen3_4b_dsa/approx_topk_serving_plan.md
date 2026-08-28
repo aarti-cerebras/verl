@@ -1,6 +1,6 @@
 # Approximate Top-k for Qwen3 DSA Serving
 
-**Status (2026-08-26):** the isolated `dsa-csx` PyTorch reference selector, hooks, variable-capacity
+**Status (2026-08-28):** the isolated `dsa-csx` PyTorch reference selector, hooks, variable-capacity
 FA3 handoff, telemetry, and eager/CUDA-graph validation are implemented locally. Stage B persistent
 graph-safety counters passed their GPU gate. Stage C `graph_verify_exact` quality accumulators also
 passed CUDA capture and compiled-no-graph versus compiled-graph parity. A native partial-radix
@@ -8,8 +8,10 @@ Triton/CUDA kernel remains explicitly deferred.
 
 **Stage-A GPU gate (2026-08-26): PASS.** At 9,168/9,164 prompt tokens with `dsa_top_k=2048`, the
 `radix_ceil` reference selector produced token-identical eager and `FULL_DECODE_ONLY` CUDA-graph
-outputs. The complete seven-arm campaign also passed exact-vs-copy top-k parity, top-k eager-vs-graph
-parity, and ceil eager-vs-graph parity. Ceil, midpoint, and floor each recorded 662,184 eager
+outputs in that recorded pair of processes. The complete seven-arm campaign also observed
+exact-vs-copy top-k parity, top-k eager-vs-graph parity, and ceil eager-vs-graph parity. Later
+fresh-process replication showed that greedy equality is not deterministic even for exact versus
+exact, so those historical observations are not reproducibility gates. Ceil, midpoint, and floor each recorded 662,184 eager
 telemetry rows with zero hard safety violations, capacity saturation, or rescue. The graph arm's
 zero telemetry rows are intentional under the Stage-A `dsa_telemetry=off` contract. Artifacts:
 `.agents/dsa_approx_gpu_validation/cg_stage_a_20260826_222937/`.
@@ -38,6 +40,29 @@ token IDs were exact, and compiled-no-graph versus compiled-graph telemetry matc
 per-layer, position-band, and safety metrics. Prefill intentionally remained eager under
 `FULL_DECODE_ONLY`. Artifacts:
 `.agents/dsa_approx_gpu_validation/cg_stage_c_20260826_235814/`.
+
+**Historical gate scope and concurrency gap (identified 2026-08-28):** the Stage A/B/C PASS results
+above used one offline `LLM.generate` call containing only two nearly equal-length prompts. That
+covered the two-request decode shape but never forced vLLM to pad a non-power-of-two request batch
+to a CUDA-graph capture bucket. It therefore did not cover production-style heterogeneous decode
+concurrency. In a later evaluation, a seven-request decode batch was padded to eight; the inactive
+row had sequence length zero and exposed an unmasked selector rescue. The historical PASS claims
+remain valid for their recorded two-request workload, but must not be read as multi-request graph
+padding validation.
+
+The versioned Stage runner, `tests/dsa/run_qwen3_dsa_approx_gpu_validation.sh`, now sets
+`--decode-batch-size 7`. The smoke harness submits seven heterogeneous long prompts in one call and
+forces every request to decode `--max-tokens` tokens, deliberately
+exercising the 7-to-8 `FULL_DECODE_ONLY` capture bucket. Each arm fails unless all seven outputs are
+present, at least three prompt lengths are distinct, and every prompt exceeds 2,048 tokens. This
+expanded fixture completed for all eight arms on 2026-08-28: every process served all seven requests,
+the 7-to-8 graph bucket captured cleanly, and floor/ceil telemetry reported zero hard violations.
+The old runner nevertheless failed because it required cross-process greedy tokens and every quality
+summary statistic to be bit-identical. Three fresh exact-plugin controls then produced margins
+`0.125`, `0.125`, and `0.0` at the same decision, with the zero-margin run choosing the alternate
+token. The runner now reports token equality diagnostically and instead hard-gates centered
+top-token logprobs on identical prefixes, tolerance-bounded quality means, exact selector semantics,
+and safety. A GPU rerun of that revised verdict is pending.
 
 **Scope:** Qwen3 DSA evaluation and vLLM serving only. This plan does not change
 training, checkpoint weights, sampling `top_k`, or distillation top-k.
@@ -671,8 +696,9 @@ sampling parameters, and seed. The serve manifest records the artifact path.
 Add tests for:
 
 - snapshot parity: the untouched exact server and the initial approximate copy
-  in `dsa_selector=topk` mode produce identical selected indices, logits, and
-  deterministic tokens on fixed fixtures;
+  in `dsa_selector=topk` mode produce identical selected indices on fixed tensors and
+  tolerance-bounded centered logits on identical generated prefixes; free-running token equality is
+  reported but is not a cross-process hard gate;
 - isolation: importing the exact bootstrap does not install selector hooks and
   starting the approximate bootstrap does not mutate files or configuration in
   the exact serving directory;
@@ -689,7 +715,8 @@ Add tests for:
 - same-pass exact verification;
 - layer and query-position attribution;
 - eager/CUDA-graph parity;
-- repeated-run determinism;
+- heterogeneous concurrent decode at non-power-of-two batch sizes, including 7-to-8 graph padding;
+- repeated-run numerical-variability characterization for the exact and copied controls;
 - unchanged exact-top-k mode.
 
 Fatal safety gates:
@@ -724,9 +751,10 @@ deferred.
 1. Record the source revision, snapshot the working exact plugin into
    `vllm_qwen3_dsa_approx`, rename its architecture/indexer classes, and add
    separate approximate bootstrap, builder, entry point, and serve script.
-2. Before any selector change, pass a parity gate between the untouched exact
-   server and the copied server in `dsa_selector=topk` mode. Stop if selected
-   indices, logits, or deterministic tokens differ.
+2. Before any selector change, pass fixed-input selected-index parity between the untouched exact
+   server and copied `dsa_selector=topk` server. For fresh end-to-end processes, compare centered
+   top-token logprobs on identical prefixes against the exact-vs-exact variability envelope; report
+   greedy token equality diagnostically.
 3. Add approximate-only configuration parsing, hard validation, and manifest
    fields. Verify that the exact serving directory and exact source paths have
    no diff.

@@ -25,6 +25,14 @@ MAX_LEN="${MAX_LEN:-32768}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 SERVED_NAME="${SERVED_NAME:-Qwen3-4B-Thinking-2507}"
 EAGER="${EAGER:-1}"
+# vLLM cudagraph tier used when EAGER=0. FULL_AND_PIECEWISE -- vLLM's default -- CANNOT capture
+# an active approximate selector: selector_hooks derives request boundaries with a host sync
+# (`.tolist()` on cu_seqlen_ks/ke), which is illegal inside a capturing stream. Measured
+# 2026-08-26: PIECEWISE captures 51/51 and FULL then dies with "operation not permitted when
+# stream is capturing". FULL_DECODE_ONLY leaves prefill eager (sync legal) and still captures
+# decode, which is what every Stage A/B/C GPU gate ran. Set CG_MODE= (empty) to accept the
+# vLLM default -- only correct for a `topk` serving dir, whose stock selector is graph-compatible.
+CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 LOGDIR=${LOGDIR:-/cb/ml-eng/aarti/dsa_qwen3/serving/logs}; mkdir -p "$LOGDIR"
 TS=$(date +%Y%m%d_%H%M%S)
 LOG=$LOGDIR/${TS}_serve_dsa_approx_gpu${GPU}_p${PORT}.log
@@ -78,6 +86,8 @@ if [[ "$EAGER" != "0" ]]; then
   # Set EAGER=0 for a `topk` serving dir, or a radix serving dir built with --telemetry off or
   # --telemetry graph_safety, or a radix serving dir built with --telemetry graph_verify_exact.
   CMD+=(--enforce-eager)
+elif [[ -n "$CG_MODE" ]]; then
+  CMD+=(--compilation-config "{\"cudagraph_mode\":\"$CG_MODE\"}")
 fi
 
 {
@@ -96,7 +106,7 @@ fi
   echo "PYTHONPATH:  $PYTHONPATH"
   echo "DSA_SPARSE:  $DSA_SPARSE   DSA_RANDOM_INDEXER: ${DSA_RANDOM_INDEXER:-0}"
   echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
-  echo "port:$PORT gpu_mem_util:$GPU_MEM_UTIL max_len:$MAX_LEN block_size:64 eager:$EAGER"
+  echo "port:$PORT gpu_mem_util:$GPU_MEM_UTIL max_len:$MAX_LEN block_size:64 eager:$EAGER cudagraph_mode:$([[ "$EAGER" != "0" ]] && echo n/a || echo "${CG_MODE:-vllm-default}")"
   echo "command:     ${CMD[*]}"
   echo "log:         $LOG"
   echo "================================"

@@ -26,6 +26,30 @@ def test_reference_selector_emits_valid_prefix(selector: str) -> None:
         assert selected.unique().numel() == selected.numel()
 
 
+@pytest.mark.parametrize(
+    "selector",
+    ["topk", "exact_ge", "radix_floor", "radix_midpoint", "radix_ceil"],
+)
+def test_cuda_graph_padding_rows_stay_empty(selector: str) -> None:
+    torch.manual_seed(9)
+    logits = torch.randn(4, 12)
+    qpos = torch.tensor([7, 11, -1, -1])
+    padded_output = torch.empty(4, 12, dtype=torch.int32)
+    padded = select_prefix_reference(logits, qpos, 4, padded_output, selector)
+
+    active_output = torch.empty(2, 12, dtype=torch.int32)
+    active = select_prefix_reference(logits[:2], qpos[:2], 4, active_output, selector)
+
+    assert torch.equal(padded_output[:2], active_output)
+    assert torch.equal(padded.selected_count[:2], active.selected_count)
+    assert torch.equal(padded.effective_k[:2], active.effective_k)
+    assert torch.equal(padded.rescued[:2], active.rescued)
+    assert bool((padded_output[2:] == -1).all())
+    assert padded.selected_count[2:].tolist() == [0, 0]
+    assert padded.effective_k[2:].tolist() == [0, 0]
+    assert padded.rescued[2:].tolist() == [False, False]
+
+
 def test_selector_set_invariants() -> None:
     torch.manual_seed(11)
     logits = torch.randn(8, 64)

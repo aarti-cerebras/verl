@@ -139,6 +139,49 @@ def write_selector_artifact(llm, path: str | None, *, expected: bool, model: str
     print(f"[smoke] wrote selector telemetry {target} (safety rows={rows})")
 
 
+def build_prompts(prompt_tokens: int, decode_batch_size: int) -> tuple[list[str], list[str], int]:
+    """Build a heterogeneous batch that keeps every request alive for decode validation."""
+
+    if decode_batch_size < 2:
+        raise ValueError(f"decode_batch_size must be at least 2, got {decode_batch_size}")
+    sents = [
+        f"Fact {i}: the code word for item {i} is {(i * 7919) % 10007}."
+        for i in range(max(prompt_tokens // 14, 1))
+    ]
+    filler = " ".join(sents) + "\n" if prompt_tokens else ""
+    needle_i = max(len(sents) // 3, 0)
+    prompts = [
+        filler + "Q: What is 17 * 23? Think briefly, then answer.\nA:",
+        filler + f"Q: Repeat the code word for item {needle_i} exactly.\nA:",
+    ]
+    for request_index in range(2, decode_batch_size):
+        # Drop a different number of complete facts from each extra request. This keeps the long
+        # context content meaningful while guaranteeing heterogeneous request lengths. A batch of
+        # seven therefore exercises vLLM's 7 -> 8 FULL_DECODE_ONLY graph padding instead of merely
+        # replaying the historically covered, naturally captured two-request shape.
+        if prompt_tokens:
+            kept = max(1, len(sents) - request_index)
+            request_filler = " ".join(sents[:kept]) + "\n"
+        else:
+            request_filler = " ".join(
+                f"Check value {value}." for value in range(request_index + 1)
+            ) + "\n"
+        prompts.append(
+            request_filler
+            + f"Q: State the request marker {request_index}, then briefly summarize the final fact.\nA:"
+        )
+    return prompts, sents, needle_i
+
+
+def serialize_step_logprobs(steps) -> list[dict[str, float]]:
+    """Convert vLLM's per-step ``Logprob`` objects into stable JSON data."""
+
+    return [
+        {str(int(token_id)): float(item.logprob) for token_id, item in step.items()}
+        for step in (steps or [])
+    ]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/cb/ml-eng/aarti/dsa_qwen3/serving/p2_mix5050_k2048_step1200")
@@ -152,9 +195,37 @@ def main() -> int:
                     help="FULL_AND_PIECEWISE (vLLM default) | PIECEWISE | FULL | NONE")
     ap.add_argument("--prompt-tokens", type=int, default=0,
                     help="prepend roughly N filler tokens to exercise a longer prefill")
+    ap.add_argument(
+        "--decode-batch-size",
+        type=int,
+        default=2,
+        help=(
+            "number of heterogeneous prompts submitted in one LLM.generate call; use 7 to force "
+            "the FULL_DECODE_ONLY 7-to-8 padded capture bucket"
+        ),
+    )
+    ap.add_argument(
+        "--logprobs",
+        type=int,
+        default=0,
+        help=(
+            "save this many top token logprobs per generation step in --out-json; "
+            "0 keeps the normal compact artifact"
+        ),
+    )
+    ap.add_argument(
+        "--architecture-override",
+        default=None,
+        help=(
+            "diagnostic Hugging Face architecture override; permits loading the same serving "
+            "directory through a different registered implementation"
+        ),
+    )
     ap.add_argument("--out-json", default=None, help="dump {prompt_idx: text} for ladder diffing")
     ap.add_argument("--label", default="", help="tag recorded in --out-json")
     args = ap.parse_args()
+    if args.logprobs < 0:
+        ap.error("--logprobs must be nonnegative")
 
     from vllm import LLM, SamplingParams
 
@@ -179,20 +250,18 @@ def main() -> int:
             enable_prefix_caching=False,
             seed=1234,
             worker_extension_cls=WORKER_EXTENSION_CLS,
+            **(
+                {"hf_overrides": {"architectures": [args.architecture_override]}}
+                if args.architecture_override
+                else {}
+            ),
         )
         # A long, non-repetitive filler: repeated text would let ANY selector succeed (every
         # position is interchangeable), which would make the sparsity ladder meaningless. Numbered
         # sentences also give the needle question a unique answer to retrieve.
-        sents = [
-            f"Fact {i}: the code word for item {i} is {(i * 7919) % 10007}."
-            for i in range(max(args.prompt_tokens // 14, 1))
-        ]
-        filler = " ".join(sents) + "\n" if args.prompt_tokens else ""
-        needle_i = max(len(sents) // 3, 0)
-        prompts = [
-            filler + "Q: What is 17 * 23? Think briefly, then answer.\nA:",
-            filler + f"Q: Repeat the code word for item {needle_i} exactly.\nA:",
-        ]
+        prompts, sents, needle_i = build_prompts(
+            args.prompt_tokens, args.decode_batch_size
+        )
         # Everything observed so far came from vLLM's warmup/autotune dummy batches, whose
         # operands are synthetic; folding them into the artifact would attribute them to real
         # traffic and let the runner's hard-violation gate fire (or hide) on garbage.
@@ -200,22 +269,80 @@ def main() -> int:
 
         outs = llm.generate(
             prompts,
-            SamplingParams(temperature=0.0, max_tokens=args.max_tokens, seed=1234),
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=args.max_tokens,
+                min_tokens=args.max_tokens,
+                ignore_eos=True,
+                seed=1234,
+                logprobs=args.logprobs or None,
+            ),
+        )
+        if len(outs) != args.decode_batch_size:
+            raise RuntimeError(
+                f"concurrent decode fixture returned {len(outs)} outputs for "
+                f"decode_batch_size={args.decode_batch_size}"
+            )
+        prompt_lengths = [len(output.prompt_token_ids) for output in outs]
+        decode_lengths = [len(output.outputs[0].token_ids) for output in outs]
+        if any(length != args.max_tokens for length in decode_lengths):
+            raise RuntimeError(
+                "concurrent decode fixture did not keep every request alive for the forced decode "
+                f"window: expected={args.max_tokens}, observed={decode_lengths}"
+            )
+        distinct_lengths = len(set(prompt_lengths))
+        if args.decode_batch_size > 2 and distinct_lengths < 3:
+            raise RuntimeError(
+                "concurrent decode fixture did not produce heterogeneous prompt lengths: "
+                f"{prompt_lengths}"
+            )
+        print(
+            f"[smoke] concurrent decode batch: requests={args.decode_batch_size} "
+            f"distinct_prompt_lengths={distinct_lengths} min={min(prompt_lengths)} "
+            f"max={max(prompt_lengths)} forced_decode_tokens={args.max_tokens}"
         )
         rec = {}
         for i, o in enumerate(outs):
-            text = o.outputs[0].text
+            completion = o.outputs[0]
+            text = completion.text
             rec[str(i)] = {
                 "n_prompt_tok": len(o.prompt_token_ids),
-                "token_ids": list(o.outputs[0].token_ids),
+                "token_ids": list(completion.token_ids),
                 "text": text,
             }
+            if args.logprobs:
+                step_logprobs = serialize_step_logprobs(completion.logprobs)
+                if len(step_logprobs) != len(completion.token_ids):
+                    raise RuntimeError(
+                        "requested generation logprobs are incomplete: "
+                        f"prompt={i} tokens={len(completion.token_ids)} "
+                        f"logprob_steps={len(step_logprobs)}"
+                    )
+                rec[str(i)]["step_logprobs"] = step_logprobs
             print(f"[smoke] prompt {i}: n_prompt_tok={len(o.prompt_token_ids)} -> "
                   f"{text.replace(chr(10), ' ')[:200]!r}")
+        needle_retrieved = None
+        if len(sents) > 1:
+            want = str((needle_i * 7919) % 10007)
+            needle_retrieved = want in rec["1"]["text"]
+            print(f"[smoke] needle(item {needle_i} = {want}) retrieved: {needle_retrieved}")
+            if not needle_retrieved:
+                raise RuntimeError(f"long-context needle item {needle_i}={want} was not retrieved")
         if args.out_json:
+            artifact = {
+                "label": args.label,
+                "sparse": int(sparse),
+                "top_k": args.top_k,
+                "decode_batch_size": args.decode_batch_size,
+                "needle_retrieved": needle_retrieved,
+                "outputs": rec,
+            }
+            if args.architecture_override:
+                artifact["architecture_override"] = args.architecture_override
+            if args.logprobs:
+                artifact["logprobs"] = args.logprobs
             with open(args.out_json, "w") as fh:
-                json.dump({"label": args.label, "sparse": int(sparse), "top_k": args.top_k,
-                           "outputs": rec}, fh, indent=2)
+                json.dump(artifact, fh, indent=2)
             print(f"[smoke] wrote {args.out_json}")
         write_selector_artifact(
             llm,
@@ -224,10 +351,6 @@ def main() -> int:
             model=model,
         )
 
-        if len(sents) > 1:
-            want = str((needle_i * 7919) % 10007)
-            got = want in rec["1"]["text"]
-            print(f"[smoke] needle(item {needle_i} = {want}) retrieved: {got}")
         print("[smoke] OK")
         return 0
     finally:

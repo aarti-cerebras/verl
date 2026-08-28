@@ -20,12 +20,14 @@ from scripts.dsa.vllm_qwen3_dsa_approx.selector_telemetry import (
 )
 
 
-def _selector_config(*, selector: str = "radix_ceil", telemetry: str = "off") -> SelectorConfig:
+def _selector_config(
+    *, selector: str = "radix_ceil", telemetry: str = "off", capacity: int = 4
+) -> SelectorConfig:
     return SelectorConfig(
         selector=selector,
         backend="vllm_stock" if selector == "topk" else "dsa_csx_reference",
         rule_k=4,
-        capacity=4,
+        capacity=capacity,
         omit_bits=4,
         telemetry=telemetry,
     )
@@ -82,6 +84,60 @@ def test_graph_safety_counters_are_persistent_attributed_and_reset_in_place() ->
     reset_artifact = runtime.artifact()
     assert reset_artifact["safety"]["rows"] == 0
     assert reset_artifact["graph_replay_safety"]["global"]["calls"] == 0
+
+
+def test_graph_telemetry_excludes_cuda_graph_padding_rows() -> None:
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(telemetry="graph_verify_exact"))
+    runtime.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    logits = torch.randn(4, 12)
+    qpos = torch.tensor([7, 9, -1, -1])
+    approximate = torch.empty(4, 4, dtype=torch.int32)
+    exact = torch.empty_like(approximate)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
+    select_prefix_reference(logits, qpos, 4, exact, "topk")
+
+    runtime.validate_and_record(
+        phase="decode",
+        layer_name="layer.0",
+        output=approximate,
+        query_positions=qpos,
+        result=result,
+        stock_reference=exact,
+        key_count=logits.shape[1],
+    )
+
+    artifact = runtime.artifact()
+    graph_safety = artifact["graph_replay_safety"]["global"]
+    assert graph_safety["rows"] == 2
+    assert graph_safety["calls"] == 1
+    assert not any(
+        graph_safety[name]
+        for name in runtime_module.GRAPH_SAFETY_FIELDS
+        if name not in ("rows", "calls")
+    )
+    assert artifact["decode"]["global"]["exact_recall"]["n"] == 2
+    assert artifact["position_histograms"]["decode"][0]["rows"] == 2
+
+
+def test_inactive_cuda_graph_padding_row_fails_closed_if_nonempty() -> None:
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(telemetry="off"))
+    logits = torch.randn(2, 8)
+    qpos = torch.tensor([7, -1])
+    output = torch.empty(2, 4, dtype=torch.int32)
+    result = select_prefix_reference(logits, qpos, 4, output, "radix_ceil")
+    output[1, 0] = 0
+
+    with pytest.raises(RuntimeError, match="inactive CUDA graph padding row"):
+        runtime.validate_and_record(
+            phase="decode",
+            output=output,
+            query_positions=qpos,
+            result=result,
+            stock_reference=None,
+            key_count=logits.shape[1],
+        )
 
 
 def test_graph_verify_exact_matches_host_folded_decode_and_resets_in_place() -> None:
@@ -174,19 +230,24 @@ def test_graph_verify_exact_keeps_prefill_host_folded() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
-def test_graph_verify_exact_device_accumulators_replay_under_cuda_graph() -> None:
+@pytest.mark.parametrize(("selector", "capacity"), [("radix_ceil", 4), ("radix_floor", 12)])
+def test_graph_verify_exact_device_accumulators_replay_under_cuda_graph(
+    selector: str, capacity: int
+) -> None:
     device = torch.device("cuda")
     runtime = SelectorRuntime()
-    runtime.configure(_selector_config(telemetry="graph_verify_exact"))
+    runtime.configure(
+        _selector_config(selector=selector, telemetry="graph_verify_exact", capacity=capacity)
+    )
     runtime.initialize_graph_quality(["layer.0"], device=device)
-    logits = torch.randn(3, 12, device=device)
-    qpos = torch.tensor([7, 9, 11], device=device)
-    approximate = torch.empty(3, 4, dtype=torch.int32, device=device)
+    logits = torch.randn(4, 12, device=device)
+    qpos = torch.tensor([7, 9, 11, -1], device=device)
+    approximate = torch.empty(4, capacity, dtype=torch.int32, device=device)
     exact = torch.empty_like(approximate)
-    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
-    select_prefix_reference(logits, qpos, 4, exact, "topk")
 
     def record() -> None:
+        result = select_prefix_reference(logits, qpos, 4, approximate, selector)
+        select_prefix_reference(logits, qpos, 4, exact, "topk")
         runtime.validate_and_record(
             phase="decode",
             layer_name="layer.0",
@@ -209,11 +270,20 @@ def test_graph_verify_exact_device_accumulators_replay_under_cuda_graph() -> Non
     with torch.cuda.graph(graph):
         record()
     runtime.reset()
+    # vLLM mutates persistent graph inputs before every replay. Move the inactive row and shorten
+    # two real prefixes so this test catches capture-time value baking as well as padding support.
+    qpos.copy_(torch.tensor([5, -1, 3, 10], device=device))
+    logits.copy_(torch.randn_like(logits))
     graph.replay()
     torch.cuda.synchronize()
 
+    assert bool((approximate[1] == -1).all())
+    assert bool(
+        ((approximate == -1) | ((approximate >= 0) & (approximate <= qpos[:, None]))).all()
+    )
     artifact = runtime.artifact()
     assert artifact["decode"]["global"]["exact_recall"]["n"] == 3
+    assert artifact["graph_replay_safety"]["global"]["rows"] == 3
     assert artifact["graph_replay_safety"]["global"]["calls"] == 1
 
 

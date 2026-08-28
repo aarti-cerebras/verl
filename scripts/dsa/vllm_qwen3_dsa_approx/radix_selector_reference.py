@@ -74,6 +74,11 @@ def select_prefix_reference(
     qpos = query_positions.reshape(-1).to(device=logits.device, dtype=torch.int64)
     if qpos.numel() != rows:
         raise ValueError(f"got {qpos.numel()} query positions for {rows} score rows")
+    # vLLM pads FULL CUDA graph batches to a captured batch size by setting the unused sequence
+    # lengths to zero. The decode hook consequently presents those rows with qpos=-1. They are not
+    # requests and must stay empty; in particular, the ordinary empty-selection rescue must not
+    # manufacture key 0 for them.
+    active = qpos >= 0
     valid = torch.arange(key_count, device=logits.device)[None, :] <= qpos[:, None]
     scores = logits.float().masked_fill(~valid, float("-inf"))
     # Boolean indexing materializes a data-dependent-length tensor. CUDA graph capture rejects that
@@ -117,7 +122,7 @@ def select_prefix_reference(
 
     selected_count = rule.member_ge(rule.mono(scores), valid, mono_threshold).sum(-1)
     selected_count = torch.where(degenerate, effective_k, selected_count)
-    rescued = ~keep.any(-1)
+    rescued = active & ~keep.any(-1)
     keep[:, 0] = keep[:, 0] | rescued
     selected_count = torch.where(rescued, torch.ones_like(selected_count), selected_count)
     _assert_tensor(

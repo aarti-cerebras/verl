@@ -24,6 +24,8 @@ model's long-context and reasoning capability.
 | [eval_plan.md](eval_plan.md) | Long-context benchmark selection, the de-confounding ladder, length × top_k grid, intrinsic indexer probes, thinking-mode eval protocol, acceptance gates |
 | [serving_bringup_results.md](serving_bringup_results.md) | **P0-P4 execution log (2026-08-20): what was built, the token-exact ladder, throughput (1.60x at 21K/4096/conc16), and the five silent failure modes found on the way** |
 | [serving_eval_plan.md](serving_eval_plan.md) | **vLLM serving + how the evaluation actually gets run (2026-08-20).** Executes plan_v2 §5: the reuse ledger (every kernel reused, ~350 lines of non-MLA plumbing written), the two still-free training-side geometry decisions, phases P0–P6 with gates, and the DSA-vs-MSA equal-KV-budget comparison |
+| [approx_topk_selector_overview.md](approx_topk_selector_overview.md) | Exact and copied-top-k controls, partial-radix floor/midpoint/ceil semantics, capacity and safety contracts, and the distinction between approximate attention sets and a future selector-speed kernel |
+| [approx_topk_cuda_graph_debugging.md](approx_topk_cuda_graph_debugging.md) | Production seven-request CUDA-graph padding failure, debug arms, inactive-row fix, numerical-parity experiments, exact-process nondeterminism conclusion, and revised validation policy |
 
 **Prior art in this repo** (MiniCPM3-4B, MLA + DSA): `docs/dsa_minicpm3_plan.md`,
 `docs/dsa_phase2_plan.md`, `docs/dsa_eval_report.md`, `docs/dsa_vllm_serving.md`.

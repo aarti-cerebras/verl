@@ -401,7 +401,7 @@ class SelectorRuntime:
         *,
         phase: str,
         layer_name: str,
-        rows: int,
+        active: torch.Tensor,
         count_mismatch: torch.Tensor,
         padding_violation: torch.Tensor,
         invalid_index: torch.Tensor,
@@ -427,7 +427,7 @@ class SelectorRuntime:
         target = counters[phase_slot, layer_slot]
         # Every operation below is fixed-shape and device-side. During capture these in-place adds
         # become graph nodes; replay updates the same persistent storage without executing Python.
-        target[GRAPH_SAFETY_SLOT["rows"]].add_(rows)
+        target[GRAPH_SAFETY_SLOT["rows"]].add_(active.to(torch.int64).sum())
         target[GRAPH_SAFETY_SLOT["calls"]].add_(1)
         for name, values in (
             ("count_mismatch", count_mismatch),
@@ -438,7 +438,7 @@ class SelectorRuntime:
             ("capacity_saturation", capacity_saturation),
             ("rescued", rescued),
         ):
-            target[GRAPH_SAFETY_SLOT[name]].add_(values.to(torch.int64).sum())
+            target[GRAPH_SAFETY_SLOT[name]].add_((values & active).to(torch.int64).sum())
 
     def _graph_quality_record(
         self,
@@ -447,6 +447,7 @@ class SelectorRuntime:
         layer_name: str,
         record: dict[str, torch.Tensor],
         position_bands: torch.Tensor,
+        active: torch.Tensor,
     ) -> None:
         stats = self._graph_quality_stats
         histograms = self._graph_quality_histograms
@@ -492,7 +493,7 @@ class SelectorRuntime:
         values = torch.stack([record[field] for field in GRAPH_QUALITY_FIELDS], dim=-1).to(
             torch.float64
         )
-        finite = torch.isfinite(values)
+        finite = torch.isfinite(values) & active[:, None]
         finite_float = finite.to(torch.float64)
         safe = torch.where(finite, values, torch.zeros_like(values))
         minimum = torch.where(
@@ -564,6 +565,7 @@ class SelectorRuntime:
         result: SelectionResult,
         stock_reference: torch.Tensor,
         key_count: int,
+        active: torch.Tensor,
     ) -> None:
         """Fold exact-overlap quality into persistent tensors on every graph replay."""
 
@@ -606,9 +608,15 @@ class SelectorRuntime:
 
         selector = self._config.selector if self._config is not None else ""
         if selector == "radix_ceil":
-            self._assert_tensor((added == 0).all(), "radix_ceil added keys outside exact top-k")
+            self._assert_tensor(
+                ((added == 0) | ~active).all(),
+                "radix_ceil added keys outside exact top-k",
+            )
         if selector in ("radix_floor", "exact_ge"):
-            self._assert_tensor((dropped == 0).all(), f"{selector} dropped exact top-k keys")
+            self._assert_tensor(
+                ((dropped == 0) | ~active).all(),
+                f"{selector} dropped exact top-k keys",
+            )
 
         edges = self._graph_position_edges
         if edges is None:
@@ -619,6 +627,7 @@ class SelectorRuntime:
             layer_name=layer_name,
             record=record,
             position_bands=position_bands,
+            active=active,
         )
 
     @staticmethod
@@ -691,6 +700,7 @@ class SelectorRuntime:
         valid = output >= 0
         observed_count = valid.sum(-1)
         qpos = query_positions.reshape(-1).to(output.device)
+        active = qpos >= 0
         count_mismatch = observed_count != result.selected_count
         padding_violation = ((~valid[:, :-1]) & valid[:, 1:]).any(-1)
         invalid_index = (output < -1).any(-1)
@@ -698,8 +708,18 @@ class SelectorRuntime:
         sentinel = torch.full_like(output, key_count)
         ordered = torch.where(valid, output, sentinel).sort(-1).values
         duplicates = ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] != key_count)).sum(-1)
+        inactive_violation = (~active) & (
+            valid.any(-1)
+            | (result.selected_count != 0)
+            | (result.effective_k != 0)
+            | result.rescued
+        )
 
         # Mandatory fatal gates (§15). Live in every telemetry mode, including `off`.
+        self._assert_tensor(
+            ~inactive_violation.any(),
+            "approximate selector emitted data for an inactive CUDA graph padding row",
+        )
         self._assert_tensor(
             ~count_mismatch.any(),
             "selector count does not match emitted non-negative indices",
@@ -732,7 +752,7 @@ class SelectorRuntime:
             self._record_graph_safety(
                 phase=phase,
                 layer_name=graph_layer,
-                rows=rows,
+                active=active,
                 count_mismatch=count_mismatch,
                 padding_violation=padding_violation,
                 invalid_index=invalid_index,
@@ -755,6 +775,7 @@ class SelectorRuntime:
                     result=result,
                     stock_reference=stock_reference,
                     key_count=key_count,
+                    active=active,
                 )
             return
         record: dict[str, torch.Tensor] = {
@@ -841,9 +862,15 @@ class SelectorRuntime:
                     record[f"distance_added_{label}"] = (approx_added & approx_band).sum(-1)
             selector = config.selector
             if selector == "radix_ceil":
-                self._assert_tensor((added == 0).all(), "radix_ceil added keys outside exact top-k")
+                self._assert_tensor(
+                    ((added == 0) | ~active).all(),
+                    "radix_ceil added keys outside exact top-k",
+                )
             if selector in ("radix_floor", "exact_ge"):
-                self._assert_tensor((dropped == 0).all(), f"{selector} dropped exact top-k keys")
+                self._assert_tensor(
+                    ((dropped == 0) | ~active).all(),
+                    f"{selector} dropped exact top-k keys",
+                )
             flags["containment_added"] = (added > 0) if selector == "radix_ceil" else torch.zeros_like(
                 count_mismatch
             )
@@ -854,14 +881,21 @@ class SelectorRuntime:
             )
 
         # One host transfer per field, then every aggregate is computed on CPU at fixed cost.
-        host = {name: values.detach().to("cpu") for name, values in record.items()}
-        host_flags = {name: values.detach().to("cpu").bool() for name, values in flags.items()}
+        host_active = active.detach().to("cpu")
+        host = {
+            name: values.detach().to("cpu")[host_active] for name, values in record.items()
+        }
+        host_flags = {
+            name: values.detach().to("cpu").bool()[host_active]
+            for name, values in flags.items()
+        }
         band = torch.bucketize(host["query_position"].to(torch.int64), _BAND_EDGES, right=True)
         layer = self._layer
 
         with self._lock:
-            self._safety["rows"] += rows
-            violating = torch.zeros(rows, dtype=torch.bool)
+            active_rows = int(host_active.sum())
+            self._safety["rows"] += active_rows
+            violating = torch.zeros(active_rows, dtype=torch.bool)
             for name, flag in host_flags.items():
                 self._safety[name] += int(flag.sum())
                 violating |= flag
@@ -929,7 +963,8 @@ class SelectorRuntime:
             "mode": "persistent_device_counters",
             "semantics": (
                 "fixed-address counters updated by captured selector safety ops on every CUDA-graph "
-                "replay; reset in place after engine warmup"
+                "replay; rows and per-row counters exclude inactive graph-padding rows; reset in "
+                "place after engine warmup"
             ),
             "fields": list(GRAPH_SAFETY_FIELDS),
             "global": total,
