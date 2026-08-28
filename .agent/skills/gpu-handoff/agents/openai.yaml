@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPU Handoff"
+  short_description: "Queue and consume structured GPU validation jobs"
+  default_prompt: "Use $gpu-handoff to create or execute a file-based GPU validation request."
