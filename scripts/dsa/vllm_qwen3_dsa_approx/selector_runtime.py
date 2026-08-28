@@ -606,15 +606,25 @@ class SelectorRuntime:
                 numerator = exact_retained[:, low:stop].sum(-1)
             record[f"rank_recall_{low + 1}_{high}"] = self._rate(numerator, denominator)
 
+        # Quality is intentionally measured against literal vLLM output, but containment is a
+        # property of the radix rule relative to the torch.topk set from which it selected. The
+        # two exact implementations may choose different indices at a tied boundary. Treating
+        # that harmless tie-break disagreement as a containment violation kills the CUDA context.
+        containment_added, containment_dropped = self._selector_containment_counts(
+            ordered_output=ordered_output,
+            observed_count=observed_count,
+            result=result,
+            key_count=key_count,
+        )
         selector = self._config.selector if self._config is not None else ""
         if selector == "radix_ceil":
             self._assert_tensor(
-                ((added == 0) | ~active).all(),
+                ((containment_added == 0) | ~active).all(),
                 "radix_ceil added keys outside exact top-k",
             )
         if selector in ("radix_floor", "exact_ge"):
             self._assert_tensor(
-                ((dropped == 0) | ~active).all(),
+                ((containment_dropped == 0) | ~active).all(),
                 f"{selector} dropped exact top-k keys",
             )
 
@@ -636,6 +646,26 @@ class SelectorRuntime:
             torch._assert_async(condition, message)
         elif not bool(condition):
             raise RuntimeError(message)
+
+    @staticmethod
+    def _selector_containment_counts(
+        *,
+        ordered_output: torch.Tensor,
+        observed_count: torch.Tensor,
+        result: SelectionResult,
+        key_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compare output with the selector's own exact set, independent of top-k tie-breaking."""
+
+        exact_width = result.exact_indices.shape[1]
+        exact_valid = torch.arange(exact_width, device=ordered_output.device)[None, :] < result.effective_k[:, None]
+        safe_exact = result.exact_indices.clamp(min=0, max=max(key_count - 1, 0)).long()
+        insertion = torch.searchsorted(ordered_output.long(), safe_exact).clamp(
+            max=max(ordered_output.shape[1] - 1, 0)
+        )
+        retained = (ordered_output.long().gather(-1, insertion) == safe_exact) & exact_valid
+        intersection = retained.sum(-1)
+        return observed_count - intersection, result.effective_k - intersection
 
     # Only delta_k can go negative (an under-capturing arm selects fewer than effective k); every
     # other integer metric is a count bounded by the output buffer. Anything that lands outside a
@@ -860,22 +890,28 @@ class SelectorRuntime:
                     )
                     record[f"distance_dropped_{label}"] = exact_denominator - overlap_in_band
                     record[f"distance_added_{label}"] = (approx_added & approx_band).sum(-1)
+            containment_added, containment_dropped = self._selector_containment_counts(
+                ordered_output=ordered,
+                observed_count=observed_count,
+                result=result,
+                key_count=key_count,
+            )
             selector = config.selector
             if selector == "radix_ceil":
                 self._assert_tensor(
-                    ((added == 0) | ~active).all(),
+                    ((containment_added == 0) | ~active).all(),
                     "radix_ceil added keys outside exact top-k",
                 )
             if selector in ("radix_floor", "exact_ge"):
                 self._assert_tensor(
-                    ((dropped == 0) | ~active).all(),
+                    ((containment_dropped == 0) | ~active).all(),
                     f"{selector} dropped exact top-k keys",
                 )
-            flags["containment_added"] = (added > 0) if selector == "radix_ceil" else torch.zeros_like(
-                count_mismatch
+            flags["containment_added"] = (
+                containment_added > 0 if selector == "radix_ceil" else torch.zeros_like(count_mismatch)
             )
             flags["containment_dropped"] = (
-                (dropped > 0)
+                (containment_dropped > 0)
                 if selector in ("radix_floor", "exact_ge")
                 else torch.zeros_like(count_mismatch)
             )

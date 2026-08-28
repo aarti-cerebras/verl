@@ -120,6 +120,67 @@ def test_graph_telemetry_excludes_cuda_graph_padding_rows() -> None:
     assert artifact["position_histograms"]["decode"][0]["rows"] == 2
 
 
+@pytest.mark.parametrize("telemetry", ["verify_exact", "graph_verify_exact"])
+def test_containment_ignores_stock_topk_tie_breaking(telemetry: str) -> None:
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(telemetry=telemetry))
+    if telemetry == "graph_verify_exact":
+        runtime.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+
+    # Every index is an equally valid member of exact top-k. Force the simulated stock kernel to
+    # choose a different tied set from torch.topk, including omission of ceil's rescued best key.
+    logits = torch.ones(1, 8)
+    qpos = torch.tensor([7])
+    approximate = torch.empty(1, 4, dtype=torch.int32)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
+    selected = int(approximate[0, 0])
+    stock_reference = torch.tensor(
+        [[index for index in range(logits.shape[1]) if index != selected][:4]],
+        dtype=torch.int32,
+    )
+
+    with runtime.layer("layer.0"):
+        runtime.note_call("decode")
+        runtime.validate_and_record(
+            phase="decode",
+            layer_name="layer.0",
+            output=approximate,
+            query_positions=qpos,
+            result=result,
+            stock_reference=stock_reference,
+            key_count=logits.shape[1],
+        )
+
+    artifact = runtime.artifact()
+    # Quality remains literal-stock-relative and exposes the tie-break disagreement, while the
+    # selector containment gate correctly recognizes the output as part of its own exact set.
+    assert artifact["decode"]["global"]["added"]["mean"] == 1
+    if telemetry == "verify_exact":
+        assert artifact["safety"]["counts"]["containment_added"] == 0
+
+
+def test_containment_still_rejects_an_index_outside_selector_topk() -> None:
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(telemetry="verify_exact"))
+    logits = torch.ones(1, 8)
+    qpos = torch.tensor([7])
+    approximate = torch.empty(1, 4, dtype=torch.int32)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_ceil")
+    exact_set = set(result.exact_indices[0].tolist())
+    outside = next(index for index in range(logits.shape[1]) if index not in exact_set)
+    approximate[0, 0] = outside
+
+    with pytest.raises(RuntimeError, match="radix_ceil added keys outside exact top-k"):
+        runtime.validate_and_record(
+            phase="decode",
+            output=approximate,
+            query_positions=qpos,
+            result=result,
+            stock_reference=approximate.clone(),
+            key_count=logits.shape[1],
+        )
+
+
 def test_inactive_cuda_graph_padding_row_fails_closed_if_nonempty() -> None:
     runtime = SelectorRuntime()
     runtime.configure(_selector_config(telemetry="off"))
