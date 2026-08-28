@@ -181,6 +181,39 @@ def test_containment_still_rejects_an_index_outside_selector_topk() -> None:
         )
 
 
+@pytest.mark.parametrize("telemetry", ["verify_exact", "graph_verify_exact"])
+def test_floor_capacity_saturation_is_reported_without_failing(telemetry: str) -> None:
+    runtime = SelectorRuntime()
+    runtime.configure(_selector_config(selector="radix_floor", telemetry=telemetry, capacity=8))
+    if telemetry == "graph_verify_exact":
+        runtime.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+
+    logits = torch.arange(0x3C00, 0x3C10, dtype=torch.int16).view(torch.float16).float()[None, :]
+    qpos = torch.tensor([15])
+    approximate = torch.empty(1, 8, dtype=torch.int32)
+    exact = torch.empty_like(approximate)
+    result = select_prefix_reference(logits, qpos, 4, approximate, "radix_floor")
+    select_prefix_reference(logits, qpos, 4, exact, "topk")
+
+    with runtime.layer("layer.0"):
+        runtime.validate_and_record(
+            phase="decode",
+            layer_name="layer.0",
+            output=approximate,
+            query_positions=qpos,
+            result=result,
+            stock_reference=exact,
+            key_count=logits.shape[1],
+        )
+
+    artifact = runtime.artifact()
+    assert artifact["decode"]["global"]["selected_count"]["max"] == 8
+    if telemetry == "verify_exact":
+        assert artifact["safety"]["counts"]["capacity_saturation"] == 1
+    else:
+        assert artifact["graph_replay_safety"]["global"]["capacity_saturation"] == 1
+
+
 def test_inactive_cuda_graph_padding_row_fails_closed_if_nonempty() -> None:
     runtime = SelectorRuntime()
     runtime.configure(_selector_config(telemetry="off"))

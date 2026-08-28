@@ -69,12 +69,30 @@ def test_selector_set_invariants() -> None:
                 assert approximate_set >= exact_set
 
 
-def test_capacity_saturation_fails_closed() -> None:
-    # All scores share the same FP16 radix bucket, so floor wants the complete row.
-    logits = torch.ones(1, 64)
+def test_capacity_saturation_keeps_the_highest_scoring_prefix() -> None:
+    # These are 16 consecutive positive FP16 values in one 16-code radix bucket. Floor rounds the
+    # fourth-largest threshold down to the start of the bucket and therefore requests all 16 keys,
+    # while the serving buffer can hold only eight.
+    logits = torch.arange(0x3C00, 0x3C10, dtype=torch.int16).view(torch.float16).float()[None, :]
+    output = torch.empty(1, 8, dtype=torch.int32)
+    result = select_prefix_reference(logits, torch.tensor([15]), 4, output, "radix_floor")
+
+    expected = logits.topk(output.shape[1], dim=-1, largest=True, sorted=True).indices
+    exact = set(result.exact_indices[0, : int(result.effective_k[0])].tolist())
+    emitted = set(output[0].tolist())
+    discarded = torch.tensor(sorted(set(range(logits.shape[1])) - emitted))
+
+    assert int(result.selected_count[0]) == output.shape[1]
+    assert torch.equal(output.long(), expected)
+    assert exact <= emitted
+    assert logits[0, output[0].long()].min() >= logits[0, discarded].max()
+
+
+def test_capacity_saturation_remains_fail_closed_for_non_floor_arms() -> None:
+    logits = torch.ones(1, 16)
     output = torch.empty(1, 8, dtype=torch.int32)
     with pytest.raises(RuntimeError, match="exceeds index_topk capacity"):
-        select_prefix_reference(logits, torch.tensor([63]), 8, output, "radix_floor")
+        select_prefix_reference(logits, torch.tensor([15]), 4, output, "exact_ge")
 
 
 @pytest.mark.parametrize(

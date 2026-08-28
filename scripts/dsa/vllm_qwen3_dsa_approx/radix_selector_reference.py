@@ -113,24 +113,30 @@ def select_prefix_reference(
         )
 
     window = min(capacity, key_count)
-    candidates = scores.topk(window, dim=-1)
-    finite = torch.isfinite(candidates.values)
+    candidates = scores.topk(window, dim=-1, largest=True, sorted=True)
     mono_threshold = rule.row_threshold(arm, rule.mono(threshold))
-    keep = rule.member_ge(rule.mono(candidates.values), finite, mono_threshold)
     degenerate = valid.sum(-1) <= effective_k
-    keep = torch.where(degenerate[:, None], finite, keep)
 
-    selected_count = rule.member_ge(rule.mono(scores), valid, mono_threshold).sum(-1)
-    selected_count = torch.where(degenerate, effective_k, selected_count)
-    rescued = active & ~keep.any(-1)
-    keep[:, 0] = keep[:, 0] | rescued
-    selected_count = torch.where(rescued, torch.ones_like(selected_count), selected_count)
-    _assert_tensor(
-        (selected_count <= capacity).all(),
-        "approximate DSA selection exceeds index_topk capacity",
-    )
+    requested_count = rule.member_ge(rule.mono(scores), valid, mono_threshold).sum(-1)
+    requested_count = torch.where(degenerate, effective_k, requested_count)
+    rescued = active & (requested_count == 0)
+    requested_count = torch.where(rescued, torch.ones_like(requested_count), requested_count)
+
+    # The vLLM 0.26 top-k/attention kernels are validated only through capacity=4096. A floor
+    # threshold can very rarely select more keys than that at long context. Saturate by emitting a
+    # rank prefix of the globally highest-scoring candidates: this discards only lower-scoring
+    # members (or arbitrary equals at a tie) and preserves floor's exact-top-k superset contract.
+    if arm == "floor":
+        selected_count = requested_count.clamp(max=capacity)
+    else:
+        _assert_tensor(
+            (requested_count <= capacity).all(),
+            "approximate DSA selection exceeds index_topk capacity",
+        )
+        selected_count = requested_count
+    emit = torch.arange(window, device=output.device)[None, :] < selected_count[:, None]
     output[:, :window].copy_(
-        torch.where(keep, candidates.indices.to(torch.int32), -1)
+        torch.where(emit, candidates.indices.to(torch.int32), -1)
     )
     return SelectionResult(
         selected_count,
