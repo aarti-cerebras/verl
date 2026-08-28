@@ -270,6 +270,7 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
         self.rotate_activation = rotate_activation
         self.softmax_scale = head_dim**-0.5
         self.padded_n_heads = next(h for h in SUPPORTED_KERNEL_HEADS if n_heads <= h)
+        self.layer_name = prefix or "metadata_free"
 
         self.wq = nn.Linear(hidden_size, n_heads * head_dim, bias=False)
         self.q_norm = _IndexerRMSNorm(head_dim, eps=1e-6)
@@ -436,4 +437,12 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
         fused_w = (weights * q_scale * self.softmax_scale).float().contiguous()
 
         # k is inserted into the fp8 side cache by the op itself (bf16 in, fp8+scale out).
-        return self.indexer_op(hidden_states, q_fp8, k.contiguous(), fused_w)
+        # A plain-attribute scope is Dynamo-traceable and gives eager telemetry its layer name.
+        # Decode graph capture recovers the same static prefix from vLLM's custom-op frame because
+        # Python scopes do not execute on replay.
+        from .bucket_selector_runtime import RUNTIME
+
+        if not RUNTIME.telemetry_active:
+            return self.indexer_op(hidden_states, q_fp8, k.contiguous(), fused_w)
+        with RUNTIME.layer(self.layer_name):
+            return self.indexer_op(hidden_states, q_fp8, k.contiguous(), fused_w)

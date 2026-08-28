@@ -60,6 +60,27 @@ def maybe_override_topk(model_dir: str, top_k: int | None, tmpdir: str) -> str:
 # the loaded one, so the exact-plugin arms are unaffected.
 
 WORKER_EXTENSION_CLS = "scripts.dsa.selector_telemetry_rpc.SelectorTelemetryExtension"
+BUCKET_WORKER_EXTENSION_CLS = "scripts.dsa.bucket_telemetry_rpc.BucketTelemetryExtension"
+
+
+def telemetry_kind(model_dir: str) -> str | None:
+    """Return the isolated telemetry family selected by the model architecture."""
+
+    try:
+        with open(os.path.join(model_dir, "config.json")) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    architectures = config.get("architectures") or []
+    if any("Bucketed" in str(name) for name in architectures):
+        return "bucket"
+    if any("Approx" in str(name) for name in architectures):
+        return "selector"
+    return None
+
+
+def telemetry_worker_extension(model_dir: str) -> str:
+    return BUCKET_WORKER_EXTENSION_CLS if telemetry_kind(model_dir) == "bucket" else WORKER_EXTENSION_CLS
 
 
 def selector_telemetry_expected(model_dir: str) -> bool:
@@ -77,12 +98,14 @@ def selector_telemetry_expected(model_dir: str) -> bool:
     except (OSError, ValueError):
         return False
     architectures = config.get("architectures") or []
-    if not any("Approx" in str(name) for name in architectures):
-        return False
-    return str(config.get("dsa_telemetry", "off")) != "off"
+    if any("Bucketed" in str(name) for name in architectures):
+        return str(config.get("dsa_bucket_telemetry", "off")) != "off"
+    if any("Approx" in str(name) for name in architectures):
+        return str(config.get("dsa_telemetry", "off")) != "off"
+    return False
 
 
-def reset_selector_telemetry(llm) -> None:
+def reset_selector_telemetry(llm, *, kind: str | None = None) -> None:
     """Discard warmup observations so the safety gate only ever sees real traffic.
 
     A transport failure is FATAL, not a warning. The worker extension is attached on every arm, so
@@ -91,17 +114,25 @@ def reset_selector_telemetry(llm) -> None:
     """
 
     try:
-        done = llm.collective_rpc("selector_telemetry_reset")
+        method = "bucket_telemetry_reset" if kind == "bucket" else "selector_telemetry_reset"
+        done = llm.collective_rpc(method)
     except Exception as exc:
         raise RuntimeError(
             f"selector telemetry reset failed: {exc!r}. Warmup observations would be attributed "
             f"to served traffic, so this run cannot produce a trustworthy safety artifact."
         ) from exc
     if any(done):
-        print(f"[smoke] selector telemetry reset on {sum(map(bool, done))} worker(s)")
+        print(f"[smoke] {kind or 'selector'} telemetry reset on {sum(map(bool, done))} worker(s)")
 
 
-def write_selector_artifact(llm, path: str | None, *, expected: bool, model: str = "") -> None:
+def write_selector_artifact(
+    llm,
+    path: str | None,
+    *,
+    expected: bool,
+    model: str = "",
+    kind: str | None = None,
+) -> None:
     """Pull the artifact out of the worker(s) and write it from THIS process.
 
     FATAL on transport failure, and also fatal on an EMPTY result when `expected` -- see
@@ -112,7 +143,8 @@ def write_selector_artifact(llm, path: str | None, *, expected: bool, model: str
     if not path:
         return
     try:
-        payloads = llm.collective_rpc("selector_telemetry_artifact")
+        method = "bucket_telemetry_artifact" if kind == "bucket" else "selector_telemetry_artifact"
+        payloads = llm.collective_rpc(method)
     except Exception as exc:
         raise RuntimeError(
             f"selector telemetry read failed: {exc!r}. DSA_SELECTOR_ARTIFACT={path} was requested "
@@ -122,10 +154,9 @@ def write_selector_artifact(llm, path: str | None, *, expected: bool, model: str
     if not payloads:
         if expected:
             raise RuntimeError(
-                f"no worker returned selector telemetry, but {model} is an approximate serving "
-                f"dir with dsa_telemetry enabled, so an artifact was expected at {path}. It is "
-                f"not active in the worker (check the _pluginboot_approx PYTHONPATH), and a missing "
-                f"artifact reads as 'no violations'."
+                f"no worker returned {kind or 'selector'} telemetry, but {model} enables it, so "
+                f"an artifact was expected at {path}. The matching plugin/worker extension is "
+                f"not active, and a missing artifact reads as 'no violations'."
             )
         print("[smoke] no selector telemetry to write (exact plugin: none expected)")
         return
@@ -135,8 +166,13 @@ def write_selector_artifact(llm, path: str | None, *, expected: bool, model: str
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(json.dumps(body, indent=2, default=str) + "\n")
     temporary.replace(target)
-    rows = (body.get("safety") or {}).get("rows", "?") if len(payloads) == 1 else "?"
-    print(f"[smoke] wrote selector telemetry {target} (safety rows={rows})")
+    if len(payloads) == 1:
+        rows = (body.get("safety") or {}).get("rows")
+        if rows is None:
+            rows = ((body.get("graph_replay") or {}).get("global") or {}).get("rows", "?")
+    else:
+        rows = "?"
+    print(f"[smoke] wrote {kind or 'selector'} telemetry {target} (safety rows={rows})")
 
 
 def build_prompts(prompt_tokens: int, decode_batch_size: int) -> tuple[list[str], list[str], int]:
@@ -232,6 +268,11 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="dsa_smoke_")
     try:
         model = maybe_override_topk(args.model, args.top_k, tmp)
+        telemetry = telemetry_kind(model)
+        if telemetry == "bucket":
+            # The reset RPC below marks the real-traffic boundary. Avoid running expensive
+            # host-folded exact comparisons during synthetic profiling/autotune forwards.
+            os.environ.setdefault("DSA_BUCKET_DEFER_HOST_TELEMETRY", "1")
         sparse = os.environ.get("DSA_SPARSE", "1") not in ("0", "", "false", "False")
         print(f"[smoke] model={model} DSA_SPARSE={int(sparse)} eager={args.eager}")
 
@@ -249,7 +290,7 @@ def main() -> int:
                if args.cudagraph_mode else {}),
             enable_prefix_caching=False,
             seed=1234,
-            worker_extension_cls=WORKER_EXTENSION_CLS,
+            worker_extension_cls=telemetry_worker_extension(model),
             **(
                 {"hf_overrides": {"architectures": [args.architecture_override]}}
                 if args.architecture_override
@@ -265,7 +306,7 @@ def main() -> int:
         # Everything observed so far came from vLLM's warmup/autotune dummy batches, whose
         # operands are synthetic; folding them into the artifact would attribute them to real
         # traffic and let the runner's hard-violation gate fire (or hide) on garbage.
-        reset_selector_telemetry(llm)
+        reset_selector_telemetry(llm, kind=telemetry)
 
         outs = llm.generate(
             prompts,
@@ -346,9 +387,12 @@ def main() -> int:
             print(f"[smoke] wrote {args.out_json}")
         write_selector_artifact(
             llm,
-            os.environ.get("DSA_SELECTOR_ARTIFACT"),
+            os.environ.get("DSA_BUCKET_TELEMETRY_ARTIFACT")
+            if telemetry == "bucket"
+            else os.environ.get("DSA_SELECTOR_ARTIFACT"),
             expected=selector_telemetry_expected(model),
             model=model,
+            kind=telemetry,
         )
 
         print("[smoke] OK")

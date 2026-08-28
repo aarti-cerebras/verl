@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from scripts.dsa.vllm_qwen3_dsa_bucketed import bucket_selector_hooks
 from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_hooks import (
     _cuda_decode_hook,
     _decode_hook,
@@ -12,7 +13,7 @@ from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_runtime import (
 )
 
 
-def _configure(backend: str = "vllm_stock_per_bucket") -> None:
+def _configure(backend: str = "vllm_stock_per_bucket", telemetry: str = "off") -> None:
     RUNTIME.configure(
         BucketSelectorConfig(
             selector="modulo_bucket_topk",
@@ -21,6 +22,7 @@ def _configure(backend: str = "vllm_stock_per_bucket") -> None:
             bucket_top_k=2,
             total_k=4,
             capacity=4,
+            telemetry=telemetry,
         )
     )
 
@@ -80,6 +82,26 @@ def test_reference_decode_does_not_call_stock() -> None:
     assert bool((output[1] == -1).all())
 
 
+def test_verify_exact_reuses_saved_stock_once_for_global_reference() -> None:
+    _configure(telemetry="verify_exact")
+    logits = torch.tensor([[100.0, 99.0, 98.0, 1.0, 97.0, 2.0, 96.0, 3.0]])
+    seq_lens = torch.tensor([[8]], dtype=torch.int32)
+    output = torch.empty(1, 4, dtype=torch.int32)
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def stock(logits, next_n, seq_lens, target, num_rows, stride0, stride1, topk_tokens):
+        calls.append((tuple(logits.shape), topk_tokens))
+        _fill_stock(logits, seq_lens, target, topk_tokens)
+
+    with RUNTIME.layer("layer.0"):
+        _decode_hook({"decode": stock}, logits, 1, seq_lens, output, 1, 8, 1, 4)
+
+    assert calls == [((1, 4), 2), ((1, 4), 2), ((1, 8), 4)]
+    artifact = RUNTIME.artifact()
+    assert artifact["decode"]["calls"] == 1
+    assert artifact["decode"]["global"]["recall"]["mean"] == 0.75
+
+
 def test_prefill_restarts_modulo_positions_per_request() -> None:
     _configure()
     # Request 0 has two query rows over key columns [0, 3); request 1 has one row over [3, 5).
@@ -104,6 +126,27 @@ def test_prefill_restarts_modulo_positions_per_request() -> None:
     assert set(output[1][output[1] >= 0].tolist()) == {0, 1, 2}
     # The second request emits 0 and 1, not packed score columns 3 and 4.
     assert set(output[2][output[2] >= 0].tolist()) == {0, 1}
+
+
+def test_graph_safety_prefill_uses_captured_layer_attribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(telemetry="graph_safety")
+    RUNTIME.initialize_graph_safety(["layer.0"], device=torch.device("cpu"))
+    monkeypatch.setattr(bucket_selector_hooks, "_captured_indexer_layer", lambda: "layer.0")
+    logits = torch.tensor([[2.0, 9.0, 0.0], [1.0, 2.0, 3.0]])
+    starts = torch.tensor([0, 0], dtype=torch.int32)
+    ends = torch.tensor([1, 3], dtype=torch.int32)
+    output = torch.empty(2, 4, dtype=torch.int32)
+
+    def stock(logits, starts, ends, target, num_rows, stride0, stride1, topk_tokens):
+        _fill_stock(logits, ends, target, topk_tokens)
+
+    _prefill_hook({"prefill": stock}, logits, starts, ends, output, 2, 3, 1, 4)
+
+    replay = RUNTIME.artifact()["graph_replay"]
+    layer = replay["phases"]["prefill"]["per_layer"]["layer.0"]
+    assert layer["rows"] == 2
+    assert layer["calls"] == 1
+    assert layer["selected_total"] == 4
 
 
 @pytest.mark.parametrize("name", ["cooperative_topk", "persistent_topk"])

@@ -25,7 +25,7 @@ def reset_runtime() -> None:
     RUNTIME.reset_for_test()
 
 
-def _configure(bucket_count: int, bucket_top_k: int) -> None:
+def _configure(bucket_count: int, bucket_top_k: int, *, telemetry: str = "off") -> None:
     total_k = bucket_count * bucket_top_k
     RUNTIME.configure(
         BucketSelectorConfig(
@@ -35,6 +35,7 @@ def _configure(bucket_count: int, bucket_top_k: int) -> None:
             bucket_top_k=bucket_top_k,
             total_k=total_k,
             capacity=total_k,
+            telemetry=telemetry,
         )
     )
 
@@ -198,3 +199,91 @@ def test_decode_cuda_graph_replay_handles_inactive_padding_row() -> None:
     _assert_same_position_sets(observed, expected)
     assert (observed >= 0).sum(-1).cpu().tolist() == [2048, 2048, 2048, 2048, 2048, 1173, 17, 0]
     assert bool((observed[-1] == -1).all())
+
+
+def test_graph_safety_telemetry_updates_persistent_counters_on_replay() -> None:
+    """Replay must update stable bucket-only counters without executing telemetry Python."""
+
+    from vllm import _custom_ops
+
+    device = torch.device("cuda")
+    bucket_count, bucket_top_k = 8, 256
+    _configure(bucket_count, bucket_top_k, telemetry="graph_safety")
+    RUNTIME.initialize_graph_safety(["layer.0"], device=device)
+    assert RUNTIME._graph is not None
+    graph_address = RUNTIME._graph.data_ptr()
+
+    generator = torch.Generator(device=device).manual_seed(20260831)
+    logits = torch.randn((8, 4103), generator=generator, device=device)
+    seq_lens = torch.full((8, 1), 4103, device=device, dtype=torch.int32)
+    output = torch.empty((8, 2048), device=device, dtype=torch.int32)
+    workspace = torch.empty(1, device=device, dtype=torch.uint8)
+
+    def restricted_native_must_not_run(*args: object) -> None:
+        raise AssertionError("restricted native top-k ran inside the telemetry graph")
+
+    originals = {
+        "cooperative_topk": restricted_native_must_not_run,
+        "decode": _custom_ops.top_k_per_row_decode,
+    }
+
+    def select() -> None:
+        with RUNTIME.layer("layer.0"):
+            _cuda_decode_hook(
+                "cooperative_topk",
+                originals,
+                logits,
+                seq_lens,
+                output,
+                workspace,
+                2048,
+                logits.shape[1],
+            )
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        select()
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select()
+    torch.cuda.synchronize()
+    RUNTIME.reset()
+    assert RUNTIME._graph.data_ptr() == graph_address
+
+    replay_lengths = torch.tensor(
+        [[4103], [3501], [3077], [2049], [2048], [1173], [17], [0]],
+        device=device,
+        dtype=torch.int32,
+    )
+    seq_lens.copy_(replay_lengths)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    replay = RUNTIME.artifact()["graph_replay"]
+    assert replay["global"]["rows"] == 14
+    assert replay["global"]["calls"] == 2
+    assert replay["global"]["selected_total"] == 2 * sum(
+        min(int(length), 2048) for length in replay_lengths.cpu().flatten()
+    )
+    layer = replay["phases"]["decode"]["per_layer"]["layer.0"]
+    assert not any(
+        layer[name]
+        for name in (
+            "count_mismatch",
+            "padding_violation",
+            "prefix_violation",
+            "invalid_index",
+            "noncausal_index",
+            "duplicate_index",
+        )
+    )
+    assert len(layer["per_bucket"]) == bucket_count
+
+    RUNTIME.reset()
+    assert RUNTIME._graph.data_ptr() == graph_address
+    assert RUNTIME.artifact()["graph_replay"]["global"]["rows"] == 0

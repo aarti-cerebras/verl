@@ -83,6 +83,7 @@ def test_builder_derives_isolated_fixed_budget_directory(tmp_path: Path) -> None
     assert derived["dsa_selector_backend"] == "vllm_stock_per_bucket"
     assert derived["dsa_bucket_count"] == 4
     assert derived["dsa_bucket_top_k"] == 4
+    assert derived["dsa_bucket_telemetry"] == "off"
     assert derived["index_topk"] == derived["dsa_top_k"] == 16
     assert (output / "model.safetensors").is_symlink()
     manifest = json.loads((output / "BUCKETED_BUILD_MANIFEST.json").read_text())
@@ -92,6 +93,43 @@ def test_builder_derives_isolated_fixed_budget_directory(tmp_path: Path) -> None
     assert manifest["decode_cuda_graph_validated"] is False
     assert manifest["prefill_cuda_graph_validated"] is False
     assert manifest["cuda_graph_validation_evidence"] is None
+
+
+def test_builder_records_eager_telemetry_and_restricts_graph_modes(tmp_path: Path) -> None:
+    source = tmp_path / "exact"
+    output = tmp_path / "bucketed"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3DSAForCausalLM"],
+                "dsa_enabled": True,
+                "dsa_mode": "sparse",
+                "dsa_top_k": 16,
+                "index_topk": 16,
+            }
+        )
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts/dsa/build_qwen3_dsa_bucketed_serving_dir.py"),
+            "--source",
+            str(source),
+            "--out",
+            str(output),
+            "--bucket-count",
+            "4",
+            "--telemetry",
+            "verify_exact",
+        ],
+        check=True,
+    )
+    config = json.loads((output / "config.json").read_text())
+    manifest = json.loads((output / "BUCKETED_BUILD_MANIFEST.json").read_text())
+    assert config["dsa_bucket_telemetry"] == "verify_exact"
+    assert manifest["telemetry"] == "verify_exact"
+    assert manifest["cuda_graph_modes_supported"] == ["NONE"]
 
 
 def test_builder_records_only_the_gpu_validated_decode_graph_geometry(tmp_path: Path) -> None:
@@ -131,6 +169,30 @@ def test_builder_records_only_the_gpu_validated_decode_graph_geometry(tmp_path: 
     assert manifest["prefill_cuda_graph_validated"] is False
     assert manifest["cuda_graph_validation_evidence"].endswith(
         "20260828T210745Z-qwen3-dsa-bucketed-decode-graph/result.md"
+    )
+
+    graph_output = tmp_path / "bucketed-graph-safety"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts/dsa/build_qwen3_dsa_bucketed_serving_dir.py"),
+            "--source",
+            str(source),
+            "--out",
+            str(graph_output),
+            "--bucket-count",
+            "8",
+            "--bucket-top-k",
+            "256",
+            "--telemetry",
+            "graph_safety",
+        ],
+        check=True,
+    )
+    graph_manifest = json.loads((graph_output / "BUCKETED_BUILD_MANIFEST.json").read_text())
+    assert graph_manifest["decode_cuda_graph_validated"] is True
+    assert graph_manifest["cuda_graph_validation_evidence"].endswith(
+        "20260828T232757Z-qwen3-dsa-bucket-graph-telemetry-fix/result.md"
     )
 
 

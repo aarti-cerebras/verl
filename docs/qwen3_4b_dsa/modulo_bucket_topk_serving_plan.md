@@ -7,7 +7,8 @@ all 36 bucketed layers, and a 4.5k-token equal-budget needle fixture passed with
 exact/bucket outputs. `FULL_DECODE_ONLY` capture and replay also pass on H100, including seven active
 decode rows padded to an eight-row captured graph and additional 3-to-4, 9-to-16, and 33-to-40
 replays. Exploratory graph/eager decode measurements are retained, but full/prefill graphs,
-telemetry, and durable performance claims remain unvalidated or disabled.
+and durable performance claims remain unvalidated. Bucket telemetry is implemented and validated
+on H100 in eager `verify_exact` and decode-graph `graph_safety` modes.
 
 **Scope:** Qwen3 DSA vLLM serving and evaluation only. This plan does not change training,
 checkpoint weights, sampling top-k, or the existing exact and radix-selector servers.
@@ -458,9 +459,11 @@ reference and stock-reuse backends.
   2,839-to-3,542-token prompts, all above the 2,048 selection budget. These are engine-level graph
   versus eager results, not isolated selector-kernel timings or a durable speed claim.
 - No Stage D Triton kernel was added. There is no evidence yet that one is needed.
-- Telemetry remains `off`, and manifests keep `selector_speed_claim_valid` false. Manifests report
-  decode and prefill graph validation separately and only mark the tested 8-by-256 stock geometry
-  as decode-graph validated.
+- Telemetry defaults to `off`; manifests keep `selector_speed_claim_valid` false. Eager `summary`
+  and `verify_exact` use bounded host-folded summaries and fail closed with CUDA graphs.
+  `graph_safety` uses persistent fixed-address per-layer/per-bucket device counters and is validated
+  with `FULL_DECODE_ONLY`. Manifests report decode and prefill graph validation separately and only
+  mark the tested 8-by-256 stock geometry as decode-graph validated.
 
 Retained GPU evidence:
 
@@ -481,6 +484,13 @@ Retained GPU evidence:
 - `.agents/gpu_jobs/20260828T220547Z-qwen3-dsa-bucketed-b33-long-bench/result.md` — corrected
   batch-33 job `PASS`: all prompts 2,839-to-3,542 tokens, five safe 33-to-40 replays, median decode
   throughput 105.290 tok/s eager versus 200.664 tok/s graph (1.906x), and all needles retrieved.
+- `.agents/gpu_jobs/20260828T225011Z-qwen3-dsa-bucket-telemetry/result.md` — eager
+  `verify_exact` telemetry passed end to end (36 layers, eight buckets/layer, zero violations); the
+  overall job is `FAIL` because its first graph-safety attempt exposed missing prefill attribution.
+- `.agents/gpu_jobs/20260828T232757Z-qwen3-dsa-bucket-graph-telemetry-fix/result.md` — corrected
+  graph telemetry job `PASS`: 51 decode graphs captured, post-capture reset succeeded, all 36
+  prefill and decode layers exported persistent counters, and six safety-violation classes were
+  zero over 1,440 observed rows.
 
 ### Stage A: isolated reference
 

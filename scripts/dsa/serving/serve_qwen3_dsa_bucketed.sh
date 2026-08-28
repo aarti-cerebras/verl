@@ -8,6 +8,7 @@
 # Env: GPU (0) · PORT (8000+GPU) · SERVING_DIR · MAX_LEN (32768) · GPU_MEM_UTIL (0.85)
 #      DSA_SPARSE (1) · SERVED_NAME (Qwen3-4B-Thinking-2507) · EAGER (1)
 #      CG_MODE (FULL_DECODE_ONLY; the only mode allowed when EAGER=0)
+#      DSA_BUCKET_TELEMETRY_ARTIFACT (default: a timestamped JSON beside the server log)
 set -euo pipefail
 
 REPO=${REPO:-/net/aarti-vm/srv/nfs/aarti-data/ws/code/ws_repos/dsa/verl}
@@ -32,6 +33,10 @@ LOGDIR=${LOGDIR:-/cb/ml-eng/aarti/dsa_qwen3/serving/logs}; mkdir -p "$LOGDIR"
 TS=$(date +%Y%m%d_%H%M%S)
 LOG=$LOGDIR/${TS}_serve_dsa_bucketed_gpu${GPU}_p${PORT}.log
 MANIFEST=$LOGDIR/${TS}_serve_dsa_bucketed_gpu${GPU}_p${PORT}.manifest
+BUCKET_TELEMETRY=$(python3 -c "import json;print(json.load(open('$SERVING_DIR/config.json')).get('dsa_bucket_telemetry', 'off'))")
+if [[ "$BUCKET_TELEMETRY" != "off" ]]; then
+  export DSA_BUCKET_TELEMETRY_ARTIFACT="${DSA_BUCKET_TELEMETRY_ARTIFACT:-$LOGDIR/${TS}_serve_dsa_bucketed_gpu${GPU}_p${PORT}.telemetry.json}"
+fi
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 # _pluginboot FIRST: its sitecustomize registers the architecture AND the CUSTOM attention backend
@@ -42,6 +47,7 @@ export DSA_SPARSE="${DSA_SPARSE:-1}"
 # caller sets them as one-shot assignments (`DSA_RANDOM_INDEXER=1 bash serve_qwen3_dsa.sh`).
 export DSA_RANDOM_INDEXER="${DSA_RANDOM_INDEXER:-0}"
 export DSA_DEBUG_SELECTION="${DSA_DEBUG_SELECTION:-0}"
+export DSA_BUCKET_DEFER_HOST_TELEMETRY="${DSA_BUCKET_DEFER_HOST_TELEMETRY:-1}"
 export VLLM_NO_USAGE_STATS=1
 
 CMD=("$PY" "$REPO/scripts/dsa/serving/serve_qwen3_dsa_bucketed_entry.py"
@@ -54,6 +60,7 @@ CMD=("$PY" "$REPO/scripts/dsa/serving/serve_qwen3_dsa_bucketed_entry.py"
   --max-model-len "$MAX_LEN"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --dtype bfloat16
+  --worker-extension-cls scripts.dsa.bucket_telemetry_rpc.BucketTelemetryExtension
   --seed "${SEED:-1234}"     # baseline parity: every baseline manifest recorded --seed 1234
   --no-enable-prefix-caching # baseline parity: all baseline manifests show prefix_cache: 0. Also
                              # semantically important here -- a cache hit skips the prefill that
@@ -81,6 +88,7 @@ fi
   echo "index_topk:  $(python3 -c "import json;print(json.load(open('$SERVING_DIR/config.json')).get('index_topk'))" 2>/dev/null || echo NA)"
   echo "selector:    $(python3 -c "import json; c=json.load(open('$SERVING_DIR/config.json')); print(c.get('dsa_selector'), c.get('dsa_selector_backend'))" 2>/dev/null || echo NA)"
   echo "buckets:     $(python3 -c "import json; c=json.load(open('$SERVING_DIR/config.json')); print(c.get('dsa_bucket_count'), c.get('dsa_bucket_top_k'))" 2>/dev/null || echo NA)"
+  echo "telemetry:   $BUCKET_TELEMETRY artifact:${DSA_BUCKET_TELEMETRY_ARTIFACT:-none}"
   echo "speed_claim: false (exploratory graph/eager data exists; no durable selector claim)"
   echo "served_name: $SERVED_NAME"
   echo "PYTHONPATH:  $PYTHONPATH"

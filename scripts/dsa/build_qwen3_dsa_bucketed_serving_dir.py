@@ -14,6 +14,7 @@ from typing import Any
 EXACT_ARCH = "Qwen3DSAForCausalLM"
 BUCKETED_ARCH = "Qwen3DSABucketedForCausalLM"
 BACKENDS = ("torch_reference", "vllm_stock_per_bucket")
+TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety")
 DECODE_GRAPH_VALIDATED_GEOMETRY = {
     "backend": "vllm_stock_per_bucket",
     "bucket_count": 8,
@@ -21,6 +22,9 @@ DECODE_GRAPH_VALIDATED_GEOMETRY = {
     "total_k": 2048,
 }
 DECODE_GRAPH_EVIDENCE = ".agents/gpu_jobs/20260828T210745Z-qwen3-dsa-bucketed-decode-graph/result.md"
+GRAPH_SAFETY_EVIDENCE = (
+    ".agents/gpu_jobs/20260828T232757Z-qwen3-dsa-bucket-graph-telemetry-fix/result.md"
+)
 
 
 def _git_revision(repo: Path) -> str | None:
@@ -71,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         help="local k; omitted means dsa_top_k // bucket_count",
     )
     parser.add_argument("--backend", choices=BACKENDS, default="vllm_stock_per_bucket")
+    parser.add_argument(
+        "--telemetry",
+        choices=TELEMETRY_MODES,
+        default="off",
+        help="summary/verify_exact are eager-only; graph_safety uses persistent device counters",
+    )
     return parser.parse_args()
 
 
@@ -114,7 +124,7 @@ def main() -> int:
             "dsa_selector_backend": args.backend,
             "dsa_bucket_count": args.bucket_count,
             "dsa_bucket_top_k": bucket_top_k,
-            "dsa_bucket_telemetry": "off",
+            "dsa_bucket_telemetry": args.telemetry,
             "index_topk": total_k,
         }
     )
@@ -124,7 +134,7 @@ def main() -> int:
     (output / "config.json").write_text(json.dumps(derived, indent=2) + "\n")
 
     repo = Path(__file__).resolve().parents[2]
-    decode_graph_validated = {
+    decode_graph_validated = args.telemetry in ("off", "graph_safety") and {
         "backend": args.backend,
         "bucket_count": args.bucket_count,
         "bucket_top_k": bucket_top_k,
@@ -138,6 +148,7 @@ def main() -> int:
         "architecture": BUCKETED_ARCH,
         "selector": "modulo_bucket_topk",
         "selector_backend": args.backend,
+        "telemetry": args.telemetry,
         "selector_speed_claim_valid": False,
         "dsa_top_k": total_k,
         "index_topk": total_k,
@@ -151,11 +162,19 @@ def main() -> int:
         "verl_revision": _git_revision(repo),
         "exact_source_modified": False,
         "cuda_graph_modes_supported": (
-            ["NONE", "FULL_DECODE_ONLY"] if args.backend == "vllm_stock_per_bucket" else ["NONE"]
+            ["NONE", "FULL_DECODE_ONLY"]
+            if args.backend == "vllm_stock_per_bucket" and args.telemetry in ("off", "graph_safety")
+            else ["NONE"]
         ),
         "decode_cuda_graph_validated": decode_graph_validated,
         "prefill_cuda_graph_validated": False,
-        "cuda_graph_validation_evidence": DECODE_GRAPH_EVIDENCE if decode_graph_validated else None,
+        "cuda_graph_validation_evidence": (
+            GRAPH_SAFETY_EVIDENCE
+            if decode_graph_validated and args.telemetry == "graph_safety"
+            else DECODE_GRAPH_EVIDENCE
+            if decode_graph_validated
+            else None
+        ),
     }
     (output / "BUCKETED_BUILD_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))

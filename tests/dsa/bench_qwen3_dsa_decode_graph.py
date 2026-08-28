@@ -147,12 +147,12 @@ def main() -> int:
         # first_token_ts/last_token_ts unavailable even though the engine records them internally.
         disable_log_stats=False,
         seed=1234,
-        worker_extension_cls=smoke.WORKER_EXTENSION_CLS,
+        worker_extension_cls=smoke.telemetry_worker_extension(args.model),
     )
 
     # Do not bill first-inference initialization to either mode.
     run_batch(llm, batch_size=2, prompt_tokens=0, max_tokens=8)
-    smoke.reset_selector_telemetry(llm)
+    smoke.reset_selector_telemetry(llm, kind=smoke.telemetry_kind(args.model))
 
     samples = []
     for repeat in range(args.repeats):

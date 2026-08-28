@@ -24,6 +24,34 @@ class Installation:
 _INSTALLATION: Installation | None = None
 
 
+def _captured_indexer_layer() -> str:
+    """Recover the static indexer prefix from vLLM's pinned custom-op frame.
+
+    During CUDA capture the Python ``RUNTIME.layer`` scope may have run only while Dynamo traced
+    the model. The sparse-indexer implementation still carries its k-cache prefix, and selecting a
+    persistent counter slice from that prefix during capture bakes the right address into replay.
+    """
+
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "sparse_attn_indexer"
+                and frame.f_globals.get("__name__")
+                == "vllm.model_executor.layers.sparse_attn_indexer"
+                and "k_cache_prefix" in frame.f_locals
+            ):
+                prefix = frame.f_locals["k_cache_prefix"]
+                value = getattr(prefix, "value", prefix)
+                return str(value).removesuffix(".k_cache")
+            frame = frame.f_back
+    finally:
+        del frame
+    if RUNTIME.current_layer != "unattributed":
+        return RUNTIME.current_layer
+    raise RuntimeError("graph_safety could not recover the bucket indexer layer prefix")
+
+
 def _validate_output(
     output: torch.Tensor,
     query_positions: torch.Tensor,
@@ -57,6 +85,7 @@ def _select(
     query_positions: torch.Tensor,
     output: torch.Tensor,
     *,
+    phase: str,
     stock_topk: StockTopK,
 ) -> None:
     config = RUNTIME.config
@@ -82,6 +111,26 @@ def _select(
             stock_topk=stock_topk,
         )
     _validate_output(output, query_positions, result, logits.shape[1])
+    exact_reference = None
+    if config.telemetry == "verify_exact":
+        exact_reference = torch.full_like(output, -1)
+        sequence_lengths = (query_positions.reshape(-1).to(torch.int64) + 1).clamp(
+            min=0, max=logits.shape[1]
+        )
+        stock_topk(logits, sequence_lengths, exact_reference, config.total_k)
+    RUNTIME.record(
+        phase=phase,
+        logits=logits,
+        output=output,
+        query_positions=query_positions,
+        result=result,
+        exact_reference=exact_reference,
+        layer_name=(
+            _captured_indexer_layer()
+            if config.telemetry == "graph_safety"
+            else None
+        ),
+    )
 
 
 def _prefill_hook(
@@ -153,6 +202,7 @@ def _prefill_hook(
             logits[rows, key_start : key_start + key_count],
             query_positions[rows],
             raw_topk_indices[rows],
+            phase="prefill",
             stock_topk=stock_topk,
         )
         request_start = request_end
@@ -171,7 +221,13 @@ def _decode_selection(
         raise RuntimeError(
             f"bucket decode supports next_n=1 only; got {lengths.numel()} lengths for {output.shape[0]} rows"
         )
-    _select(logits, lengths.to(torch.int64) - 1, output, stock_topk=stock_topk)
+    _select(
+        logits,
+        lengths.to(torch.int64) - 1,
+        output,
+        phase="decode",
+        stock_topk=stock_topk,
+    )
 
 
 def _decode_hook(
