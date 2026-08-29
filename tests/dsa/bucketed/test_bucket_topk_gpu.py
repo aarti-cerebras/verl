@@ -243,6 +243,75 @@ def test_500_by_12_generic_decode_cuda_graph_replay(backend: str) -> None:
     assert bool((observed[:, total_k:] == -1).all())
 
 
+def test_500_by_12_graph_verify_exact_cuda_graph_replay() -> None:
+    from vllm import _custom_ops
+
+    device = torch.device("cuda")
+    bucket_count, bucket_top_k = 500, 12
+    total_k = bucket_count * bucket_top_k
+    capacity = 6016
+    _configure(
+        bucket_count,
+        bucket_top_k,
+        backend="vllm_stock_batched_buckets",
+        telemetry="graph_verify_exact",
+        capacity=capacity,
+    )
+    RUNTIME.initialize_graph_quality(["layer.0"], device=device)
+    generator = torch.Generator(device=device).manual_seed(20260831)
+    logits = torch.randn((2, 6003), generator=generator, device=device, dtype=torch.float32)
+    seq_lens = torch.tensor([[6003], [1173]], device=device, dtype=torch.int32)
+    observed = torch.empty((2, capacity), device=device, dtype=torch.int32)
+
+    def select() -> None:
+        with RUNTIME.layer("layer.0"):
+            _decode_hook(
+                {"decode": _custom_ops.top_k_per_row_decode},
+                logits,
+                1,
+                seq_lens,
+                observed,
+                logits.shape[0],
+                logits.stride(0),
+                logits.stride(1),
+                capacity,
+            )
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        select()
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select()
+    RUNTIME.reset()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    artifact = RUNTIME.artifact()
+    counters = artifact["graph_replay"]["global"]
+    assert counters["rows"] == 2
+    assert counters["selected_total"] == total_k + 1173
+    assert not any(
+        counters[name]
+        for name in (
+            "count_mismatch",
+            "padding_violation",
+            "prefix_violation",
+            "invalid_index",
+            "noncausal_index",
+            "duplicate_index",
+        )
+    )
+    quality = artifact["graph_replay_quality"]["phases"]["decode"]
+    assert quality["global"]["recall"]["n"] == 2
+    assert len(quality["per_layer"]["layer.0"]["per_bucket"]) == bucket_count
+    assert bool((observed[:, total_k:] == -1).all())
+
+
 def test_500_by_12_padding_converts_to_exactly_6000_global_slots() -> None:
     from vllm.v1.attention.backends.mla.sparse_utils import (
         triton_convert_req_index_to_global_index,

@@ -322,6 +322,53 @@ def test_graph_verify_exact_matches_eager_decode_moments_and_resets_in_place() -
     assert all(summary["n"] == 0 for summary in reset_metrics.values())
 
 
+def test_graph_verify_exact_large_bucket_geometry_accumulates_without_one_hot() -> None:
+    bucket_count, bucket_top_k = 500, 12
+    config = BucketSelectorConfig(
+        selector="modulo_bucket_topk",
+        backend="vllm_stock_batched_buckets",
+        bucket_count=bucket_count,
+        bucket_top_k=bucket_top_k,
+        total_k=bucket_count * bucket_top_k,
+        capacity=6016,
+        telemetry="graph_verify_exact",
+    )
+    logits = torch.arange(23, dtype=torch.float32).reshape(1, -1)
+    qpos = torch.tensor([22])
+    output = torch.empty((1, config.total_k), dtype=torch.int32)
+    result = select_bucket_topk_reference(
+        logits,
+        qpos,
+        output,
+        bucket_count=bucket_count,
+        bucket_top_k=bucket_top_k,
+    )
+    exact = torch.full_like(output, -1)
+    exact[:, : logits.shape[1]] = torch.arange(logits.shape[1], dtype=torch.int32)
+
+    runtime = BucketSelectorRuntime()
+    runtime.configure(config)
+    runtime.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    runtime.record(
+        phase="decode",
+        layer_name="layer.0",
+        logits=logits,
+        output=output,
+        query_positions=qpos,
+        result=result,
+        exact_reference=exact,
+    )
+
+    buckets = runtime.artifact()["graph_replay_quality"]["phases"]["decode"][
+        "per_layer"
+    ]["layer.0"]["per_bucket"]
+    assert len(buckets) == bucket_count
+    assert all(bucket["intersection"]["mean"] == 1 for bucket in buckets[:23])
+    assert all(bucket["intersection"]["mean"] == 0 for bucket in buckets[23:])
+    assert all(bucket["added"]["mean"] == 0 for bucket in buckets)
+    assert all(bucket["dropped"]["mean"] == 0 for bucket in buckets)
+
+
 def test_graph_verify_exact_keeps_prefill_host_folded() -> None:
     runtime = BucketSelectorRuntime()
     runtime.configure(_config(telemetry="graph_verify_exact"))

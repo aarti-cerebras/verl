@@ -561,16 +561,23 @@ class BucketSelectorRuntime:
             position_quality[phase_slot], position_values, position_include
         )
 
-        buckets = torch.arange(config.bucket_count, device=output.device)
-        output_bucket = (
-            output.remainder(config.bucket_count)[..., None] == buckets
-        ) & (output >= 0)[..., None]
-        exact_bucket = (
-            exact_reference.remainder(config.bucket_count)[..., None] == buckets
-        ) & exact_valid[..., None]
-        bucket_intersection = (bucket_in_exact[..., None] & output_bucket).sum(1)
         bucket_selected = result.bucket_counts
-        bucket_exact = exact_bucket.sum(1)
+        # Accumulate by modulo id without materializing [rows, total_k, bucket_count] one-hot
+        # tensors. At 500x12 and vLLM's largest decode capture shape those broadcasts require more
+        # than 11 GiB apiece; scatter keeps the temporary footprint proportional to
+        # [rows, total_k] plus the small [rows, bucket_count] result.
+        output_bucket_ids = output.remainder(config.bucket_count).long()
+        exact_bucket_ids = exact_reference.remainder(config.bucket_count).long()
+        bucket_intersection = torch.zeros_like(bucket_selected).scatter_add(
+            1,
+            output_bucket_ids,
+            (bucket_in_exact & (output >= 0)).to(bucket_selected.dtype),
+        )
+        bucket_exact = torch.zeros_like(bucket_selected).scatter_add(
+            1,
+            exact_bucket_ids,
+            exact_valid.to(bucket_selected.dtype),
+        )
         bucket_metrics = torch.stack(
             (
                 bucket_selected,
