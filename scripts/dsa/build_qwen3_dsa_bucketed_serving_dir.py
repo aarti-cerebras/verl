@@ -13,13 +13,15 @@ from typing import Any
 
 EXACT_ARCH = "Qwen3DSAForCausalLM"
 BUCKETED_ARCH = "Qwen3DSABucketedForCausalLM"
-BACKENDS = ("torch_reference", "vllm_stock_per_bucket")
+BACKENDS = ("torch_reference", "vllm_stock_per_bucket", "vllm_stock_batched_buckets")
 TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety", "graph_verify_exact")
+INDEX_TOPK_ALIGNMENT = 128
 DECODE_GRAPH_VALIDATED_GEOMETRY = {
     "backend": "vllm_stock_per_bucket",
     "bucket_count": 8,
     "bucket_top_k": 256,
     "total_k": 2048,
+    "capacity": 2048,
 }
 DECODE_GRAPH_EVIDENCE = ".agents/gpu_jobs/20260828T210745Z-qwen3-dsa-bucketed-decode-graph/result.md"
 GRAPH_SAFETY_EVIDENCE = (
@@ -75,7 +77,10 @@ def parse_args() -> argparse.Namespace:
         "--bucket-top-k",
         type=int,
         default=None,
-        help="local k; omitted means dsa_top_k // bucket_count",
+        help=(
+            "fixed local k per bucket; omitted preserves the source dsa_top_k budget by using "
+            "dsa_top_k // bucket_count"
+        ),
     )
     parser.add_argument("--backend", choices=BACKENDS, default="vllm_stock_per_bucket")
     parser.add_argument(
@@ -106,21 +111,22 @@ def main() -> int:
         raise SystemExit("--bucket-count must be positive")
 
     config, raw_config = _load_source(source)
-    total_k = int(config["dsa_top_k"])
+    source_top_k = int(config["dsa_top_k"])
     if args.bucket_top_k is None:
-        if total_k % args.bucket_count:
+        if source_top_k % args.bucket_count:
             raise SystemExit(
-                f"dsa_top_k={total_k} is not divisible by bucket_count={args.bucket_count}; "
-                "pass an explicit geometry whose product preserves the total budget"
+                f"dsa_top_k={source_top_k} is not divisible by bucket_count={args.bucket_count}; "
+                "pass --bucket-top-k explicitly to choose the bucket selector capacity"
             )
-        bucket_top_k = total_k // args.bucket_count
+        bucket_top_k = source_top_k // args.bucket_count
     else:
         bucket_top_k = args.bucket_top_k
-    if bucket_top_k <= 0 or args.bucket_count * bucket_top_k != total_k:
-        raise SystemExit(
-            f"fixed budget requires bucket_count * bucket_top_k == dsa_top_k: "
-            f"{args.bucket_count} * {bucket_top_k} != {total_k}"
-        )
+    if bucket_top_k <= 0:
+        raise SystemExit("--bucket-top-k must be positive")
+    selector_top_k = args.bucket_count * bucket_top_k
+    capacity = (
+        (selector_top_k + INDEX_TOPK_ALIGNMENT - 1) // INDEX_TOPK_ALIGNMENT
+    ) * INDEX_TOPK_ALIGNMENT
 
     derived = dict(config)
     derived.update(
@@ -131,7 +137,9 @@ def main() -> int:
             "dsa_bucket_count": args.bucket_count,
             "dsa_bucket_top_k": bucket_top_k,
             "dsa_bucket_telemetry": args.telemetry,
-            "index_topk": total_k,
+            # dsa_top_k remains checkpoint/training metadata. index_topk is the physical buffer
+            # width required by vLLM's 128-wide index conversion; surplus slots stay -1.
+            "index_topk": capacity,
         }
     )
 
@@ -145,7 +153,8 @@ def main() -> int:
         "backend": args.backend,
         "bucket_count": args.bucket_count,
         "bucket_top_k": bucket_top_k,
-        "total_k": total_k,
+        "total_k": selector_top_k,
+        "capacity": capacity,
     } == DECODE_GRAPH_VALIDATED_GEOMETRY
     manifest = {
         "artifact_kind": "qwen3_dsa_bucketed_serving_dir",
@@ -157,20 +166,34 @@ def main() -> int:
         "selector_backend": args.backend,
         "telemetry": args.telemetry,
         "selector_speed_claim_valid": False,
-        "dsa_top_k": total_k,
-        "index_topk": total_k,
+        "dsa_top_k": source_top_k,
+        "index_topk": capacity,
+        "bucket_total_k": selector_top_k,
+        "index_topk_alignment": INDEX_TOPK_ALIGNMENT,
+        "index_topk_padding": capacity - selector_top_k,
         "bucket_count": args.bucket_count,
         "bucket_top_k": bucket_top_k,
-        "stock_topk_launches_per_selection": (args.bucket_count if args.backend == "vllm_stock_per_bucket" else 0),
+        "stock_topk_launches_per_selection": (
+            args.bucket_count
+            if args.backend == "vllm_stock_per_bucket"
+            else 1
+            if args.backend == "vllm_stock_batched_buckets"
+            else 0
+        ),
         "bucket_score_materialization": (
-            "none_strided_per_bucket" if args.backend == "vllm_stock_per_bucket" else "reference_tensor_view"
+            "none_strided_per_bucket"
+            if args.backend == "vllm_stock_per_bucket"
+            else "single_padded_bucket_row_tensor"
+            if args.backend == "vllm_stock_batched_buckets"
+            else "reference_tensor_view"
         ),
         "linked_assets": linked,
         "verl_revision": _git_revision(repo),
         "exact_source_modified": False,
         "cuda_graph_modes_supported": (
             ["NONE", "FULL_DECODE_ONLY"]
-            if args.backend == "vllm_stock_per_bucket" and args.telemetry in graph_telemetry_modes
+            if args.backend in ("vllm_stock_per_bucket", "vllm_stock_batched_buckets")
+            and args.telemetry in graph_telemetry_modes
             else ["NONE"]
         ),
         "decode_cuda_graph_validated": decode_graph_validated,

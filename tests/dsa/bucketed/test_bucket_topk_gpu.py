@@ -7,6 +7,7 @@ import torch
 
 from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_hooks import (
     _cuda_decode_hook,
+    _decode_hook,
     _prefill_hook,
 )
 from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_runtime import (
@@ -26,16 +27,24 @@ def reset_runtime() -> None:
     RUNTIME.reset_for_test()
 
 
-def _configure(bucket_count: int, bucket_top_k: int, *, telemetry: str = "off") -> None:
+def _configure(
+    bucket_count: int,
+    bucket_top_k: int,
+    *,
+    backend: str = "vllm_stock_per_bucket",
+    capacity: int | None = None,
+    telemetry: str = "off",
+) -> None:
     total_k = bucket_count * bucket_top_k
+    capacity = total_k if capacity is None else capacity
     RUNTIME.configure(
         BucketSelectorConfig(
             selector="modulo_bucket_topk",
-            backend="vllm_stock_per_bucket",
+            backend=backend,
             bucket_count=bucket_count,
             bucket_top_k=bucket_top_k,
             total_k=total_k,
-            capacity=total_k,
+            capacity=capacity,
             telemetry=telemetry,
         )
     )
@@ -132,6 +141,132 @@ def test_prefill_uses_real_stock_topk_per_request_and_bucket() -> None:
 
     _assert_same_position_sets(observed, expected)
     assert (observed >= 0).sum(-1).cpu().tolist() == [5, 12, 9]
+
+
+@pytest.mark.parametrize(
+    "backend", ["vllm_stock_per_bucket", "vllm_stock_batched_buckets"]
+)
+def test_generic_decode_supports_real_500_by_12_stock_topk(backend: str) -> None:
+    from vllm import _custom_ops
+
+    device = torch.device("cuda")
+    bucket_count, bucket_top_k = 500, 12
+    total_k = bucket_count * bucket_top_k
+    capacity = 6016
+    _configure(bucket_count, bucket_top_k, backend=backend, capacity=capacity)
+    generator = torch.Generator(device=device).manual_seed(20260829)
+    logits = torch.randn((2, 6003), generator=generator, device=device, dtype=torch.float32)
+    seq_lens = torch.tensor([[6003], [1173]], device=device, dtype=torch.int32)
+    observed = torch.empty((2, capacity), device=device, dtype=torch.int32)
+
+    _decode_hook(
+        {"decode": _custom_ops.top_k_per_row_decode},
+        logits,
+        1,
+        seq_lens,
+        observed,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        capacity,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.full_like(observed, -1)
+    select_bucket_topk_reference(
+        logits,
+        seq_lens.to(torch.int64) - 1,
+        expected[:, :total_k],
+        bucket_count=bucket_count,
+        bucket_top_k=bucket_top_k,
+    )
+    _assert_same_position_sets(observed, expected)
+    assert (observed >= 0).sum(-1).cpu().tolist() == [6000, 1173]
+    assert bool((observed[:, total_k:] == -1).all())
+
+
+@pytest.mark.parametrize(
+    "backend", ["vllm_stock_per_bucket", "vllm_stock_batched_buckets"]
+)
+def test_500_by_12_generic_decode_cuda_graph_replay(backend: str) -> None:
+    from vllm import _custom_ops
+
+    device = torch.device("cuda")
+    bucket_count, bucket_top_k = 500, 12
+    total_k = bucket_count * bucket_top_k
+    capacity = 6016
+    _configure(bucket_count, bucket_top_k, backend=backend, capacity=capacity)
+    generator = torch.Generator(device=device).manual_seed(20260830)
+    logits = torch.randn((1, 6003), generator=generator, device=device, dtype=torch.float32)
+    seq_lens = torch.tensor([[6003]], device=device, dtype=torch.int32)
+    observed = torch.empty((1, capacity), device=device, dtype=torch.int32)
+
+    def select() -> None:
+        _decode_hook(
+            {"decode": _custom_ops.top_k_per_row_decode},
+            logits,
+            1,
+            seq_lens,
+            observed,
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            capacity,
+        )
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        select()
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select()
+
+    seq_lens.fill_(1173)
+    logits.copy_(torch.randn(logits.shape, generator=generator, device=device))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = torch.full_like(observed, -1)
+    select_bucket_topk_reference(
+        logits,
+        seq_lens.to(torch.int64) - 1,
+        expected[:, :total_k],
+        bucket_count=bucket_count,
+        bucket_top_k=bucket_top_k,
+    )
+    _assert_same_position_sets(observed, expected)
+    assert int((observed >= 0).sum()) == 1173
+    assert bool((observed[:, total_k:] == -1).all())
+
+
+def test_500_by_12_padding_converts_to_exactly_6000_global_slots() -> None:
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        triton_convert_req_index_to_global_index,
+    )
+
+    device = torch.device("cuda")
+    token_indices = torch.full((1, 6016), -1, device=device, dtype=torch.int32)
+    token_indices[:, :6000] = torch.arange(6000, device=device, dtype=torch.int32)
+    req_ids = torch.zeros(1, device=device, dtype=torch.int32)
+    block_table = torch.arange(94, device=device, dtype=torch.int32).reshape(1, -1)
+
+    global_slots, valid_counts = triton_convert_req_index_to_global_index(
+        req_ids,
+        block_table,
+        token_indices,
+        BLOCK_SIZE=64,
+        NUM_TOPK_TOKENS=6016,
+        return_valid_counts=True,
+    )
+    torch.cuda.synchronize()
+
+    assert valid_counts.cpu().tolist() == [6000]
+    assert torch.equal(global_slots[:, :6000], token_indices[:, :6000])
+    assert bool((global_slots[:, 6000:] == -1).all())
 
 
 def test_decode_cuda_graph_replay_handles_inactive_padding_row() -> None:

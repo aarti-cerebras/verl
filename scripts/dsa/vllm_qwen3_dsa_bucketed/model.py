@@ -143,6 +143,8 @@ def dsa_params(config: PretrainedConfig) -> dict[str, Any]:
         rope_head_dim=int(getattr(config, "dsa_rope_head_dim", 64)),
         rope_theta=float(theta),
         top_k=int(top_k),
+        capacity=int(getattr(config, "index_topk", top_k)),
+        bucket_top_k=int(getattr(config, "dsa_bucket_top_k", top_k)),
         fp8=bool(getattr(config, "dsa_fp8", True)),
         fp8_ue8m0=bool(getattr(config, "dsa_fp8_ue8m0", True)),
         rotate_activation=bool(getattr(config, "dsa_rotate_activation", True)),
@@ -158,8 +160,8 @@ def assert_servable_sparse(config: PretrainedConfig) -> None:
         bit-identical to stock Qwen3 by construction, so benchmarks would look *fine*;
       * ``index_topk`` absent -> the documented vLLM sparse gate. vLLM's own use of it is SOFT
         (a missing key merely makes the MLA sparse backend decline and the engine picks a dense
-        one -- memory ``dsa-serving-index-topk-gate``). Ours is hard, and it must agree with
-        ``dsa_top_k`` so the config cannot describe one budget while serving another.
+        one -- memory ``dsa-serving-index-topk-gate``). Ours is hard, and it must agree with the
+        bucket product that defines the selector and GQA capacity.
     """
     assert getattr(config, "dsa_enabled", False), (
         "config.dsa_enabled is not set -- this serving dir was not built from a DSA checkpoint"
@@ -182,12 +184,16 @@ def assert_servable_sparse(config: PretrainedConfig) -> None:
     assert bucket_count > 0 and bucket_top_k > 0, (
         "bucketed serving requires positive config.dsa_bucket_count and config.dsa_bucket_top_k"
     )
-    assert bucket_count * bucket_top_k == top_k, (
-        f"bucket budget {bucket_count} * {bucket_top_k} != dsa_top_k {top_k}"
+    assert top_k > 0, f"config.dsa_top_k must be positive, got {top_k}"
+    bucket_total_k = bucket_count * bucket_top_k
+    physical_capacity = int(index_topk)
+    assert physical_capacity >= bucket_total_k, (
+        f"index_topk ({physical_capacity}) cannot hold bucket total "
+        f"{bucket_count} * {bucket_top_k} = {bucket_total_k}"
     )
-    assert int(index_topk) == top_k, (
-        f"index_topk ({index_topk}) != dsa_top_k ({top_k}) -- fixed bucket selection requires "
-        "one shared total attention budget"
+    assert physical_capacity % 128 == 0 and physical_capacity - bucket_total_k < 128, (
+        f"index_topk ({physical_capacity}) must be the smallest 128-aligned capacity at or above "
+        f"bucket total {bucket_total_k}"
     )
 
 
@@ -392,7 +398,7 @@ class Qwen3DSAModel(Qwen2Model):
             # token, unlike MSA which selects per (token, index head). Same shape stock vLLM
             # allocates for DeepSeek-V3.2 (deepseek_v2.py:1362-1367). Plain attribute, never a
             # Parameter or registered buffer, so it stays out of state_dict.
-            top_k = int(config.dsa_top_k)
+            top_k = int(config.index_topk)
             buf = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 top_k,
@@ -439,7 +445,9 @@ class Qwen3DSAModel(Qwen2Model):
                 f"[Qwen3DSA-bucketed] {n_sparse}/{config.num_hidden_layers} layers sparse; "
                 f"selector={config.dsa_selector} backend={config.dsa_selector_backend} "
                 f"buckets={config.dsa_bucket_count} local_k={config.dsa_bucket_top_k} "
-                f"total_k={config.dsa_top_k} telemetry={config.dsa_bucket_telemetry} "
+                f"trained_k={config.dsa_top_k} selected_k="
+                f"{config.dsa_bucket_count * config.dsa_bucket_top_k} capacity={config.index_topk} "
+                f"telemetry={config.dsa_bucket_telemetry} "
                 f"(dense: {sorted(set(range(config.num_hidden_layers)) - sparse_ids) or 'none'})"
             )
 

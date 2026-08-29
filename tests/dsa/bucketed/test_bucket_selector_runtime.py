@@ -40,6 +40,33 @@ def test_config_from_hf_fixed_budget() -> None:
     assert observed.bucket_top_k == 256
 
 
+def test_config_from_hf_uses_bucket_product_capacity_not_trained_top_k() -> None:
+    config = SimpleNamespace(
+        dsa_selector="modulo_bucket_topk",
+        dsa_selector_backend="vllm_stock_per_bucket",
+        dsa_bucket_count=500,
+        dsa_bucket_top_k=12,
+        dsa_top_k=2048,
+        index_topk=6016,
+    )
+    observed = config_from_hf(config)
+    assert observed.total_k == 6000
+    assert observed.capacity == 6016
+
+
+def test_config_rejects_nonminimal_capacity_padding() -> None:
+    config = BucketSelectorConfig(
+        selector="modulo_bucket_topk",
+        backend="vllm_stock_per_bucket",
+        bucket_count=500,
+        bucket_top_k=12,
+        total_k=6000,
+        capacity=6144,
+    )
+    with pytest.raises(ValueError, match="smallest 128-aligned"):
+        config.validate()
+
+
 def test_config_rejects_budget_mismatch() -> None:
     config = BucketSelectorConfig(
         selector="modulo_bucket_topk",
@@ -82,7 +109,7 @@ def test_reference_backend_fails_closed_on_cuda_graphs() -> None:
         total_k=8,
         capacity=8,
     )
-    with pytest.raises(ValueError, match="vllm_stock_per_bucket"):
+    with pytest.raises(ValueError, match="vLLM stock backend"):
         config.validate_execution(cudagraph_mode="FULL_DECODE_ONLY")
 
 

@@ -5,6 +5,7 @@ from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_topk_reference import (
 )
 from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_topk_stock import (
     select_bucket_topk_stock,
+    select_bucket_topk_stock_batched,
 )
 
 
@@ -79,3 +80,34 @@ def test_stock_callback_receives_strided_bucket_views_and_local_lengths() -> Non
 
     assert seen == [(3, [4, 2]), (3, [3, 2]), (3, [3, 1])]
     assert [len(row) for row in _sets(output)] == [6, 5]
+
+
+def test_batched_stock_matches_reference_with_one_materialized_call() -> None:
+    torch.manual_seed(29)
+    logits = torch.randn(8, 37)
+    logits += torch.arange(37, dtype=torch.float32)[None, :] * 1e-5
+    qpos = torch.tensor([0, 3, 7, 11, 19, 28, 36, -1])
+    reference = torch.empty(8, 12, dtype=torch.int32)
+    observed = torch.empty_like(reference)
+    calls: list[tuple[tuple[int, ...], list[int]]] = []
+
+    def recording_stock(scores, lengths, target, top_k):
+        calls.append((tuple(scores.shape), lengths.tolist()))
+        _torch_stock_topk(scores, lengths, target, top_k)
+
+    expected = select_bucket_topk_reference(
+        logits, qpos, reference, bucket_count=4, bucket_top_k=3
+    )
+    result = select_bucket_topk_stock_batched(
+        logits,
+        qpos,
+        observed,
+        bucket_count=4,
+        bucket_top_k=3,
+        stock_topk=recording_stock,
+    )
+
+    assert _sets(observed) == _sets(reference)
+    assert torch.equal(result.selected_count, expected.selected_count)
+    assert len(calls) == 1
+    assert calls[0][0] == (32, 10)

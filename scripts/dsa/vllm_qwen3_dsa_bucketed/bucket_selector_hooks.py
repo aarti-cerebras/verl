@@ -10,9 +10,14 @@ import torch
 
 from .bucket_selector_runtime import RUNTIME
 from .bucket_topk_reference import BucketSelectionResult, _assert_tensor, select_bucket_topk_reference
-from .bucket_topk_stock import StockTopK, select_bucket_topk_stock
+from .bucket_topk_stock import (
+    StockTopK,
+    select_bucket_topk_stock,
+    select_bucket_topk_stock_batched,
+)
 
 PINNED_VLLM_VERSION = "0.26.0"
+MAX_STOCK_GLOBAL_TOP_K = 4096
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,35 @@ def _validate_output(
     )
 
 
+def _global_exact_topk(
+    logits: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    output: torch.Tensor,
+    total_k: int,
+    stock_topk: StockTopK,
+) -> None:
+    """Write the equal-cardinality global exact reference used only by telemetry."""
+
+    if total_k <= MAX_STOCK_GLOBAL_TOP_K:
+        stock_topk(logits, sequence_lengths, output, total_k)
+        return
+
+    # vLLM 0.26's compiled global top-k fails above 4096. The bucket path itself never asks it for
+    # the total capacity (only bucket_top_k), so use graph-capturable torch top-k solely for the
+    # optional telemetry reference.
+    output.fill_(-1)
+    width = min(total_k, logits.shape[1])
+    if not width:
+        return
+    positions = torch.arange(logits.shape[1], device=logits.device)
+    valid = positions[None, :] < sequence_lengths[:, None]
+    top = logits.masked_fill(~valid, float("-inf")).topk(width, dim=-1)
+    keep = torch.arange(width, device=logits.device)[None, :] < sequence_lengths.clamp(
+        max=total_k
+    )[:, None]
+    output[:, :width].copy_(torch.where(keep, top.indices.to(output.dtype), -1))
+
+
 def _select(
     logits: torch.Tensor,
     query_positions: torch.Tensor,
@@ -93,19 +127,30 @@ def _select(
         raise RuntimeError("bucket selector hook ran before model configuration")
     if output.shape[1] != config.capacity:
         raise RuntimeError(f"bucket selector output width {output.shape[1]} != configured capacity {config.capacity}")
+    output.fill_(-1)
+    selector_output = output[:, : config.total_k]
     if config.backend == "torch_reference":
         result = select_bucket_topk_reference(
             logits,
             query_positions,
-            output,
+            selector_output,
             bucket_count=config.bucket_count,
             bucket_top_k=config.bucket_top_k,
         )
-    else:
+    elif config.backend == "vllm_stock_per_bucket":
         result = select_bucket_topk_stock(
             logits,
             query_positions,
-            output,
+            selector_output,
+            bucket_count=config.bucket_count,
+            bucket_top_k=config.bucket_top_k,
+            stock_topk=stock_topk,
+        )
+    else:
+        result = select_bucket_topk_stock_batched(
+            logits,
+            query_positions,
+            selector_output,
             bucket_count=config.bucket_count,
             bucket_top_k=config.bucket_top_k,
             stock_topk=stock_topk,
@@ -117,7 +162,13 @@ def _select(
         sequence_lengths = (query_positions.reshape(-1).to(torch.int64) + 1).clamp(
             min=0, max=logits.shape[1]
         )
-        stock_topk(logits, sequence_lengths, exact_reference, config.total_k)
+        _global_exact_topk(
+            logits,
+            sequence_lengths,
+            exact_reference,
+            config.total_k,
+            stock_topk,
+        )
     RUNTIME.record(
         phase=phase,
         logits=logits,
@@ -266,7 +317,7 @@ def _decode_hook(
         target: torch.Tensor,
         local_k: int,
     ) -> None:
-        local_lengths = bucket_lengths.to(seq_lens.dtype).reshape_as(seq_lens)
+        local_lengths = bucket_lengths.to(seq_lens.dtype).reshape(-1, 1)
         originals["decode"](
             bucket_logits,
             1,
@@ -312,7 +363,7 @@ def _cuda_decode_hook(
         # The native cooperative/persistent kernels only accept k in {512, 1024, 2048} and expose
         # no score strides. Redirect their global-k call to vLLM's saved generic, stride-aware
         # top-k so arbitrary fixed local k values work without materializing each bucket.
-        local_lengths = bucket_lengths.to(seq_lens.dtype).reshape_as(seq_lens)
+        local_lengths = bucket_lengths.to(seq_lens.dtype).reshape(-1, 1)
         originals["decode"](
             bucket_logits,
             1,

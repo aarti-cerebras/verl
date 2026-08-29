@@ -1,6 +1,7 @@
 # Modulo-Bucket Local Top-k for Qwen3 DSA Serving
 
-**Status (2026-08-28):** eager implementation validated. The isolated reference and
+**Status (2026-08-29):** eager implementation validated, including an attention budget independent
+of the checkpoint's `dsa_top_k`. The isolated reference and
 `vllm_stock_per_bucket` paths, builder, boot path, launcher, and CPU/non-interference tests pass.
 On an H100, real vLLM CUDA prefill/decode selected-set parity passed, an eager sparse engine loaded
 all 36 bucketed layers, and a 4.5k-token equal-budget needle fixture passed with token-identical
@@ -10,7 +11,11 @@ replays. Exploratory graph/eager decode measurements are retained, but full/pref
 and durable performance claims remain unvalidated. Bucket telemetry is implemented and validated
 on H100 in eager `verify_exact` and decode-graph `graph_safety` modes. A separate
 `graph_verify_exact` mode now follows the approximate selector's split: eager prefill remains
-host-folded while captured decode updates fixed-address exact-quality moments on device.
+host-folded while captured decode updates fixed-address exact-quality moments on device. The
+`vllm_stock_batched_buckets` backend validates the requested 500-by-12 geometry: 6,000 logical
+positions are carried in a minimally 128-aligned 6,016-slot buffer whose 16-slot tail is always
+invalid. End-to-end eager generation passes at this geometry; full-engine decode graph capture has
+not yet been validated for it.
 
 **Scope:** Qwen3 DSA vLLM serving and evaluation only. This plan does not change training,
 checkpoint weights, sampling top-k, or the existing exact and radix-selector servers.
@@ -26,15 +31,21 @@ bucket(position) = position % bucket_count
 and selects a fixed exact local top-k from the indexer scores in every bucket. The union of those
 positions is the key set consumed by sparse GQA attention.
 
-The initial fixed-budget invariant is:
+The selector/GQA capacity is:
 
 ```text
-total_k = bucket_count * bucket_top_k
-dsa_top_k == index_topk == total_k
+bucket_total_k = bucket_count * bucket_top_k
+index_topk = round_up(bucket_total_k, 128)
 ```
 
-Keeping `total_k` equal to the source model's `dsa_top_k` makes exact global top-k and bucketed
-local top-k comparable at the same maximum GQA attention budget.
+`bucket_total_k` is the logical maximum selected count. `index_topk` is the physical buffer width
+required by vLLM's request-index conversion; any alignment tail is permanently `-1` padded and is
+excluded by FA3's `valid_counts`, so it does not increase the keys consumed by GQA.
+
+`dsa_top_k` remains the source checkpoint's logical/training value. Omitting `--bucket-top-k`
+preserves the old equal-budget behavior by deriving it from `dsa_top_k`; passing it explicitly may
+choose an independent maximum GQA attention budget. Telemetry compares against global exact
+top-`bucket_total_k`, so cardinality remains comparable even when the source value differs.
 
 Example:
 
@@ -43,6 +54,16 @@ dsa_top_k      = 2048
 bucket_count   = 8
 bucket_top_k   = 256
 index_topk     = 2048
+```
+
+An explicitly larger geometry is also valid:
+
+```text
+dsa_top_k      = 2048  # retained source metadata
+bucket_count   = 500
+bucket_top_k   = 12
+bucket_total_k = 6000  # maximum valid positions consumed by GQA
+index_topk     = 6016  # physical width; final 16 slots are -1
 ```
 
 ## 2. Non-interference requirement
@@ -57,6 +78,12 @@ radix_midpoint       -> existing global radix-midpoint selector
 radix_ceil           -> existing global radix-ceil selector
 modulo_bucket_topk   -> exact local top-k in each position bucket
 ```
+
+Two stock-reuse layouts implement the same selector: `vllm_stock_per_bucket` issues one strided
+top-k call per bucket and remains the simple rollback path; `vllm_stock_batched_buckets`
+materializes all bucket rows and invokes stock top-k once. The batched layout is intended for large
+bucket counts such as 500, where the per-bucket layout measured 18,000 launches per 36-layer model
+forward and did not finish engine warmup within 45 minutes.
 
 Do not implement either of these compositions:
 
@@ -352,9 +379,10 @@ Fail closed unless:
 
 - `dsa_bucket_count > 0`;
 - `dsa_bucket_top_k > 0`;
-- `dsa_bucket_count * dsa_bucket_top_k == dsa_top_k`;
-- `index_topk == dsa_top_k`;
-- `index_topk` does not exceed the validated sparse-attention/index-buffer limit;
+- `index_topk` is the smallest multiple of 128 greater than or equal to
+  `dsa_bucket_count * dsa_bucket_top_k`;
+- every slot from the logical bucket total through `index_topk` is `-1` padded;
+- the local `dsa_bucket_top_k` does not exceed the validated stock top-k kernel limit;
 - the backend is one of the bucket plugin's explicitly supported reference, stock-reuse, or
   optional Triton backends;
 - the configured graph and telemetry modes are compatible.
@@ -372,7 +400,7 @@ Record bounded summaries for:
 - selected count and effective k;
 - selected count per bucket;
 - empty or underfilled buckets;
-- recall, precision, and Jaccard against global exact top-`dsa_top_k`;
+- recall, precision, and Jaccard against global exact top-`bucket_total_k`;
 - global exact top-k keys dropped by bucketing;
 - bucket-selected keys added relative to global exact top-k;
 - indexer-score mass or score-rank loss relative to global exact top-k;
@@ -469,6 +497,16 @@ reference and stock-reuse backends.
   decode replay; eager prefill continues to use the bounded host-folded summaries. Both graph modes
   use `FULL_DECODE_ONLY`. Manifests report decode and prefill graph validation separately and only
   mark the tested 8-by-256 stock geometry as decode-graph validated.
+- Explicit `bucket_top_k` now decouples the selected attention budget from checkpoint
+  `dsa_top_k`. The logical budget is `bucket_count * bucket_top_k`; the physical `index_topk` is
+  its minimal 128-aligned capacity. Both values and the padding width are recorded in the build
+  manifest. The materialized `vllm_stock_batched_buckets` backend performs one existing stock
+  top-k call per selection and is the practical large-bucket-count path; no custom Triton selector
+  was added.
+- At 500-by-12, CUDA reference parity, both stock backend parity checks, direct selector graph
+  replay, and the padded vLLM request-index conversion pass. The eager engine loads all 36 sparse
+  layers and consumes 6,000 valid positions from a 6,016-slot buffer. The final smoke served
+  6,518- and 6,514-token prompts, generated 16 tokens for each, and retrieved the expected needle.
 
 Retained GPU evidence:
 
@@ -506,6 +544,17 @@ Retained GPU evidence:
 - `.agents/gpu_jobs/20260829T003723Z-qwen3-dsa-bucket-graph-verify-exact-attribution/result.md` —
   follow-up contract routes graph-exact prefill through pinned layer recovery and computes the
   independent expected intersection mean in float64.
+- `.agents/gpu_jobs/20260829T023927Z-qwen3-dsa-bucket-500x12-aligned-eager/result.md` — aligned
+  6,016-slot capacity removes vLLM's multiple-of-128 rejection and passes eight CUDA tests, but the
+  500-launch-per-layer rollback backend times out during warmup after 45 minutes.
+- `.agents/gpu_jobs/20260829T033425Z-qwen3-dsa-bucket-500x12-batched-eager/result.md` — one-call
+  materialized stock backend passes 11 CUDA tests, loads all 36 layers, and reduces warmup to
+  125.37 seconds. Its terminal `FAIL` is limited to a two-token needle fixture that stopped after
+  emitting `" The code"`.
+- `.agents/gpu_jobs/20260829T034254Z-qwen3-dsa-bucket-500x12-needle/result.md` — corrected eager
+  end-to-end job `PASS`: 126.16-second warmup, 6,518/6,514-token prompts, 16 decode tokens each,
+  successful needle retrieval, unchanged implementation/artifact digests, and 74.07 GiB peak GPU
+  memory. This job does not claim full-engine decode graph validation.
 
 ### Stage A: isolated reference
 
@@ -574,7 +623,9 @@ correctness, graph safety, or isolation.
 
 | Risk | Mitigation |
 |---|---|
-| `bucket_count` stock launches add overhead | compare strided, materialized single-call, and hybrid approaches before adding a kernel |
+| `bucket_count` stock launches add overhead, especially at geometries such as 500×12 | compare strided, materialized single-call, and hybrid/fused approaches before adding a kernel |
+| Materializing batched bucket rows duplicates the score tensor temporarily | retain the strided rollback backend and measure peak memory at target prompt/batch shapes |
+| Larger `index_topk` increases shared-buffer, index-conversion, and GQA work | record the derived capacity in the manifest and measure memory/latency for each explicit geometry |
 | Stock kernels reject strided input or output | use fixed preallocated contiguous scratch and a graph-safe remap |
 | Bucket materialization adds score-sized traffic | prefer strided calls where supported and decide from phase-specific profiles |
 | Optional FP32 radix requires repeated score scans | implement only after a measured stock-path bottleneck justifies it |
@@ -592,7 +643,6 @@ correctness, graph safety, or isolation.
 - Claiming reduced indexer score-computation cost.
 - Claiming complete prefill graph capture from selector capture alone.
 - Supporting a variable per-bucket budget in the first implementation.
-- Increasing `index_topk` beyond the currently validated attention-buffer/kernel limit.
 - Requiring a custom Triton kernel before the stock top-k reuse path has been measured.
 
 ## 15. Acceptance criteria
@@ -600,7 +650,9 @@ correctness, graph safety, or isolation.
 The feature is complete only when:
 
 1. the bucketed architecture and serving artifacts are isolated from exact and radix plugins;
-2. configuration enforces an equal total attention budget;
+2. configuration records the logical `bucket_count * bucket_top_k`, enforces the minimally
+   128-aligned physical `index_topk`, and records when the logical budget differs from source
+   `dsa_top_k`;
 3. reference and stock-per-bucket implementations select identical sets at unique boundaries and
    satisfy the same threshold-membership contract at tied boundaries;
 4. all outputs are causal, unique, request-local, and valid-prefix/`-1`-suffix;

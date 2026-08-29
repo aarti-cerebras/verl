@@ -14,7 +14,7 @@ import torch
 
 from .bucket_topk_reference import BucketSelectionResult
 
-BACKENDS = ("torch_reference", "vllm_stock_per_bucket")
+BACKENDS = ("torch_reference", "vllm_stock_per_bucket", "vllm_stock_batched_buckets")
 SELECTOR = "modulo_bucket_topk"
 TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety", "graph_verify_exact")
 PHASES = ("prefill", "decode")
@@ -110,12 +110,19 @@ class BucketSelectorConfig:
         derived = self.bucket_count * self.bucket_top_k
         if derived != self.total_k:
             raise ValueError(
-                "bucket budget must equal dsa_top_k: "
+                "bucket budget must equal selector total_k: "
                 f"{self.bucket_count} * {self.bucket_top_k} = {derived} != {self.total_k}"
             )
-        if self.capacity != self.total_k:
+        if self.capacity < self.total_k:
             raise ValueError(
-                f"index_topk must equal dsa_top_k for fixed bucket selection: {self.capacity} != {self.total_k}"
+                f"index_topk capacity cannot hold bucket total_k: {self.capacity} < {self.total_k}"
+            )
+        if self.capacity != self.total_k and (
+            self.capacity % 128 != 0 or self.capacity - self.total_k >= 128
+        ):
+            raise ValueError(
+                f"padded index_topk must be the smallest 128-aligned capacity above bucket "
+                f"total_k: capacity={self.capacity}, total_k={self.total_k}"
             )
         if self.telemetry not in TELEMETRY_MODES:
             raise ValueError(f"dsa_bucket_telemetry={self.telemetry!r}; expected one of {TELEMETRY_MODES}")
@@ -124,9 +131,9 @@ class BucketSelectorConfig:
         self.validate()
         if cudagraph_mode == "NONE":
             return
-        if self.backend != "vllm_stock_per_bucket":
+        if self.backend not in ("vllm_stock_per_bucket", "vllm_stock_batched_buckets"):
             raise ValueError(
-                "Qwen3 DSA bucket CUDA graphs require backend='vllm_stock_per_bucket'; "
+                "Qwen3 DSA bucket CUDA graphs require a vLLM stock backend; "
                 f"got {self.backend!r}"
             )
         if cudagraph_mode != "FULL_DECODE_ONLY":
@@ -142,13 +149,16 @@ class BucketSelectorConfig:
 
 
 def config_from_hf(config: Any) -> BucketSelectorConfig:
+    capacity = int(config.index_topk)
+    bucket_count = int(config.dsa_bucket_count)
+    bucket_top_k = int(config.dsa_bucket_top_k)
     value = BucketSelectorConfig(
         selector=str(getattr(config, "dsa_selector", SELECTOR)),
         backend=str(getattr(config, "dsa_selector_backend", "vllm_stock_per_bucket")),
-        bucket_count=int(config.dsa_bucket_count),
-        bucket_top_k=int(config.dsa_bucket_top_k),
-        total_k=int(config.dsa_top_k),
-        capacity=int(config.index_topk),
+        bucket_count=bucket_count,
+        bucket_top_k=bucket_top_k,
+        total_k=bucket_count * bucket_top_k,
+        capacity=capacity,
         telemetry=str(getattr(config, "dsa_bucket_telemetry", "off")),
     )
     value.validate()
@@ -773,7 +783,7 @@ class BucketSelectorRuntime:
             if config.telemetry == "graph_verify_exact":
                 if exact_reference is None:
                     raise RuntimeError(
-                        "graph_verify_exact bucket telemetry requires global stock top-k"
+                        "graph_verify_exact bucket telemetry requires a global exact top-k reference"
                     )
                 self._record_graph_quality(
                     phase=phase,
@@ -787,7 +797,7 @@ class BucketSelectorRuntime:
             return
         if config.telemetry in ("verify_exact", "graph_verify_exact") and exact_reference is None:
             raise RuntimeError(
-                f"{config.telemetry} bucket telemetry requires global stock top-k"
+                f"{config.telemetry} bucket telemetry requires a global exact top-k reference"
             )
         self._record_host(
             phase=phase,

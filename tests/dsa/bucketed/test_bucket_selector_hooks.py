@@ -5,6 +5,7 @@ from scripts.dsa.vllm_qwen3_dsa_bucketed import bucket_selector_hooks
 from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_hooks import (
     _cuda_decode_hook,
     _decode_hook,
+    _global_exact_topk,
     _prefill_hook,
 )
 from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_runtime import (
@@ -13,15 +14,24 @@ from scripts.dsa.vllm_qwen3_dsa_bucketed.bucket_selector_runtime import (
 )
 
 
-def _configure(backend: str = "vllm_stock_per_bucket", telemetry: str = "off") -> None:
+def _configure(
+    backend: str = "vllm_stock_per_bucket",
+    telemetry: str = "off",
+    *,
+    bucket_count: int = 2,
+    bucket_top_k: int = 2,
+    capacity: int | None = None,
+) -> None:
+    total_k = bucket_count * bucket_top_k
+    capacity = total_k if capacity is None else capacity
     RUNTIME.configure(
         BucketSelectorConfig(
             selector="modulo_bucket_topk",
             backend=backend,
-            bucket_count=2,
-            bucket_top_k=2,
-            total_k=4,
-            capacity=4,
+            bucket_count=bucket_count,
+            bucket_top_k=bucket_top_k,
+            total_k=total_k,
+            capacity=capacity,
             telemetry=telemetry,
         )
     )
@@ -100,6 +110,84 @@ def test_verify_exact_reuses_saved_stock_once_for_global_reference() -> None:
     artifact = RUNTIME.artifact()
     assert artifact["decode"]["calls"] == 1
     assert artifact["decode"]["global"]["recall"]["mean"] == 0.75
+
+
+def test_global_exact_telemetry_above_stock_limit_uses_torch_topk() -> None:
+    logits = torch.tensor([[9.0, 1.0, 8.0, 2.0, 7.0, 3.0, 6.0, 4.0]])
+    lengths = torch.tensor([6])
+    output = torch.empty((1, 6000), dtype=torch.int32)
+
+    def stock_must_not_run(*args: object) -> None:
+        raise AssertionError("global stock top-k cannot safely serve total_k=6000")
+
+    _global_exact_topk(logits, lengths, output, 6000, stock_must_not_run)
+
+    assert set(output[0, :6].tolist()) == set(range(6))
+    assert bool((output[0, 6:] == -1).all())
+
+
+def test_generic_decode_supports_500_by_12_capacity() -> None:
+    _configure(bucket_count=500, bucket_top_k=12, capacity=6016)
+    logits = torch.arange(6003, dtype=torch.float32).reshape(1, -1)
+    seq_lens = torch.tensor([[6003]], dtype=torch.int32)
+    output = torch.empty((1, 6016), dtype=torch.int32)
+    calls = 0
+
+    def stock(logits, next_n, seq_lens, target, num_rows, stride0, stride1, topk_tokens):
+        nonlocal calls
+        calls += 1
+        assert topk_tokens == 12
+        _fill_stock(logits, seq_lens, target, topk_tokens)
+
+    _decode_hook(
+        {"decode": stock},
+        logits,
+        1,
+        seq_lens,
+        output,
+        1,
+        logits.stride(0),
+        logits.stride(1),
+        6016,
+    )
+
+    assert calls == 500
+    assert int((output >= 0).sum()) == 6000
+    assert int(torch.unique(output[output >= 0]).numel()) == 6000
+    assert bool((output[:, 6000:] == -1).all())
+
+
+def test_batched_generic_decode_supports_500_by_12_with_one_stock_call() -> None:
+    _configure(
+        backend="vllm_stock_batched_buckets",
+        bucket_count=500,
+        bucket_top_k=12,
+        capacity=6016,
+    )
+    logits = torch.arange(6003, dtype=torch.float32).reshape(1, -1)
+    seq_lens = torch.tensor([[6003]], dtype=torch.int32)
+    output = torch.empty((1, 6016), dtype=torch.int32)
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], int]] = []
+
+    def stock(logits, next_n, seq_lens, target, num_rows, stride0, stride1, topk_tokens):
+        calls.append((tuple(logits.shape), tuple(seq_lens.shape), topk_tokens))
+        _fill_stock(logits, seq_lens, target, topk_tokens)
+
+    _decode_hook(
+        {"decode": stock},
+        logits,
+        1,
+        seq_lens,
+        output,
+        1,
+        logits.stride(0),
+        logits.stride(1),
+        6016,
+    )
+
+    assert calls == [((500, 13), (500, 1), 12)]
+    assert int((output >= 0).sum()) == 6000
+    assert bool((output[:, 6000:] == -1).all())
 
 
 def test_graph_verify_exact_reuses_stock_and_records_device_quality(

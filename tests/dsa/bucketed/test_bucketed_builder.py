@@ -47,6 +47,23 @@ def test_bucketed_indexer_snapshot_matches_exact_scores() -> None:
     )
 
 
+def test_bucketed_indexer_allows_total_capacity_above_stock_global_limit() -> None:
+    bucketed = Qwen3DSABucketedServingIndexer(
+        hidden_size=64,
+        n_heads=2,
+        head_dim=32,
+        rope_head_dim=32,
+        top_k=2048,
+        capacity=6016,
+        bucket_top_k=12,
+        fp8=False,
+        rotate_activation=False,
+    )
+    assert bucketed.top_k == 2048
+    assert bucketed.capacity == 6016
+    assert bucketed.topk_tokens == 6016
+
+
 def test_builder_derives_isolated_fixed_budget_directory(tmp_path: Path) -> None:
     source = tmp_path / "exact"
     output = tmp_path / "bucketed"
@@ -84,7 +101,8 @@ def test_builder_derives_isolated_fixed_budget_directory(tmp_path: Path) -> None
     assert derived["dsa_bucket_count"] == 4
     assert derived["dsa_bucket_top_k"] == 4
     assert derived["dsa_bucket_telemetry"] == "off"
-    assert derived["index_topk"] == derived["dsa_top_k"] == 16
+    assert derived["dsa_top_k"] == 16
+    assert derived["index_topk"] == 128
     assert (output / "model.safetensors").is_symlink()
     manifest = json.loads((output / "BUCKETED_BUILD_MANIFEST.json").read_text())
     assert manifest["exact_source_modified"] is False
@@ -223,7 +241,7 @@ def test_builder_records_only_the_gpu_validated_decode_graph_geometry(tmp_path: 
     )
 
 
-def test_builder_rejects_budget_change(tmp_path: Path) -> None:
+def test_builder_allows_bucket_capacity_independent_of_source_top_k(tmp_path: Path) -> None:
     source = tmp_path / "exact"
     source.mkdir()
     (source / "config.json").write_text(
@@ -237,24 +255,77 @@ def test_builder_rejects_budget_change(tmp_path: Path) -> None:
             }
         )
     )
-    completed = subprocess.run(
+    output = tmp_path / "bucketed"
+    subprocess.run(
         [
             sys.executable,
             str(REPO / "scripts/dsa/build_qwen3_dsa_bucketed_serving_dir.py"),
             "--source",
             str(source),
             "--out",
-            str(tmp_path / "bucketed"),
+            str(output),
             "--bucket-count",
             "3",
             "--bucket-top-k",
             "5",
         ],
-        text=True,
-        capture_output=True,
+        check=True,
     )
-    assert completed.returncode != 0
-    assert "fixed budget requires" in completed.stderr
+    derived = json.loads((output / "config.json").read_text())
+    manifest = json.loads((output / "BUCKETED_BUILD_MANIFEST.json").read_text())
+    assert derived["dsa_top_k"] == 16
+    assert derived["index_topk"] == 128
+    assert manifest["dsa_top_k"] == 16
+    assert manifest["bucket_total_k"] == 15
+    assert manifest["index_topk"] == 128
+    assert manifest["index_topk_padding"] == 113
+
+
+def test_builder_supports_requested_500_by_12_geometry(tmp_path: Path) -> None:
+    source = tmp_path / "exact"
+    output = tmp_path / "bucketed"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3DSAForCausalLM"],
+                "dsa_enabled": True,
+                "dsa_mode": "sparse",
+                "dsa_top_k": 2048,
+                "index_topk": 2048,
+            }
+        )
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts/dsa/build_qwen3_dsa_bucketed_serving_dir.py"),
+            "--source",
+            str(source),
+            "--out",
+            str(output),
+            "--bucket-count",
+            "500",
+            "--bucket-top-k",
+            "12",
+            "--backend",
+            "vllm_stock_batched_buckets",
+        ],
+        check=True,
+    )
+
+    derived = json.loads((output / "config.json").read_text())
+    manifest = json.loads((output / "BUCKETED_BUILD_MANIFEST.json").read_text())
+    assert derived["dsa_top_k"] == 2048
+    assert derived["index_topk"] == 6016
+    assert derived["dsa_bucket_count"] == 500
+    assert derived["dsa_bucket_top_k"] == 12
+    assert manifest["bucket_total_k"] == 6000
+    assert manifest["index_topk"] == 6016
+    assert manifest["index_topk_padding"] == 16
+    assert manifest["stock_topk_launches_per_selection"] == 1
+    assert manifest["bucket_score_materialization"] == "single_padded_bucket_row_tensor"
+    assert manifest["decode_cuda_graph_validated"] is False
 
 
 def test_bucketed_plugin_does_not_import_radix_modules() -> None:

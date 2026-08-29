@@ -57,13 +57,9 @@ FP8_MAX = float(torch.finfo(FP8_DTYPE).max)  # 448.0
 SUPPORTED_KERNEL_HEADS = (32, 64, 128)
 PADDED_HEAD_DIM = 128
 QUANT_BLOCK_SIZE = 128
-# Empirical ceiling of vLLM 0.26.0's compiled top-k (`_C.top_k_per_row_prefill`, reached through
-# `sparse_attn_indexer`): top_k 4096 runs, 8192 dies with an ASYNC `CUDA error: invalid argument`
-# whose traceback points at the *preceding* DeepGEMM `fp8_fp4_mqa_logits` launch and therefore reads
-# as a logits-kernel bug. Measured 2026-08-20 on H100. It does not constrain the real config
-# (DeepSeek, Keye and this checkpoint all use 2048), but it DOES cap the dense-equivalence control
-# (`top_k >= T`) to sequences of at most 4096 tokens. Asserted here so that lands as one clear
-# message at construction instead of an inscrutable CUDA error 90 s into warmup.
+# Empirical ceiling of vLLM 0.26.0's generic stock top-k operation. The bucket hook invokes that
+# operation at local `bucket_top_k`, not at the total output capacity, so only the local value is
+# bounded here. A wider `index_topk` buffer is valid and is filled by the union of bucket results.
 MAX_KERNEL_TOP_K = 4096
 
 _LOGGED_HADAMARD = False
@@ -238,6 +234,8 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
         rope_head_dim: int = 64,
         rope_theta: float = 5e6,
         top_k: int = 2048,
+        capacity: int | None = None,
+        bucket_top_k: int | None = None,
         fp8: bool = True,
         fp8_ue8m0: bool = True,
         rotate_activation: bool = True,
@@ -250,11 +248,18 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
         super().__init__()
         assert head_dim in (32, 64, 128), f"head_dim must be 32/64/128 to serve, got {head_dim}"
         assert 128 % n_heads == 0, f"n_heads must divide 128 to serve, got {n_heads}"
-        assert top_k <= MAX_KERNEL_TOP_K, (
-            f"top_k={top_k} exceeds MAX_KERNEL_TOP_K={MAX_KERNEL_TOP_K}: vLLM 0.26.0's compiled "
-            "top-k kernel fails above ~4096 with an async 'CUDA error: invalid argument' during "
-            "warmup. For the dense-equivalence control use top_k=4096 with a prompt shorter than "
-            "that, rather than a larger top_k."
+        capacity_was_explicit = capacity is not None
+        capacity = top_k if capacity is None else int(capacity)
+        bucket_top_k = top_k if bucket_top_k is None else int(bucket_top_k)
+        assert capacity > 0
+        assert not capacity_was_explicit or capacity % 128 == 0, (
+            f"explicit index_topk capacity={capacity} must be divisible by 128 for vLLM's "
+            "request-index conversion"
+        )
+        assert 0 < bucket_top_k <= MAX_KERNEL_TOP_K, (
+            f"bucket_top_k={bucket_top_k} is outside the validated vLLM 0.26 generic top-k "
+            f"range 1..{MAX_KERNEL_TOP_K}. The total index_topk capacity may be larger because "
+            "the bucket hook invokes the stock kernel only at the local bucket_top_k."
         )
         assert fp8_ue8m0 or not fp8, (
             "the serving kernels quantize with a UE8M0 (power-of-2) scale; a checkpoint trained "
@@ -265,6 +270,8 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
         self.head_dim = head_dim
         self.rope_head_dim = rope_head_dim
         self.top_k = top_k
+        self.capacity = capacity
+        self.bucket_top_k = bucket_top_k
         self.fp8 = fp8
         self.fp8_ue8m0 = fp8_ue8m0
         self.rotate_activation = rotate_activation
@@ -308,7 +315,7 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
         # vLLM's sparse MLA impl reads `indexer.topk_indices_buffer` / `indexer.topk_tokens`; ours
         # reads them off the impl, but keep the attribute names for anything that introspects.
         self.topk_indices_buffer = topk_indices_buffer
-        self.topk_tokens = top_k
+        self.topk_tokens = capacity
         self.indexer_op = None
         self.k_cache = None
         if vllm_config is not None:
@@ -332,7 +339,7 @@ class Qwen3DSABucketedServingIndexer(nn.Module):
             self.k_cache,
             QUANT_BLOCK_SIZE,
             "ue8m0",
-            self.top_k,
+            self.capacity,
             PADDED_HEAD_DIM,
             vllm_config.model_config.max_model_len,
             get_max_prefill_buffer_size(vllm_config),
