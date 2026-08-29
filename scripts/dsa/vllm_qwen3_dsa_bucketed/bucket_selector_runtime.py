@@ -16,7 +16,7 @@ from .bucket_topk_reference import BucketSelectionResult
 
 BACKENDS = ("torch_reference", "vllm_stock_per_bucket")
 SELECTOR = "modulo_bucket_topk"
-TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety")
+TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety", "graph_verify_exact")
 PHASES = ("prefill", "decode")
 PHASE_SLOT = {name: index for index, name in enumerate(PHASES)}
 GRAPH_FIELDS = (
@@ -36,6 +36,39 @@ GRAPH_FIELDS = (
 GRAPH_FIELD_SLOT = {name: index for index, name in enumerate(GRAPH_FIELDS)}
 GRAPH_BUCKET_FIELDS = ("selected_total", "underfilled_rows", "empty_rows")
 GRAPH_BUCKET_FIELD_SLOT = {name: index for index, name in enumerate(GRAPH_BUCKET_FIELDS)}
+GRAPH_QUALITY_FIELDS = (
+    "query_position",
+    "selected_count",
+    "effective_k",
+    "underfilled_buckets",
+    "empty_buckets",
+    "intersection",
+    "added",
+    "dropped",
+    "recall",
+    "precision",
+    "jaccard",
+    "selected_score_mass",
+    "global_exact_score_mass",
+    "score_mass_gap",
+    "score_mass_ratio",
+)
+GRAPH_BUCKET_QUALITY_FIELDS = (
+    "selected_count",
+    "underfilled",
+    "empty",
+    "intersection",
+    "added",
+    "dropped",
+)
+GRAPH_DISTANCE_QUALITY_FIELDS = (
+    "selected_count",
+    "global_exact_count",
+    "intersection",
+    "recall",
+)
+GRAPH_STAT_FIELDS = ("n", "total", "total_sq", "min", "max")
+GRAPH_STAT_SLOT = {name: index for index, name in enumerate(GRAPH_STAT_FIELDS)}
 QUERY_POSITION_BANDS = (
     (0, 2048),
     (2048, 4096),
@@ -104,7 +137,7 @@ class BucketSelectorConfig:
         if self.telemetry in ("summary", "verify_exact"):
             raise ValueError(
                 "FULL_DECODE_ONLY with bucket telemetry requires dsa_bucket_telemetry='off' "
-                "or 'graph_safety'; summary/verify_exact are host-folded"
+                "or a graph telemetry mode; summary/verify_exact are host-folded"
             )
 
 
@@ -161,6 +194,7 @@ class _Summary:
         variance = max(self.total_sq / self.n - mean * mean, 0.0)
         return {
             "n": self.n,
+            "total": self.total,
             "mean": mean,
             "std": math.sqrt(variance),
             "min": self.minimum,
@@ -199,6 +233,10 @@ class BucketSelectorRuntime:
         self._graph: torch.Tensor | None = None
         self._graph_buckets: torch.Tensor | None = None
         self._graph_layer_slots: dict[str, int] = {}
+        self._graph_quality: torch.Tensor | None = None
+        self._graph_position_quality: torch.Tensor | None = None
+        self._graph_bucket_quality: torch.Tensor | None = None
+        self._graph_distance_quality: torch.Tensor | None = None
 
     @property
     def config(self) -> BucketSelectorConfig | None:
@@ -222,7 +260,7 @@ class BucketSelectorRuntime:
             if self._config is not None and self._config != config:
                 raise RuntimeError(f"bucket selector configuration changed in one worker: {self._config} -> {config}")
             self._config = config
-            if config.telemetry in ("summary", "verify_exact"):
+            if config.telemetry in ("summary", "verify_exact", "graph_verify_exact"):
                 self._host_recording_enabled = os.environ.get(
                     "DSA_BUCKET_DEFER_HOST_TELEMETRY", "0"
                 ) in ("0", "", "false", "False")
@@ -238,8 +276,11 @@ class BucketSelectorRuntime:
 
     def initialize_graph_safety(self, layer_names: list[str], *, device: torch.device) -> None:
         config = self._config
-        if config is None or config.telemetry != "graph_safety":
-            raise RuntimeError("graph storage requires dsa_bucket_telemetry='graph_safety'")
+        if config is None or config.telemetry not in ("graph_safety", "graph_verify_exact"):
+            raise RuntimeError(
+                "graph storage requires dsa_bucket_telemetry='graph_safety' or "
+                "'graph_verify_exact'"
+            )
         if not layer_names or len(set(layer_names)) != len(layer_names):
             raise ValueError(f"graph_safety requires unique sparse layer names, got {layer_names!r}")
         slots = {name: index for index, name in enumerate(layer_names)}
@@ -253,6 +294,77 @@ class BucketSelectorRuntime:
             self._graph_layer_slots = slots
             self._graph = torch.zeros(shape, dtype=torch.int64, device=device)
             self._graph_buckets = torch.zeros(bucket_shape, dtype=torch.int64, device=device)
+
+    def initialize_graph_quality(self, layer_names: list[str], *, device: torch.device) -> None:
+        """Allocate fixed-address exact-quality moments before decode graph capture."""
+
+        self.initialize_graph_safety(layer_names, device=device)
+        config = self._config
+        if config is None or config.telemetry != "graph_verify_exact":
+            raise RuntimeError(
+                "graph quality storage requires dsa_bucket_telemetry='graph_verify_exact'"
+            )
+        quality_shape = (
+            len(PHASES),
+            len(layer_names),
+            len(GRAPH_QUALITY_FIELDS),
+            len(GRAPH_STAT_FIELDS),
+        )
+        position_shape = (
+            len(PHASES),
+            len(QUERY_POSITION_BANDS),
+            len(GRAPH_QUALITY_FIELDS),
+            len(GRAPH_STAT_FIELDS),
+        )
+        bucket_shape = (
+            len(PHASES),
+            len(layer_names),
+            config.bucket_count,
+            len(GRAPH_BUCKET_QUALITY_FIELDS),
+            len(GRAPH_STAT_FIELDS),
+        )
+        distance_shape = (
+            len(PHASES),
+            len(DISTANCE_BANDS),
+            len(GRAPH_DISTANCE_QUALITY_FIELDS),
+            len(GRAPH_STAT_FIELDS),
+        )
+        with self._lock:
+            if self._graph_quality is not None:
+                observed = (
+                    tuple(self._graph_quality.shape),
+                    tuple(self._graph_position_quality.shape),
+                    tuple(self._graph_bucket_quality.shape),
+                    tuple(self._graph_distance_quality.shape),
+                )
+                expected = (quality_shape, position_shape, bucket_shape, distance_shape)
+                if observed != expected:
+                    raise RuntimeError("bucket graph quality layout changed after allocation")
+                return
+            self._graph_quality = torch.empty(quality_shape, dtype=torch.float64, device=device)
+            self._graph_position_quality = torch.empty(
+                position_shape, dtype=torch.float64, device=device
+            )
+            self._graph_bucket_quality = torch.empty(
+                bucket_shape, dtype=torch.float64, device=device
+            )
+            self._graph_distance_quality = torch.empty(
+                distance_shape, dtype=torch.float64, device=device
+            )
+            self._reset_graph_quality_storage()
+
+    def _reset_graph_quality_storage(self) -> None:
+        for stats in (
+            self._graph_quality,
+            self._graph_position_quality,
+            self._graph_bucket_quality,
+            self._graph_distance_quality,
+        ):
+            if stats is None:
+                continue
+            stats.zero_()
+            stats[..., GRAPH_STAT_SLOT["min"]].fill_(float("inf"))
+            stats[..., GRAPH_STAT_SLOT["max"]].fill_(float("-inf"))
 
     @staticmethod
     def _safety_tensors(
@@ -315,6 +427,190 @@ class BucketSelectorRuntime:
         )
         bucket_target[:, GRAPH_BUCKET_FIELD_SLOT["underfilled_rows"]].add_(underfilled.sum(0))
         bucket_target[:, GRAPH_BUCKET_FIELD_SLOT["empty_rows"]].add_(empty.sum(0))
+
+    @staticmethod
+    def _graph_moments_add(
+        target: torch.Tensor,
+        values: torch.Tensor,
+        include: torch.Tensor,
+    ) -> None:
+        """Accumulate fixed-shape moments without leaving the captured device graph."""
+
+        values = values.to(torch.float64)
+        finite = torch.isfinite(values) & include[..., None]
+        finite_float = finite.to(torch.float64)
+        safe = torch.where(finite, values, torch.zeros_like(values))
+        target[..., GRAPH_STAT_SLOT["n"]].add_(finite_float.sum(0))
+        target[..., GRAPH_STAT_SLOT["total"]].add_(safe.sum(0))
+        target[..., GRAPH_STAT_SLOT["total_sq"]].add_(safe.square().sum(0))
+        minimum = torch.where(
+            finite, values, torch.full_like(values, float("inf"))
+        ).amin(0)
+        maximum = torch.where(
+            finite, values, torch.full_like(values, float("-inf"))
+        ).amax(0)
+        target_min = target[..., GRAPH_STAT_SLOT["min"]]
+        target_max = target[..., GRAPH_STAT_SLOT["max"]]
+        target_min.copy_(torch.minimum(target_min, minimum))
+        target_max.copy_(torch.maximum(target_max, maximum))
+
+    def _record_graph_quality(
+        self,
+        *,
+        phase: str,
+        layer_name: str,
+        logits: torch.Tensor,
+        output: torch.Tensor,
+        query_positions: torch.Tensor,
+        result: BucketSelectionResult,
+        exact_reference: torch.Tensor,
+    ) -> None:
+        """Fold exact overlap and score quality into persistent tensors on replay."""
+
+        storage = (
+            self._graph_quality,
+            self._graph_position_quality,
+            self._graph_bucket_quality,
+            self._graph_distance_quality,
+        )
+        if any(value is None for value in storage):
+            raise RuntimeError(
+                "dsa_bucket_telemetry='graph_verify_exact' is active but persistent quality "
+                "storage was not initialized before execution"
+            )
+        quality, position_quality, bucket_quality, distance_quality = storage
+        assert quality is not None
+        assert position_quality is not None
+        assert bucket_quality is not None
+        assert distance_quality is not None
+        config = self._config
+        assert config is not None
+        try:
+            phase_slot = PHASE_SLOT[phase]
+            layer_slot = self._graph_layer_slots[layer_name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"no graph quality slot for phase={phase!r}, layer={layer_name!r}"
+            ) from exc
+
+        key_count = logits.shape[1]
+        active, _, observed = self._safety_tensors(
+            output, query_positions, result, key_count
+        )
+        qpos = query_positions.reshape(-1).to(output.device, torch.int64)
+        bucket_in_exact = _membership(output, exact_reference, key_count)
+        exact_in_bucket = _membership(exact_reference, output, key_count)
+        exact_valid = exact_reference >= 0
+        exact_count = exact_valid.sum(-1)
+        intersection = bucket_in_exact.sum(-1)
+        union = observed + exact_count - intersection
+        underfilled = (result.bucket_counts < config.bucket_top_k).sum(-1)
+        empty = (result.bucket_counts == 0).sum(-1)
+        safe_bucket = output.clamp(min=0, max=max(key_count - 1, 0)).long()
+        safe_exact = exact_reference.clamp(min=0, max=max(key_count - 1, 0)).long()
+        bucket_mass = (logits.gather(-1, safe_bucket).float() * (output >= 0)).sum(-1)
+        exact_mass = (logits.gather(-1, safe_exact).float() * exact_valid).sum(-1)
+        ratio = torch.where(
+            exact_mass.abs() > 1e-12,
+            bucket_mass / exact_mass,
+            torch.full_like(exact_mass, float("nan")),
+        )
+        metrics = torch.stack(
+            (
+                qpos,
+                observed,
+                result.effective_k,
+                underfilled,
+                empty,
+                intersection,
+                observed - intersection,
+                exact_count - intersection,
+                intersection.float() / exact_count.clamp(min=1),
+                intersection.float() / observed.clamp(min=1),
+                intersection.float() / union.clamp(min=1),
+                bucket_mass,
+                exact_mass,
+                exact_mass - bucket_mass,
+                ratio,
+            ),
+            dim=-1,
+        )
+        self._graph_moments_add(quality[phase_slot, layer_slot], metrics, active)
+
+        position_masks = []
+        for low, high in QUERY_POSITION_BANDS:
+            mask = active & (qpos >= low)
+            if high is not None:
+                mask &= qpos < high
+            position_masks.append(mask)
+        position_include = torch.stack(position_masks, dim=-1)
+        position_values = metrics[:, None, :].expand(
+            -1, len(QUERY_POSITION_BANDS), -1
+        )
+        self._graph_moments_add(
+            position_quality[phase_slot], position_values, position_include
+        )
+
+        buckets = torch.arange(config.bucket_count, device=output.device)
+        output_bucket = (
+            output.remainder(config.bucket_count)[..., None] == buckets
+        ) & (output >= 0)[..., None]
+        exact_bucket = (
+            exact_reference.remainder(config.bucket_count)[..., None] == buckets
+        ) & exact_valid[..., None]
+        bucket_intersection = (bucket_in_exact[..., None] & output_bucket).sum(1)
+        bucket_selected = result.bucket_counts
+        bucket_exact = exact_bucket.sum(1)
+        bucket_metrics = torch.stack(
+            (
+                bucket_selected,
+                bucket_selected < config.bucket_top_k,
+                bucket_selected == 0,
+                bucket_intersection,
+                bucket_selected - bucket_intersection,
+                bucket_exact - bucket_intersection,
+            ),
+            dim=-1,
+        )
+        self._graph_moments_add(
+            bucket_quality[phase_slot, layer_slot],
+            bucket_metrics,
+            active[:, None].expand(-1, config.bucket_count),
+        )
+
+        selected_distance = qpos[:, None] - output
+        exact_distance = qpos[:, None] - exact_reference
+        distance_metrics = []
+        for low, high in DISTANCE_BANDS:
+            selected_band = (output >= 0) & (selected_distance >= low)
+            exact_band = exact_valid & (exact_distance >= low)
+            if high is not None:
+                selected_band &= selected_distance < high
+                exact_band &= exact_distance < high
+            selected_band_count = selected_band.sum(-1)
+            exact_band_count = exact_band.sum(-1)
+            overlap = (exact_in_bucket & exact_band).sum(-1)
+            distance_metrics.append(
+                torch.stack(
+                    (
+                        selected_band_count,
+                        exact_band_count,
+                        overlap,
+                        torch.where(
+                            exact_band_count > 0,
+                            overlap.float() / exact_band_count.clamp(min=1),
+                            torch.full_like(overlap.float(), float("nan")),
+                        ),
+                    ),
+                    dim=-1,
+                )
+            )
+        distance_values = torch.stack(distance_metrics, dim=1)
+        self._graph_moments_add(
+            distance_quality[phase_slot],
+            distance_values,
+            active[:, None].expand(-1, len(DISTANCE_BANDS)),
+        )
 
     @staticmethod
     def _add(group: dict[str, _Summary], name: str, values: torch.Tensor) -> None:
@@ -455,12 +751,17 @@ class BucketSelectorRuntime:
         config = self._config
         if config is None or config.telemetry == "off":
             return
-        if config.telemetry in ("summary", "verify_exact") and not self._host_recording_enabled:
+        host_folded = config.telemetry in ("summary", "verify_exact") or (
+            config.telemetry == "graph_verify_exact" and phase != "decode"
+        )
+        if host_folded and not self._host_recording_enabled:
             return
         if phase not in PHASES:
             raise ValueError(f"unknown bucket telemetry phase {phase!r}")
         layer = layer_name or self._layer
-        if config.telemetry == "graph_safety":
+        if config.telemetry in ("graph_safety", "graph_verify_exact") and (
+            config.telemetry == "graph_safety" or phase == "decode"
+        ):
             self._record_graph(
                 phase=phase,
                 layer_name=layer,
@@ -469,9 +770,25 @@ class BucketSelectorRuntime:
                 result=result,
                 key_count=logits.shape[1],
             )
+            if config.telemetry == "graph_verify_exact":
+                if exact_reference is None:
+                    raise RuntimeError(
+                        "graph_verify_exact bucket telemetry requires global stock top-k"
+                    )
+                self._record_graph_quality(
+                    phase=phase,
+                    layer_name=layer,
+                    logits=logits,
+                    output=output,
+                    query_positions=query_positions,
+                    result=result,
+                    exact_reference=exact_reference,
+                )
             return
-        if config.telemetry == "verify_exact" and exact_reference is None:
-            raise RuntimeError("verify_exact bucket telemetry requires global stock top-k")
+        if config.telemetry in ("verify_exact", "graph_verify_exact") and exact_reference is None:
+            raise RuntimeError(
+                f"{config.telemetry} bucket telemetry requires global stock top-k"
+            )
         self._record_host(
             phase=phase,
             layer_name=layer,
@@ -519,6 +836,122 @@ class BucketSelectorRuntime:
             "phases": phases,
         }
 
+    @staticmethod
+    def _stats_artifact(stats: torch.Tensor) -> dict[str, dict[str, float | int]]:
+        result: dict[str, dict[str, float | int]] = {}
+        for field_slot, field in enumerate(GRAPH_QUALITY_FIELDS):
+            values = stats[field_slot]
+            count = int(values[GRAPH_STAT_SLOT["n"]])
+            if not count:
+                result[field] = {"n": 0}
+                continue
+            total = float(values[GRAPH_STAT_SLOT["total"]])
+            total_sq = float(values[GRAPH_STAT_SLOT["total_sq"]])
+            mean = total / count
+            result[field] = {
+                "n": count,
+                "total": total,
+                "mean": mean,
+                "std": math.sqrt(max(total_sq / count - mean * mean, 0.0)),
+                "min": float(values[GRAPH_STAT_SLOT["min"]]),
+                "max": float(values[GRAPH_STAT_SLOT["max"]]),
+            }
+        return result
+
+    @staticmethod
+    def _named_stats_artifact(
+        stats: torch.Tensor, fields: tuple[str, ...]
+    ) -> dict[str, dict[str, float | int]]:
+        result: dict[str, dict[str, float | int]] = {}
+        for field_slot, field in enumerate(fields):
+            values = stats[field_slot]
+            count = int(values[GRAPH_STAT_SLOT["n"]])
+            if not count:
+                result[field] = {"n": 0}
+                continue
+            total = float(values[GRAPH_STAT_SLOT["total"]])
+            total_sq = float(values[GRAPH_STAT_SLOT["total_sq"]])
+            mean = total / count
+            result[field] = {
+                "n": count,
+                "total": total,
+                "mean": mean,
+                "std": math.sqrt(max(total_sq / count - mean * mean, 0.0)),
+                "min": float(values[GRAPH_STAT_SLOT["min"]]),
+                "max": float(values[GRAPH_STAT_SLOT["max"]]),
+            }
+        return result
+
+    @staticmethod
+    def _merge_stats(stats: torch.Tensor, dimensions: tuple[int, ...]) -> torch.Tensor:
+        merged = stats.sum(dimensions)
+        merged[..., GRAPH_STAT_SLOT["min"]] = stats[..., GRAPH_STAT_SLOT["min"]].amin(
+            dimensions
+        )
+        merged[..., GRAPH_STAT_SLOT["max"]] = stats[..., GRAPH_STAT_SLOT["max"]].amax(
+            dimensions
+        )
+        return merged
+
+    def _graph_quality_artifact(self) -> dict[str, Any]:
+        storage = (
+            self._graph_quality,
+            self._graph_position_quality,
+            self._graph_bucket_quality,
+            self._graph_distance_quality,
+        )
+        if any(value is None for value in storage):
+            return {"initialized": False}
+        quality, position_quality, bucket_quality, distance_quality = (
+            value.detach().to("cpu") for value in storage if value is not None
+        )
+        layers = [
+            name
+            for name, _ in sorted(
+                self._graph_layer_slots.items(), key=lambda item: item[1]
+            )
+        ]
+        phases: dict[str, Any] = {}
+        for phase, phase_slot in PHASE_SLOT.items():
+            phase_quality = quality[phase_slot]
+            per_layer = {}
+            for layer_slot, layer in enumerate(layers):
+                per_layer[layer] = {
+                    "metrics": self._stats_artifact(phase_quality[layer_slot]),
+                    "per_bucket": [
+                        self._named_stats_artifact(
+                            bucket_quality[phase_slot, layer_slot, bucket],
+                            GRAPH_BUCKET_QUALITY_FIELDS,
+                        )
+                        for bucket in range(bucket_quality.shape[2])
+                    ],
+                }
+            phases[phase] = {
+                "global": self._stats_artifact(
+                    self._merge_stats(phase_quality, (0,))
+                ),
+                "per_layer": per_layer,
+                "query_position_bands": {
+                    _band_label(low, high): self._stats_artifact(
+                        position_quality[phase_slot, band]
+                    )
+                    for band, (low, high) in enumerate(QUERY_POSITION_BANDS)
+                },
+                "distance_bands": {
+                    _band_label(low, high): self._named_stats_artifact(
+                        distance_quality[phase_slot, band],
+                        GRAPH_DISTANCE_QUALITY_FIELDS,
+                    )
+                    for band, (low, high) in enumerate(DISTANCE_BANDS)
+                },
+            }
+        return {
+            "initialized": True,
+            "storage": "persistent_device_moments",
+            "fields": list(GRAPH_QUALITY_FIELDS),
+            "phases": phases,
+        }
+
     def artifact(self) -> dict[str, Any]:
         config = self._config
         if config is None:
@@ -540,9 +973,11 @@ class BucketSelectorRuntime:
                     else self._host_recording_enabled
                 ),
             }
-            if config.telemetry == "graph_safety":
+            if config.telemetry in ("graph_safety", "graph_verify_exact"):
                 artifact["graph_replay"] = self._graph_artifact()
-                return artifact
+                if config.telemetry == "graph_safety":
+                    return artifact
+                artifact["graph_replay_quality"] = self._graph_quality_artifact()
             artifact["safety"] = {"rows": self._safety_rows, "counts": dict(sorted(self._safety.items()))}
             for phase in PHASES:
                 phase_groups = [group for (group_phase, _), group in self._dists.items() if group_phase == phase]
@@ -594,6 +1029,7 @@ class BucketSelectorRuntime:
                 self._graph.zero_()
                 assert self._graph_buckets is not None
                 self._graph_buckets.zero_()
+                self._reset_graph_quality_storage()
                 if self._graph.device.type == "cuda":
                     torch.cuda.synchronize(self._graph.device)
 
@@ -604,6 +1040,10 @@ class BucketSelectorRuntime:
             self._layer = "unattributed"
             self._graph = None
             self._graph_buckets = None
+            self._graph_quality = None
+            self._graph_position_quality = None
+            self._graph_bucket_quality = None
+            self._graph_distance_quality = None
             self._graph_layer_slots.clear()
             self._host_recording_enabled = True
 

@@ -8,7 +8,9 @@ exact/bucket outputs. `FULL_DECODE_ONLY` capture and replay also pass on H100, i
 decode rows padded to an eight-row captured graph and additional 3-to-4, 9-to-16, and 33-to-40
 replays. Exploratory graph/eager decode measurements are retained, but full/prefill graphs,
 and durable performance claims remain unvalidated. Bucket telemetry is implemented and validated
-on H100 in eager `verify_exact` and decode-graph `graph_safety` modes.
+on H100 in eager `verify_exact` and decode-graph `graph_safety` modes. A separate
+`graph_verify_exact` mode now follows the approximate selector's split: eager prefill remains
+host-folded while captured decode updates fixed-address exact-quality moments on device.
 
 **Scope:** Qwen3 DSA vLLM serving and evaluation only. This plan does not change training,
 checkpoint weights, sampling top-k, or the existing exact and radix-selector servers.
@@ -461,8 +463,11 @@ reference and stock-reuse backends.
 - No Stage D Triton kernel was added. There is no evidence yet that one is needed.
 - Telemetry defaults to `off`; manifests keep `selector_speed_claim_valid` false. Eager `summary`
   and `verify_exact` use bounded host-folded summaries and fail closed with CUDA graphs.
-  `graph_safety` uses persistent fixed-address per-layer/per-bucket device counters and is validated
-  with `FULL_DECODE_ONLY`. Manifests report decode and prefill graph validation separately and only
+  `graph_safety` uses persistent fixed-address per-layer/per-bucket device counters.
+  `graph_verify_exact` additionally captures the global stock top-k reference and accumulates
+  overlap, score-mass, position-band, distance-band, and per-bucket moments on device for every
+  decode replay; eager prefill continues to use the bounded host-folded summaries. Both graph modes
+  use `FULL_DECODE_ONLY`. Manifests report decode and prefill graph validation separately and only
   mark the tested 8-by-256 stock geometry as decode-graph validated.
 
 Retained GPU evidence:
@@ -491,6 +496,16 @@ Retained GPU evidence:
   graph telemetry job `PASS`: 51 decode graphs captured, post-capture reset succeeded, all 36
   prefill and decode layers exported persistent counters, and six safety-violation classes were
   zero over 1,440 observed rows.
+- `.agents/gpu_jobs/20260829T000314Z-qwen3-dsa-bucket-graph-verify-exact/result.md` — first
+  graph-exact job `FAIL`: direct replay and all 51 engine graph captures succeeded, exposing only a
+  missing exported `total` field and a four-token needle fixture too short to contain its answer.
+- `.agents/gpu_jobs/20260829T002139Z-qwen3-dsa-bucket-graph-verify-exact-fix/result.md` — corrected
+  field/fixture job `FAIL`: long-context generation and decode-quality export passed (1,080 rows,
+  mean recall 0.9913, balanced added/dropped totals, zero safety violations), but prefill collapsed
+  under `unattributed` and a float32 expected mean used an impossible absolute tolerance.
+- `.agents/gpu_jobs/20260829T003723Z-qwen3-dsa-bucket-graph-verify-exact-attribution/result.md` —
+  follow-up contract routes graph-exact prefill through pinned layer recovery and computes the
+  independent expected intersection mean in float64.
 
 ### Stage A: isolated reference
 

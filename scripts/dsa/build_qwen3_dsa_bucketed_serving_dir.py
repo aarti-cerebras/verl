@@ -14,7 +14,7 @@ from typing import Any
 EXACT_ARCH = "Qwen3DSAForCausalLM"
 BUCKETED_ARCH = "Qwen3DSABucketedForCausalLM"
 BACKENDS = ("torch_reference", "vllm_stock_per_bucket")
-TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety")
+TELEMETRY_MODES = ("off", "summary", "verify_exact", "graph_safety", "graph_verify_exact")
 DECODE_GRAPH_VALIDATED_GEOMETRY = {
     "backend": "vllm_stock_per_bucket",
     "bucket_count": 8,
@@ -24,6 +24,9 @@ DECODE_GRAPH_VALIDATED_GEOMETRY = {
 DECODE_GRAPH_EVIDENCE = ".agents/gpu_jobs/20260828T210745Z-qwen3-dsa-bucketed-decode-graph/result.md"
 GRAPH_SAFETY_EVIDENCE = (
     ".agents/gpu_jobs/20260828T232757Z-qwen3-dsa-bucket-graph-telemetry-fix/result.md"
+)
+GRAPH_VERIFY_EXACT_EVIDENCE = (
+    ".agents/gpu_jobs/20260829T003723Z-qwen3-dsa-bucket-graph-verify-exact-attribution/result.md"
 )
 
 
@@ -79,7 +82,10 @@ def parse_args() -> argparse.Namespace:
         "--telemetry",
         choices=TELEMETRY_MODES,
         default="off",
-        help="summary/verify_exact are eager-only; graph_safety uses persistent device counters",
+        help=(
+            "summary/verify_exact are eager-only; graph_safety and graph_verify_exact use "
+            "persistent device counters"
+        ),
     )
     return parser.parse_args()
 
@@ -134,7 +140,8 @@ def main() -> int:
     (output / "config.json").write_text(json.dumps(derived, indent=2) + "\n")
 
     repo = Path(__file__).resolve().parents[2]
-    decode_graph_validated = args.telemetry in ("off", "graph_safety") and {
+    graph_telemetry_modes = ("off", "graph_safety", "graph_verify_exact")
+    decode_graph_validated = args.telemetry in graph_telemetry_modes and {
         "backend": args.backend,
         "bucket_count": args.bucket_count,
         "bucket_top_k": bucket_top_k,
@@ -163,13 +170,15 @@ def main() -> int:
         "exact_source_modified": False,
         "cuda_graph_modes_supported": (
             ["NONE", "FULL_DECODE_ONLY"]
-            if args.backend == "vllm_stock_per_bucket" and args.telemetry in ("off", "graph_safety")
+            if args.backend == "vllm_stock_per_bucket" and args.telemetry in graph_telemetry_modes
             else ["NONE"]
         ),
         "decode_cuda_graph_validated": decode_graph_validated,
         "prefill_cuda_graph_validated": False,
         "cuda_graph_validation_evidence": (
-            GRAPH_SAFETY_EVIDENCE
+            GRAPH_VERIFY_EXACT_EVIDENCE
+            if decode_graph_validated and args.telemetry == "graph_verify_exact"
+            else GRAPH_SAFETY_EVIDENCE
             if decode_graph_validated and args.telemetry == "graph_safety"
             else DECODE_GRAPH_EVIDENCE
             if decode_graph_validated

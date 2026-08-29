@@ -195,6 +195,33 @@ def test_builder_records_only_the_gpu_validated_decode_graph_geometry(tmp_path: 
         "20260828T232757Z-qwen3-dsa-bucket-graph-telemetry-fix/result.md"
     )
 
+    quality_output = tmp_path / "bucketed-graph-verify-exact"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts/dsa/build_qwen3_dsa_bucketed_serving_dir.py"),
+            "--source",
+            str(source),
+            "--out",
+            str(quality_output),
+            "--bucket-count",
+            "8",
+            "--bucket-top-k",
+            "256",
+            "--telemetry",
+            "graph_verify_exact",
+        ],
+        check=True,
+    )
+    quality_manifest = json.loads(
+        (quality_output / "BUCKETED_BUILD_MANIFEST.json").read_text()
+    )
+    assert quality_manifest["decode_cuda_graph_validated"] is True
+    assert quality_manifest["cuda_graph_modes_supported"] == ["NONE", "FULL_DECODE_ONLY"]
+    assert quality_manifest["cuda_graph_validation_evidence"].endswith(
+        "20260829T003723Z-qwen3-dsa-bucket-graph-verify-exact-attribution/result.md"
+    )
+
 
 def test_builder_rejects_budget_change(tmp_path: Path) -> None:
     source = tmp_path / "exact"

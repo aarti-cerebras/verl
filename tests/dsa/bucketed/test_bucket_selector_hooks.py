@@ -102,6 +102,28 @@ def test_verify_exact_reuses_saved_stock_once_for_global_reference() -> None:
     assert artifact["decode"]["global"]["recall"]["mean"] == 0.75
 
 
+def test_graph_verify_exact_reuses_stock_and_records_device_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(telemetry="graph_verify_exact")
+    RUNTIME.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    monkeypatch.setattr(bucket_selector_hooks, "_captured_indexer_layer", lambda: "layer.0")
+    logits = torch.tensor([[100.0, 99.0, 98.0, 1.0, 97.0, 2.0, 96.0, 3.0]])
+    seq_lens = torch.tensor([[8]], dtype=torch.int32)
+    output = torch.empty(1, 4, dtype=torch.int32)
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def stock(logits, next_n, seq_lens, target, num_rows, stride0, stride1, topk_tokens):
+        calls.append((tuple(logits.shape), topk_tokens))
+        _fill_stock(logits, seq_lens, target, topk_tokens)
+
+    _decode_hook({"decode": stock}, logits, 1, seq_lens, output, 1, 8, 1, 4)
+
+    assert calls == [((1, 4), 2), ((1, 4), 2), ((1, 8), 4)]
+    quality = RUNTIME.artifact()["graph_replay_quality"]["phases"]["decode"]["global"]
+    assert quality["recall"]["mean"] == 0.75
+
+
 def test_prefill_restarts_modulo_positions_per_request() -> None:
     _configure()
     # Request 0 has two query rows over key columns [0, 3); request 1 has one row over [3, 5).
@@ -128,9 +150,17 @@ def test_prefill_restarts_modulo_positions_per_request() -> None:
     assert set(output[2][output[2] >= 0].tolist()) == {0, 1}
 
 
-def test_graph_safety_prefill_uses_captured_layer_attribution(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure(telemetry="graph_safety")
-    RUNTIME.initialize_graph_safety(["layer.0"], device=torch.device("cpu"))
+@pytest.mark.parametrize("telemetry", ["graph_safety", "graph_verify_exact"])
+def test_graph_telemetry_prefill_uses_captured_layer_attribution(
+    monkeypatch: pytest.MonkeyPatch, telemetry: str
+) -> None:
+    _configure(telemetry=telemetry)
+    initialize = (
+        RUNTIME.initialize_graph_quality
+        if telemetry == "graph_verify_exact"
+        else RUNTIME.initialize_graph_safety
+    )
+    initialize(["layer.0"], device=torch.device("cpu"))
     monkeypatch.setattr(bucket_selector_hooks, "_captured_indexer_layer", lambda: "layer.0")
     logits = torch.tensor([[2.0, 9.0, 0.0], [1.0, 2.0, 3.0]])
     starts = torch.tensor([0, 0], dtype=torch.int32)
@@ -142,11 +172,15 @@ def test_graph_safety_prefill_uses_captured_layer_attribution(monkeypatch: pytes
 
     _prefill_hook({"prefill": stock}, logits, starts, ends, output, 2, 3, 1, 4)
 
-    replay = RUNTIME.artifact()["graph_replay"]
-    layer = replay["phases"]["prefill"]["per_layer"]["layer.0"]
-    assert layer["rows"] == 2
-    assert layer["calls"] == 1
-    assert layer["selected_total"] == 4
+    artifact = RUNTIME.artifact()
+    if telemetry == "graph_safety":
+        layer = artifact["graph_replay"]["phases"]["prefill"]["per_layer"]["layer.0"]
+        assert layer["rows"] == 2
+        assert layer["calls"] == 1
+        assert layer["selected_total"] == 4
+    else:
+        assert artifact["prefill"]["per_layer"]["layer.0"]["calls"] == 1
+        assert "unattributed" not in artifact["prefill"]["per_layer"]
 
 
 @pytest.mark.parametrize("name", ["cooperative_topk", "persistent_topk"])

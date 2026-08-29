@@ -49,7 +49,7 @@ def _captured_indexer_layer() -> str:
         del frame
     if RUNTIME.current_layer != "unattributed":
         return RUNTIME.current_layer
-    raise RuntimeError("graph_safety could not recover the bucket indexer layer prefix")
+    raise RuntimeError("graph telemetry could not recover the bucket indexer layer prefix")
 
 
 def _validate_output(
@@ -112,7 +112,7 @@ def _select(
         )
     _validate_output(output, query_positions, result, logits.shape[1])
     exact_reference = None
-    if config.telemetry == "verify_exact":
+    if config.telemetry in ("verify_exact", "graph_verify_exact"):
         exact_reference = torch.full_like(output, -1)
         sequence_lengths = (query_positions.reshape(-1).to(torch.int64) + 1).clamp(
             min=0, max=logits.shape[1]
@@ -127,7 +127,7 @@ def _select(
         exact_reference=exact_reference,
         layer_name=(
             _captured_indexer_layer()
-            if config.telemetry == "graph_safety"
+            if config.telemetry in ("graph_safety", "graph_verify_exact")
             else None
         ),
     )

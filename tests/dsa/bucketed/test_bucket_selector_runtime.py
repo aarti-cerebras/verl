@@ -92,8 +92,9 @@ def test_host_folded_telemetry_fails_closed_with_decode_graphs(telemetry: str) -
         _config(telemetry=telemetry).validate_execution(cudagraph_mode="FULL_DECODE_ONLY")
 
 
-def test_graph_safety_telemetry_allows_decode_only_graphs() -> None:
-    _config(telemetry="graph_safety").validate_execution(cudagraph_mode="FULL_DECODE_ONLY")
+@pytest.mark.parametrize("telemetry", ["graph_safety", "graph_verify_exact"])
+def test_graph_telemetry_allows_decode_only_graphs(telemetry: str) -> None:
+    _config(telemetry=telemetry).validate_execution(cudagraph_mode="FULL_DECODE_ONLY")
 
 
 def _selection_fixture() -> tuple[
@@ -229,3 +230,87 @@ def test_graph_safety_counters_are_persistent_per_layer_per_bucket_and_reset() -
     runtime.reset()
     assert runtime._graph.data_ptr() == graph_address
     assert runtime.artifact()["graph_replay"]["global"]["rows"] == 0
+
+
+def test_graph_verify_exact_matches_eager_decode_moments_and_resets_in_place() -> None:
+    logits, qpos, output, exact, result = _selection_fixture()
+    eager = BucketSelectorRuntime()
+    eager.configure(_config(telemetry="verify_exact"))
+    eager.record(
+        phase="decode",
+        layer_name="layer.0",
+        logits=logits,
+        output=output,
+        query_positions=qpos,
+        result=result,
+        exact_reference=exact,
+    )
+
+    graph = BucketSelectorRuntime()
+    graph.configure(_config(telemetry="graph_verify_exact"))
+    graph.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    assert graph._graph_quality is not None
+    quality_address = graph._graph_quality.data_ptr()
+    graph.record(
+        phase="decode",
+        layer_name="layer.0",
+        logits=logits,
+        output=output,
+        query_positions=qpos,
+        result=result,
+        exact_reference=exact,
+    )
+
+    eager_metrics = eager.artifact()["decode"]["global"]
+    artifact = graph.artifact()
+    graph_metrics = artifact["graph_replay_quality"]["phases"]["decode"]["global"]
+    for field in (
+        "selected_count",
+        "intersection",
+        "added",
+        "dropped",
+        "recall",
+        "precision",
+        "jaccard",
+        "selected_score_mass",
+        "global_exact_score_mass",
+        "score_mass_gap",
+        "score_mass_ratio",
+    ):
+        assert graph_metrics[field] == eager_metrics[field]
+    per_bucket = artifact["graph_replay_quality"]["phases"]["decode"]["per_layer"][
+        "layer.0"
+    ]["per_bucket"]
+    assert len(per_bucket) == 2
+    assert artifact["graph_replay_quality"]["phases"]["decode"][
+        "query_position_bands"
+    ]
+    assert artifact["graph_replay_quality"]["phases"]["decode"]["distance_bands"]
+
+    graph.reset()
+    assert graph._graph_quality.data_ptr() == quality_address
+    reset_metrics = graph.artifact()["graph_replay_quality"]["phases"]["decode"][
+        "global"
+    ]
+    assert all(summary["n"] == 0 for summary in reset_metrics.values())
+
+
+def test_graph_verify_exact_keeps_prefill_host_folded() -> None:
+    runtime = BucketSelectorRuntime()
+    runtime.configure(_config(telemetry="graph_verify_exact"))
+    runtime.initialize_graph_quality(["layer.0"], device=torch.device("cpu"))
+    logits, qpos, output, exact, result = _selection_fixture()
+    runtime.record(
+        phase="prefill",
+        layer_name="layer.0",
+        logits=logits,
+        output=output,
+        query_positions=qpos,
+        result=result,
+        exact_reference=exact,
+    )
+
+    artifact = runtime.artifact()
+    assert artifact["prefill"]["global"]["recall"]["n"] == 2
+    graph_prefill = artifact["graph_replay_quality"]["phases"]["prefill"]["global"]
+    assert all(summary["n"] == 0 for summary in graph_prefill.values())

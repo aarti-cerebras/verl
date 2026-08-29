@@ -417,7 +417,10 @@ class Qwen3DSAModel(Qwen2Model):
 
         super().__init__(vllm_config=vllm_config, prefix=prefix, decoder_layer_type=_layer)
         if sparse:
-            if RUNTIME.config is not None and RUNTIME.config.telemetry == "graph_safety":
+            if RUNTIME.config is not None and RUNTIME.config.telemetry in (
+                "graph_safety",
+                "graph_verify_exact",
+            ):
                 layer_names = [
                     layer.self_attn.indexer.layer_name
                     for layer in self.layers
@@ -425,10 +428,12 @@ class Qwen3DSAModel(Qwen2Model):
                 ]
                 if layer_names:
                     assert self.topk_indices_buffer is not None
-                    RUNTIME.initialize_graph_safety(
-                        layer_names,
-                        device=self.topk_indices_buffer.device,
+                    initialize = (
+                        RUNTIME.initialize_graph_quality
+                        if RUNTIME.config.telemetry == "graph_verify_exact"
+                        else RUNTIME.initialize_graph_safety
                     )
+                    initialize(layer_names, device=self.topk_indices_buffer.device)
             n_sparse = sum(1 for lyr in self.layers if getattr(lyr, "is_sparse", False))
             print(
                 f"[Qwen3DSA-bucketed] {n_sparse}/{config.num_hidden_layers} layers sparse; "
